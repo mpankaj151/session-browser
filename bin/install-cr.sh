@@ -25,16 +25,18 @@ if ! grep -qF "# >>> session-browser sb >>>" "$RC" 2>/dev/null; then
   cat >> "$RC" <<EOF
 
 # >>> session-browser sb >>>
-# Control the Session Browser: sb {ui|stop|open|doctor|refresh [--enrich]}
+# Control the Session Browser: sb {ui|stop|open|stats|demo|doctor|refresh [--enrich]}
 sb() {
   local REPO="$REPO"
   case "\${1:-}" in
     ui)      nohup "\$REPO/.venv/bin/python" "\$REPO/session-ui/app.py" >/tmp/sb-app.log 2>&1 & echo "Session Browser UI -> http://127.0.0.1:7655" ;;
     stop)    lsof -ti tcp:7655 2>/dev/null | xargs kill 2>/dev/null && echo "UI stopped" || echo "UI not running" ;;
     open)    open http://127.0.0.1:7655 2>/dev/null || xdg-open http://127.0.0.1:7655 ;;
+    stats)   "\$REPO/.venv/bin/python" "\$REPO/scripts/stats-report.py" "\${@:2}" ;;
+    demo)    "\$REPO/.venv/bin/python" "\$REPO/scripts/demo.py" ;;
     doctor)  "\$REPO/bin/doctor.sh" ;;
     refresh) "\$REPO/.venv/bin/python" "\$REPO/scripts/refresh-all.py" "\${@:2}" ;;
-    *)       echo "usage: sb {ui|stop|open|doctor|refresh [--enrich]}" ;;
+    *)       echo "usage: sb {ui|stop|open|stats|demo|doctor|refresh [--enrich]}" ;;
   esac
 }
 # <<< session-browser sb <<<

@@ -41,7 +41,13 @@ REPO_ROOT = _REPO_ROOT
 _PATHS = CONFIG.get("paths", {})
 _NEW_DB = _expand(_PATHS.get("db", "~/.session-browser/registry.db"))
 _OLD_DB = Path.home() / ".claude" / "session-registry.db"
-DB_PATH = _NEW_DB if _NEW_DB.exists() else (_OLD_DB if _OLD_DB.exists() else _NEW_DB)
+# SB_DB env override wins over everything — used by `sb demo` to point the whole
+# stack at a throwaway seeded database without touching the real registry.
+_ENV_DB = os.environ.get("SB_DB")
+if _ENV_DB:
+    DB_PATH = Path(os.path.expanduser(_ENV_DB))
+else:
+    DB_PATH = _NEW_DB if _NEW_DB.exists() else (_OLD_DB if _OLD_DB.exists() else _NEW_DB)
 
 FACETS_DIR = _expand(_PATHS.get("facets_dir", "~/.session-browser/facets"))
 HOOK_STATE = _expand(_PATHS.get("hook_state", "~/.session-browser/.hook-state.json"))

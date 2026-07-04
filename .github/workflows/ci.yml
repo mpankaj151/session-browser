@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install core dependencies (no ML stack — tests don't need it)
+        run: pip install -r requirements.txt
+
+      - name: Run smoke + regression tests (isolated HOME, no user data)
+        env:
+          HOME: ${{ runner.temp }}
+        run: python tests/test_smoke.py
+
+      - name: Byte-compile every module
+        run: python -m compileall -q sources scripts session-ui mcp enrichment *.py
+
+      - name: Shell syntax check
+        if: runner.os != 'Windows'
+        run: |
+          for f in install.sh uninstall.sh bin/*.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done

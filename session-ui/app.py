@@ -432,6 +432,56 @@ def api_reasoning(sid: str):
                     "title": row["title"] or row["first_message"]})
 
 
+@app.get("/api/stats/timeseries")
+def api_stats_timeseries():
+    """Aggregates for the usage dashboard — all derived from existing columns via
+    GROUP BY (no schema change). Powers the activity heatmap, per-day tokens/cost,
+    and per-model / per-project / per-source breakdowns."""
+    conn = indexer.connect()
+    try:
+        # per-day: session count, tokens, cost — last 365 days
+        per_day = [dict(r) for r in conn.execute(
+            "SELECT substr(last_activity,1,10) AS day, COUNT(*) AS sessions, "
+            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(cost_usd),0) AS cost "
+            "FROM sessions WHERE archived=0 AND last_activity!='' "
+            "GROUP BY day ORDER BY day"
+        ).fetchall()]
+        by_model = [dict(r) for r in conn.execute(
+            "SELECT COALESCE(model_used,'unknown') AS model, COUNT(*) AS sessions, "
+            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE archived=0 "
+            "GROUP BY model ORDER BY cost DESC LIMIT 20"
+        ).fetchall()]
+        by_project = [dict(r) for r in conn.execute(
+            "SELECT COALESCE(NULLIF(folder_name,''),'—') AS project, COUNT(*) AS sessions, "
+            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE archived=0 "
+            "GROUP BY project ORDER BY cost DESC LIMIT 15"
+        ).fetchall()]
+        by_source = [dict(r) for r in conn.execute(
+            "SELECT cli_source AS source, COUNT(*) AS sessions, "
+            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE archived=0 "
+            "GROUP BY source ORDER BY cost DESC"
+        ).fetchall()]
+        totals = dict(conn.execute(
+            "SELECT COUNT(*) AS sessions, "
+            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE archived=0"
+        ).fetchone())
+        # this-calendar-month cost (the headline "≈$X of API-equivalent" number)
+        month_cost = conn.execute(
+            "SELECT COALESCE(SUM(cost_usd),0) FROM sessions WHERE archived=0 "
+            "AND last_activity >= strftime('%Y-%m-01', 'now')"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return jsonify({"per_day": per_day, "by_model": by_model, "by_project": by_project,
+                    "by_source": by_source, "totals": totals, "month_cost": month_cost,
+                    "billing": sbconfig.BILLING, "notional": sbconfig.COST_IS_NOTIONAL})
+
+
 @app.get("/api/stats")
 def api_stats():
     conn = indexer.connect()
