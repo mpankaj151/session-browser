@@ -8,11 +8,14 @@ claude_headless.py for the pattern).
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 from .provider import parse_facet_json, render_prompt
+
+_SUPPRESS = {"SESSION_BROWSER_SUPPRESS_HOOK": "1"}
 
 _REPO = Path(__file__).resolve().parent.parent
 
@@ -35,6 +38,7 @@ class CopilotHeadless:
         proc = subprocess.run(
             [self.binary, *self.exec_args, prompt],
             capture_output=True, text=True, timeout=self.timeout,
+            env={**os.environ, **_SUPPRESS},
         )
         if proc.returncode != 0:
             raise RuntimeError(f"{self.binary} exited {proc.returncode}: {proc.stderr[:200]}")

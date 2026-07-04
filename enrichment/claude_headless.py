@@ -5,11 +5,16 @@ extra API key) and parses the returned facet JSON.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 from .provider import parse_facet_json, render_prompt
+
+# The spawned CLI inherits this; our Stop hook sees it and no-ops, so headless
+# enrichment sessions can never re-enter the indexing pipeline via the hook.
+_SUPPRESS = {"SESSION_BROWSER_SUPPRESS_HOOK": "1"}
 
 _REPO = Path(__file__).resolve().parent.parent
 
@@ -31,6 +36,7 @@ class ClaudeHeadless:
         proc = subprocess.run(
             [self.binary, *self.exec_args],
             input=prompt, capture_output=True, text=True, timeout=self.timeout,
+            env={**os.environ, **_SUPPRESS},
         )
         if proc.returncode != 0:
             raise RuntimeError(f"{self.binary} exited {proc.returncode}: {proc.stderr[:200]}")
