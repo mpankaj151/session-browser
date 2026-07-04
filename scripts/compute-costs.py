@@ -91,7 +91,52 @@ def _usage_copilot(path: Path) -> tuple[dict, dict]:
     return totals, per_model
 
 
-_EXTRACTORS = {"claude": _usage_claude, "copilot": _usage_copilot}
+def _usage_codex(path: Path) -> tuple[dict, dict]:
+    """Codex logs cumulative usage in token_count.info.total_token_usage. input_tokens
+    INCLUDES cached; split it so cache_read isn't double-counted. reasoning billed as
+    output. Keep the LAST token_count seen (it's the running total). No per-model
+    breakdown in the event, so attribute to the session's model."""
+    totals = defaultdict(int)
+    per_model = defaultdict(lambda: defaultdict(int))
+    last = None
+    model = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"model"' in line and not model:
+                    try:
+                        p = json.loads(line).get("payload", {})
+                        if isinstance(p, dict) and p.get("type") == "turn_context":
+                            model = p.get("model", "") or ""
+                    except json.JSONDecodeError:
+                        pass
+                if "token_count" not in line:
+                    continue
+                try:
+                    p = json.loads(line).get("payload", {})
+                except json.JSONDecodeError:
+                    continue
+                info = p.get("info") if isinstance(p, dict) else None
+                if isinstance(info, dict) and isinstance(info.get("total_token_usage"), dict):
+                    last = info["total_token_usage"]
+    except OSError:
+        return totals, per_model
+    if not last:
+        return totals, per_model
+    cached = int(last.get("cached_input_tokens", 0) or 0)
+    mapped = {
+        "input": max(0, int(last.get("input_tokens", 0) or 0) - cached),
+        "output": int(last.get("output_tokens", 0) or 0) + int(last.get("reasoning_output_tokens", 0) or 0),
+        "cache_read": cached,
+        "cache_write": 0,
+    }
+    for k, v in mapped.items():
+        totals[k] += v
+        per_model[model or "gpt-5"][k] += v
+    return totals, per_model
+
+
+_EXTRACTORS = {"claude": _usage_claude, "copilot": _usage_copilot, "codex": _usage_codex}
 
 
 def process(path: Path, adapter, conn) -> dict | None:

@@ -19,14 +19,21 @@ def _make_claude() -> SessionSource:
 
 
 def _make_copilot() -> SessionSource:
-    from sources.copilot import CopilotSource  # imported lazily; added in Slice 7
+    from sources.copilot import CopilotSource
     cfg = sbconfig.source_config("copilot")
     return CopilotSource(cfg.get("state_dir", "~/.copilot/session-state"))
+
+
+def _make_codex() -> SessionSource:
+    from sources.codex import CodexSource
+    cfg = sbconfig.source_config("codex")
+    return CodexSource(cfg.get("sessions_dir", "~/.codex/sessions"))
 
 
 _FACTORIES: dict[str, Callable[[], SessionSource]] = {
     "claude": _make_claude,
     "copilot": _make_copilot,
+    "codex": _make_codex,
 }
 
 

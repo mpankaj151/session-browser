@@ -37,8 +37,10 @@ if [ "$CLI" = "auto" ]; then
     CLI=claude
   elif [ -d "$HOME/.copilot/session-state/$SID" ]; then
     CLI=copilot
+  elif find "$HOME/.codex/sessions" -name "rollout-*$SID.jsonl" 2>/dev/null | grep -q .; then
+    CLI=codex
   else
-    echo "cr: session '$SID' not found for claude or copilot" >&2
+    echo "cr: session '$SID' not found for claude, copilot, or codex" >&2
     exit 1
   fi
 fi
@@ -88,6 +90,14 @@ case "$CLI" in
       echo "cr: pointed copilot session cwd -> $CUR (backup: workspace.yaml.bak)"
     fi
     exec copilot --resume="$SID"
+    ;;
+  codex)
+    # Codex stores sessions by date, not by an encoded cwd, so `codex resume`
+    # finds the session from any directory — just resume in place.
+    if ! find "$HOME/.codex/sessions" -name "rollout-*$SID.jsonl" 2>/dev/null | grep -q .; then
+      echo "cr: codex session $SID not found under ~/.codex/sessions" >&2; exit 1
+    fi
+    exec codex resume "$SID"
     ;;
   *)
     echo "cr: unknown cli_source '$CLI'" >&2; exit 1

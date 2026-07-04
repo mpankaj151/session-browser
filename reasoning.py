@@ -138,10 +138,70 @@ def extract_copilot(events_path: Path | str) -> list[ReasoningStep]:
     return steps
 
 
+def extract_codex(rollout_path: Path | str) -> list[ReasoningStep]:
+    """Codex decision trail. Codex stores reasoning as `type:reasoning` records but
+    their text is encrypted (encrypted_content only) — like Claude's empty thinking,
+    the plaintext isn't recoverable. So we reconstruct the visible agent messages
+    plus the exact tool-call sequence, flagging turns that had encrypted reasoning."""
+    path = Path(rollout_path)
+    steps: list[ReasoningStep] = []
+    turn = 0
+    pending_actions: list[dict] = []
+    saw_reasoning = False
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return steps
+    with fh:
+        for line in fh:
+            if '"payload"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            p = rec.get("payload")
+            if not isinstance(p, dict):
+                continue
+            pt = p.get("type")
+            if pt == "reasoning":
+                saw_reasoning = True
+            elif pt in ("function_call", "custom_tool_call"):
+                pending_actions.append({
+                    "tool": p.get("name", ""),
+                    "input": _summarize_input_str(p.get("arguments") or p.get("input")),
+                })
+            elif pt == "agent_message" and isinstance(p.get("message"), str):
+                turn += 1
+                steps.append(ReasoningStep(
+                    turn_index=turn, thinking="", decision=p["message"].strip(),
+                    actions=pending_actions, signature_present=saw_reasoning,
+                    timestamp=rec.get("timestamp"),
+                ))
+                pending_actions = []
+                saw_reasoning = False
+    # trailing actions with no closing message
+    if pending_actions:
+        turn += 1
+        steps.append(ReasoningStep(turn_index=turn, thinking="", decision="",
+                                   actions=pending_actions, signature_present=saw_reasoning))
+    return steps
+
+
+def _summarize_input_str(inp) -> str:
+    """Codex tool args arrive as a JSON string or a dict; summarize either."""
+    if isinstance(inp, str):
+        try:
+            inp = json.loads(inp)
+        except (json.JSONDecodeError, ValueError):
+            return inp[:140]
+    return _summarize_input(inp) if isinstance(inp, dict) else ""
+
+
 def _summarize_input(inp) -> str:
     if not isinstance(inp, dict):
         return ""
-    for key in ("command", "file_path", "path", "pattern", "query", "description", "url"):
+    for key in ("command", "cmd", "file_path", "path", "pattern", "query", "description", "url"):
         if key in inp:
             return f"{key}={str(inp[key])[:140]}"
     return ", ".join(list(inp.keys())[:5])

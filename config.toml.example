@@ -28,9 +28,8 @@ enabled   = true
 state_dir = "~/.copilot/session-state"
 binary    = "copilot"
 
-# Deferred — present for easy enablement later.
 [sources.codex]
-enabled      = false
+enabled      = true
 sessions_dir = "~/.codex/sessions"
 binary       = "codex"
 

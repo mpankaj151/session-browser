@@ -24,7 +24,8 @@ import sbconfig  # noqa: E402
 from sources.claude import ClaudeSource  # noqa: E402
 from sources.registry import build_source_registry  # noqa: E402
 
-_EXTRACTORS = {"claude": reasoning.extract, "copilot": reasoning.extract_copilot}
+_EXTRACTORS = {"claude": reasoning.extract, "copilot": reasoning.extract_copilot,
+               "codex": reasoning.extract_codex}
 
 
 def _header_dict(adapter, path: Path) -> dict | None:
