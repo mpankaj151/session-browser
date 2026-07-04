@@ -7,6 +7,7 @@ source-agnostic and speak only SessionHeader / Turn / ParsedSession.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,12 +29,19 @@ def to_iso_utc(value) -> str:
     if value is None or value == "":
         return ""
     if isinstance(value, (int, float)):
+        # epoch MILLISECONDS from a future adapter would otherwise become a
+        # year-56000 date silently; anything past ~5138 AD in seconds is ms.
+        if value > 1e11:
+            value /= 1000.0
         dt = datetime.fromtimestamp(value, tz=timezone.utc)
     elif isinstance(value, datetime):
         dt = value if value.tzinfo else value.astimezone()
     elif isinstance(value, str):
+        # fromisoformat rejects >6 fractional digits (nanosecond RFC3339);
+        # truncate rather than silently returning '' for a valid timestamp.
+        s = re.sub(r"(\.\d{6})\d+", r"\1", value.replace("Z", "+00:00"))
         try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(s)
         except ValueError:
             return ""
         if dt.tzinfo is None:

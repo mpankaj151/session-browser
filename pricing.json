@@ -4,9 +4,13 @@
     "sonnet":     {"input": 3.0,  "cache_read": 0.3,  "cache_write": 3.75,  "output": 15.0},
     "haiku":      {"input": 0.8,  "cache_read": 0.08, "cache_write": 1.0,   "output": 4.0},
     "gpt-5-mini": {"input": 0.25, "cache_read": 0.025, "cache_write": 0.0, "output": 2.0},
+    "gpt-5-nano": {"input": 0.05, "cache_read": 0.005, "cache_write": 0.0, "output": 0.4},
     "gpt-5":      {"input": 1.25, "cache_read": 0.125, "cache_write": 0.0, "output": 10.0}
   },
   "aliases": {
+    "gpt-5.4-nano": "gpt-5-nano",
+    "gpt-5.5-nano": "gpt-5-nano",
+    "gpt-5-nano": "gpt-5-nano",
     "gpt-5.4-mini": "gpt-5-mini",
     "gpt-5.5-mini": "gpt-5-mini",
     "gpt-5-mini": "gpt-5-mini",

@@ -30,8 +30,15 @@ INSERT INTO sessions
 VALUES (:session_id, :project_path, :cwd, :folder_name, :start_time, :last_activity,
         :first_message, :title, :topics, :turn_count, :cli_source, :cli_version, :model_used)
 ON CONFLICT(session_id) DO UPDATE SET
-  last_activity = excluded.last_activity,
-  turn_count    = excluded.turn_count,
+  -- Monotonic: a re-parse of a SHORTER view of the transcript (partial cloud
+  -- sync, a second codex rollout file for the same id) must not walk the row
+  -- backwards. MAX() returns NULL if either arg is NULL, hence the COALESCEs.
+  last_activity = MAX(COALESCE(sessions.last_activity, ''), COALESCE(excluded.last_activity, '')),
+  turn_count    = MAX(COALESCE(sessions.turn_count, 0), COALESCE(excluded.turn_count, 0)),
+  -- The canonical transcript dir follows the newest activity (codex `resume`
+  -- can write a second rollout file in a different date dir).
+  project_path  = CASE WHEN COALESCE(excluded.last_activity, '') >= COALESCE(sessions.last_activity, '')
+                       THEN excluded.project_path ELSE sessions.project_path END,
   -- NULLIF treats '' as absent: adapters emit '' for not-yet-known fields (e.g. the
   -- watcher fires before the first user turn is flushed), and a '' must neither
   -- stick nor overwrite a real value.

@@ -21,6 +21,9 @@ import yaml
 
 from .base import ParsedSession, SessionHeader, Turn, to_iso_utc
 
+# (events.jsonl size, events mtime, workspace.yaml mtime) -> parsed header
+_HDR_CACHE: dict[str, tuple[tuple[int, int, int], "SessionHeader | None"]] = {}
+
 STATE_DIR = Path(os.path.expanduser("~/.copilot/session-state"))
 
 
@@ -47,6 +50,19 @@ class CopilotSource:
     def parse_header(self, path: Path) -> Optional[SessionHeader]:
         sess_dir = path.parent
         session_id = sess_dir.name
+        # Memoized like codex: the watcher debounce would otherwise re-stream
+        # events.jsonl every 500ms. Key covers workspace.yaml too — the title
+        # and updated_at live there, not in the events file.
+        try:
+            st = path.stat()
+            ws_path = sess_dir / "workspace.yaml"
+            ws_mtime = ws_path.stat().st_mtime_ns if ws_path.exists() else 0
+        except OSError:
+            return None
+        cache_key = (st.st_size, st.st_mtime_ns, ws_mtime)
+        hit = _HDR_CACHE.get(str(path))
+        if hit is not None and hit[0] == cache_key:
+            return hit[1]
         ws = self._workspace(sess_dir)
         cwd = ws.get("cwd", "")
         title = ws.get("name") or None
@@ -78,7 +94,7 @@ class CopilotSource:
         except OSError:
             return None
 
-        return SessionHeader(
+        header = SessionHeader(
             session_id=session_id,
             cli_source=self.name,
             project_path=str(sess_dir),
@@ -92,6 +108,10 @@ class CopilotSource:
             model_used=model,
             metadata={"workspace_name": ws.get("name")},
         )
+        if len(_HDR_CACHE) > 4096:
+            _HDR_CACHE.clear()
+        _HDR_CACHE[str(path)] = (cache_key, header)
+        return header
 
     def parse_full(self, path: Path) -> Optional[ParsedSession]:
         header = self.parse_header(path)

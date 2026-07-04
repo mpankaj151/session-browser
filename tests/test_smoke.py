@@ -144,6 +144,40 @@ def test_reasoning_trail_is_redacted():
     print("  ok  reasoning trails redacted before archive")
 
 
+def test_upsert_is_monotonic():
+    """A re-parse of a shorter/older view (partial sync, second codex rollout
+    file for the same id) must not walk last_activity/turn_count backwards."""
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(turn_count=50, last_activity="2026-06-02T00:00:00.000Z",
+                               project_path="/roll/06/02"), conn=conn)
+        indexer.upsert(_header(turn_count=3, last_activity="2026-06-01T00:00:00.000Z",
+                               project_path="/roll/06/01"), conn=conn)
+        r = conn.execute("SELECT turn_count, last_activity, project_path FROM sessions "
+                         "WHERE session_id='__smoke__'").fetchone()
+        assert r["turn_count"] == 50 and r["last_activity"] == "2026-06-02T00:00:00.000Z"
+        # canonical dir sticks with the NEWEST activity, not the latest parse
+        assert r["project_path"] == "/roll/06/02"
+        # ...and a genuinely newer parse advances everything, dir included
+        indexer.upsert(_header(turn_count=60, last_activity="2026-06-03T00:00:00.000Z",
+                               project_path="/roll/06/03"), conn=conn)
+        r = conn.execute("SELECT turn_count, project_path FROM sessions "
+                         "WHERE session_id='__smoke__'").fetchone()
+        assert r["turn_count"] == 60 and r["project_path"] == "/roll/06/03"
+    finally:
+        conn.close()
+    print("  ok  upsert monotonic (no backward regression)")
+
+
+def test_to_iso_utc_hardening():
+    # epoch milliseconds must not become a year-56000 date
+    assert to_iso_utc(1777573058000).startswith("2026-")
+    assert to_iso_utc(1777573058).startswith("2026-")
+    # nanosecond-precision RFC3339 strings truncate instead of vanishing
+    assert to_iso_utc("2026-04-30T18:17:38.123456789Z") == "2026-04-30T18:17:38.123Z"
+    print("  ok  to_iso_utc: epoch-ms + nanosecond fractions")
+
+
 # --- costs ----------------------------------------------------------------------
 def test_cost_mapping():
     pricing = costs.load_pricing()

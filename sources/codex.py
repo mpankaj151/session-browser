@@ -27,6 +27,11 @@ from .base import ParsedSession, SessionHeader, Turn, to_iso_utc
 
 SESSIONS_DIR = Path(os.path.expanduser("~/.codex/sessions"))
 
+# parse_header streams the whole rollout (last_activity lives on the final
+# line), so memoize by (size, mtime): the watcher re-parses on a 500ms debounce
+# and would otherwise pin a core on an active multi-MB session.
+_HDR_CACHE: dict[str, tuple[tuple[int, int], "SessionHeader | None"]] = {}
+
 
 def _payload(rec: dict) -> tuple[str, dict]:
     """(record type, payload dict). Codex nests real data under 'payload'."""
@@ -60,6 +65,14 @@ class CodexSource:
 
     # -- cheap header ----------------------------------------------------------
     def parse_header(self, path: Path) -> Optional[SessionHeader]:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        cache_key = (st.st_size, st.st_mtime_ns)
+        hit = _HDR_CACHE.get(str(path))
+        if hit is not None and hit[0] == cache_key:
+            return hit[1]
         session_id = self.session_id_for_path(path) or path.stem
         cwd = ""
         start_time = ""
@@ -100,12 +113,16 @@ class CodexSource:
         except OSError:
             return None
 
+        if len(_HDR_CACHE) > 4096:
+            _HDR_CACHE.clear()
         if turn_count == 0 and not first_message:
-            # a rollout with no user turns (aborted / meta-only) — not browsable
+            # a rollout with no user turns (aborted / meta-only) — not browsable.
+            # Cached too: these files are exactly the ones re-scanned pointlessly.
+            _HDR_CACHE[str(path)] = (cache_key, None)
             return None
 
         folder = Path(cwd).name if cwd else path.parent.name
-        return SessionHeader(
+        header = SessionHeader(
             session_id=session_id,
             cli_source=self.name,
             project_path=str(path.parent),
@@ -120,6 +137,8 @@ class CodexSource:
             cli_version=version,
             metadata={"transcript": path.name},
         )
+        _HDR_CACHE[str(path)] = (cache_key, header)
+        return header
 
     # -- full parse ------------------------------------------------------------
     def parse_full(self, path: Path) -> Optional[ParsedSession]:

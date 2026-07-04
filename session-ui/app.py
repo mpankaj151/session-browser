@@ -32,14 +32,16 @@ SOURCES = build_source_registry()
 
 # DNS-rebinding guard: a malicious website can point its own domain at
 # 127.0.0.1 and read this API cross-origin. Only accept requests addressed to
-# the loopback names / the configured host.
-_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]", HOST}
+# the loopback names / the configured host. Wildcard binds are deliberately NOT
+# allowlisted — "0.0.0.0" is never a legitimate Host header.
+_LOOPBACK = {"localhost", "127.0.0.1", "[::1]", "::1"}
+_ALLOWED_HOSTS = _LOOPBACK | ({HOST} - {"0.0.0.0", "::"})
 
 
 @app.before_request
 def _check_host():
-    host = (request.host or "").rsplit(":", 1)[0] if not request.host.startswith("[") \
-        else request.host.split("]")[0] + "]"
+    raw = request.host or ""
+    host = raw.split("]")[0] + "]" if raw.startswith("[") else raw.rsplit(":", 1)[0]
     if host not in _ALLOWED_HOSTS:
         return Response("Forbidden: bad Host header", status=403)
 
@@ -506,6 +508,13 @@ def api_stats():
 
 if __name__ == "__main__":
     sbconfig.ensure_dirs()
+    if HOST not in _LOOPBACK:
+        # The Host-header check only stops browser-based rebinding; a direct
+        # socket peer sends whatever Host it likes. Binding beyond loopback
+        # exposes every session title/summary/reasoning trail to the network.
+        print("WARNING: [ui].host is not loopback — the whole session index "
+              "becomes readable by anyone on your network. Prefer 127.0.0.1 "
+              "plus an SSH tunnel for remote access.")
     print(f"Session Browser on http://{HOST}:{PORT}  (sources: {list(SOURCES)})")
     # threaded: the first semantic query loads the embedding model for seconds —
     # a single-threaded server would freeze every other request meanwhile.
