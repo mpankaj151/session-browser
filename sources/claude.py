@@ -17,7 +17,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Iterator, Optional
 
-from .base import ParsedSession, SessionHeader, Turn
+from .base import ParsedSession, SessionHeader, Turn, to_iso_utc
 
 PROJECTS_DIR = Path(os.path.expanduser("~/.claude/projects"))
 
@@ -100,8 +100,8 @@ class ClaudeSource:
             project_path=project_path,
             cwd=cwd,
             folder_name=folder_name,
-            start_time=start_time,
-            last_activity=last_activity,
+            start_time=to_iso_utc(start_time),
+            last_activity=to_iso_utc(last_activity),
             first_message=first_message[:500],
             turn_count=_count_typed_turns(path),
             title=title,
@@ -137,7 +137,10 @@ class ClaudeSource:
                         turns.append(Turn(role="assistant", content=text, tool_calls=tools))
         return ParsedSession(header=header, turns=turns)
 
-    # -- resume / availability -------------------------------------------------
+    # -- identity / resume / availability ----------------------------------------
+    def session_id_for_path(self, path: Path) -> Optional[str]:
+        return path.stem if path.suffix == ".jsonl" else None
+
     def resume_command(self, session_id: str) -> str:
         return f"claude --resume {session_id}"
 
@@ -285,10 +288,25 @@ def _read_tail_lines(path: Path, n: int, blocksize: int = 65536) -> list[dict]:
     return out
 
 
+# (path -> (size, mtime_ns, count)) — parse_header runs on every debounced watcher
+# tick; without this an active multi-MB transcript would be fully re-streamed
+# every ~0.5s just to recount turns.
+_TURN_CACHE: dict[str, tuple[int, int, int]] = {}
+
+
 def _count_typed_turns(path: Path) -> int:
     """Count substantive user turns. Streams the file and JSON-parses only the
     lines that look like user records (cheap substring prefilter), so it works
-    across both transcript formats without materializing the whole file."""
+    across both transcript formats without materializing the whole file.
+    Results are memoized by (size, mtime) so unchanged files cost one stat()."""
+    try:
+        st = path.stat()
+    except OSError:
+        return 0
+    key = str(path)
+    cached = _TURN_CACHE.get(key)
+    if cached and cached[0] == st.st_size and cached[1] == st.st_mtime_ns:
+        return cached[2]
     n = 0
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -303,4 +321,7 @@ def _count_typed_turns(path: Path) -> int:
                     n += 1
     except OSError:
         return 0
+    if len(_TURN_CACHE) > 4096:  # bound memory in the long-lived watcher
+        _TURN_CACHE.clear()
+    _TURN_CACHE[key] = (st.st_size, st.st_mtime_ns, n)
     return n

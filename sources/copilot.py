@@ -19,16 +19,15 @@ from typing import Iterator, Optional
 
 import yaml
 
-from .base import ParsedSession, SessionHeader, Turn
+from .base import ParsedSession, SessionHeader, Turn, to_iso_utc
 
 STATE_DIR = Path(os.path.expanduser("~/.copilot/session-state"))
 
 
-def _iso(v) -> str:
-    """Coerce a yaml-parsed timestamp (datetime or str) to an ISO string."""
-    if not v:
-        return ""
-    return v.isoformat() if hasattr(v, "isoformat") else str(v)
+def _text(v) -> str:
+    """Event content defensively coerced to str (a non-string content value must
+    degrade to '' rather than crash the whole session parse)."""
+    return v if isinstance(v, str) else ""
 
 
 class CopilotSource:
@@ -51,9 +50,10 @@ class CopilotSource:
         ws = self._workspace(sess_dir)
         cwd = ws.get("cwd", "")
         title = ws.get("name") or None
-        # PyYAML auto-parses ISO timestamps into datetime objects; coerce to strings.
-        start = _iso(ws.get("created_at", ""))
-        last = _iso(ws.get("updated_at", "")) or start
+        # PyYAML auto-parses ISO timestamps into datetime objects; to_iso_utc
+        # normalizes both datetimes and strings to the canonical sortable form.
+        start = to_iso_utc(ws.get("created_at", ""))
+        last = to_iso_utc(ws.get("updated_at", "")) or start
 
         first_message = ""
         model = None
@@ -72,7 +72,7 @@ class CopilotSource:
                     if t == "user.message":
                         turn_count += 1
                         if not first_message:
-                            first_message = (data.get("content") or "")[:500]
+                            first_message = _text(data.get("content"))[:500]
                     elif t == "session.model_change" and data.get("newModel"):
                         model = data["newModel"]
         except OSError:
@@ -107,16 +107,21 @@ class CopilotSource:
                 t = rec.get("type")
                 data = rec.get("data", {}) if isinstance(rec.get("data"), dict) else {}
                 if t == "user.message":
-                    content = (data.get("content") or "").strip()
+                    content = _text(data.get("content")).strip()
                     if content:
                         turns.append(Turn(role="user", content=content))
                 elif t == "assistant.message":
-                    content = (data.get("content") or "").strip()
+                    content = _text(data.get("content")).strip()
                     tools = [{"name": tr.get("name", ""), "input": ""}
                              for tr in (data.get("toolRequests") or []) if isinstance(tr, dict)]
                     if content or tools:
                         turns.append(Turn(role="assistant", content=content, tool_calls=tools))
         return ParsedSession(header=header, turns=turns)
+
+    def session_id_for_path(self, path: Path) -> Optional[str]:
+        # Transcript lives at <state_dir>/<session-id>/events.jsonl; the id is the
+        # directory name, NOT the filename stem ("events").
+        return path.parent.name if path.name == "events.jsonl" else None
 
     def resume_command(self, session_id: str) -> str:
         return f"copilot --resume={session_id}"

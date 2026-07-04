@@ -87,6 +87,14 @@ class _Handler(FileSystemEventHandler):
         path = Path(path_str)
         if not path.exists() or path.suffix != ".jsonl":
             return
+        # `cr` links sessions into other project dirs as resume conduits; the
+        # canonical transcript is the real file (same invariant as discover()).
+        if path.is_symlink():
+            return
+        # Let the adapter decide whether this path is a session transcript at all
+        # (e.g. only <sid>/events.jsonl counts for copilot, not future siblings).
+        if self.adapter.session_id_for_path(path) is None:
+            return
         try:
             header = self.adapter.parse_header(path)
             if header is None:
@@ -110,8 +118,25 @@ class _Handler(FileSystemEventHandler):
     def on_deleted(self, event):
         if event.is_directory or not str(event.src_path).endswith(".jsonl"):
             return
-        sid = Path(event.src_path).stem
+        path = Path(event.src_path)
+        sid = self.adapter.session_id_for_path(path)
+        if sid is None:
+            return
         try:
+            # Archive only when the deleted path IS the canonical transcript. A
+            # deleted `cr` symlink shares the session's filename but lives in a
+            # different project dir — archiving on it would hide a live session.
+            conn = indexer.connect()
+            try:
+                row = conn.execute(
+                    "SELECT project_path FROM sessions WHERE session_id = ?", (sid,)
+                ).fetchone()
+                canonical_dir = row["project_path"] if row else None
+            finally:
+                conn.close()
+            if canonical_dir is not None and Path(canonical_dir) != path.parent:
+                _log(f"skip archive (non-canonical copy deleted) {sid}")
+                return
             indexer.archive(sid)
             _log(f"archive [{self.adapter.name}] {sid}")
         except Exception as e:  # noqa: BLE001

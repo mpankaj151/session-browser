@@ -32,15 +32,21 @@ VALUES (:session_id, :project_path, :cwd, :folder_name, :start_time, :last_activ
 ON CONFLICT(session_id) DO UPDATE SET
   last_activity = excluded.last_activity,
   turn_count    = excluded.turn_count,
-  cwd           = COALESCE(sessions.cwd, excluded.cwd),
-  folder_name   = COALESCE(sessions.folder_name, excluded.folder_name),
-  first_message = COALESCE(sessions.first_message, excluded.first_message),
-  start_time    = COALESCE(sessions.start_time, excluded.start_time),
-  title         = COALESCE(excluded.title, sessions.title),
+  -- NULLIF treats '' as absent: adapters emit '' for not-yet-known fields (e.g. the
+  -- watcher fires before the first user turn is flushed), and a '' must neither
+  -- stick nor overwrite a real value.
+  cwd           = COALESCE(NULLIF(sessions.cwd, ''), NULLIF(excluded.cwd, '')),
+  folder_name   = COALESCE(NULLIF(sessions.folder_name, ''), NULLIF(excluded.folder_name, '')),
+  first_message = COALESCE(NULLIF(sessions.first_message, ''), NULLIF(excluded.first_message, '')),
+  start_time    = COALESCE(NULLIF(sessions.start_time, ''), NULLIF(excluded.start_time, '')),
+  title         = COALESCE(NULLIF(excluded.title, ''), sessions.title),
   topics        = COALESCE(sessions.topics, excluded.topics),
   cli_source    = excluded.cli_source,
-  cli_version   = COALESCE(sessions.cli_version, excluded.cli_version),
-  model_used    = COALESCE(excluded.model_used, sessions.model_used);
+  cli_version   = COALESCE(NULLIF(sessions.cli_version, ''), NULLIF(excluded.cli_version, '')),
+  model_used    = COALESCE(NULLIF(excluded.model_used, ''), sessions.model_used),
+  -- an upsert only ever comes from parsing a file that exists on disk, so the
+  -- session is alive: resurrect it if it was (possibly wrongly) archived.
+  archived      = 0;
 """
 
 
