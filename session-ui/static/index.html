@@ -5,12 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Session Browser</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🧠</text></svg>"/>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>tailwind.config = { darkMode: 'class' };</script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- Vendored Tailwind subset (session-ui/tailwind.input.css + tailwind.config.js
+     -> `npx tailwindcss -m`). No CDN, no fonts, no network: the UI must render
+     fully offline and never phone home. -->
+<link rel="stylesheet" href="/static/tailwind.css">
 <style>
-  body { font-family: 'Inter', system-ui, sans-serif; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, system-ui, sans-serif; }
   .clamp2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
   .kb-active { outline: 2px solid #6366f1; outline-offset: 2px; }
   ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -86,7 +86,9 @@ function closeModal(){ $('#modal').classList.add('hidden'); }
 function openModal(title, body){ $('#modalTitle').textContent=title; $('#modalBody').textContent=body; $('#modal').classList.remove('hidden'); }
 function openModalMd(title, md){ $('#modalTitle').textContent=title; $('#modalBody').innerHTML=mdToHtml(md); $('#modal').classList.remove('hidden'); $('#modalBody').scrollTop=0; }
 
-function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+// Escapes for BOTH text and attribute contexts — every dynamic string that goes
+// through innerHTML must pass through here (transcript content is untrusted).
+function esc(s){ return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function mdToHtml(md){
   const out=[]; let inList=false;
   for(let raw of md.split('\n')){
@@ -147,19 +149,20 @@ function group(sessions){
   return groups;
 }
 
-function badge(text, cls){ return `<span class="px-2 py-0.5 rounded-md text-xs border ${cls}">${text}</span>`; }
+function badge(text, cls){ return `<span class="px-2 py-0.5 rounded-md text-xs border ${cls}">${esc(text)}</span>`; }
 
 function renderCard(s, idx){
   const dot = s.is_active ? 'bg-emerald-500' : (s.summary ? 'bg-indigo-500' : 'bg-slate-400');
   const srcCls = SOURCE_COLORS[s.cli_source] || 'bg-slate-500/15 text-slate-400 border-slate-500/30';
-  const topics = (s.topics||[]).slice(0,4).map(t=>`<button onclick="filterTopic('${t}')" class="px-2 py-0.5 rounded-md text-xs bg-slate-200 dark:bg-slate-800 hover:bg-indigo-500/20">#${t}</button>`).join(' ');
+  const sid = esc(s.session_id);
+  const topics = (s.topics||[]).slice(0,4).map(t=>`<button data-act="topic" data-topic="${esc(t)}" class="px-2 py-0.5 rounded-md text-xs bg-slate-200 dark:bg-slate-800 hover:bg-indigo-500/20">#${esc(t)}</button>`).join(' ');
   const reasoningBtn = s.has_reasoning
-    ? `<button onclick="showReasoning('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-violet-600/90 hover:bg-violet-500 text-white">🧠 Reasoning</button>` : '';
+    ? `<button data-act="reasoning" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-violet-600/90 hover:bg-violet-500 text-white">🧠 Reasoning</button>` : '';
   return `<div class="card border border-slate-200 dark:border-slate-800 rounded-xl p-4 bg-white dark:bg-slate-900 hover:border-indigo-400/50 transition" data-idx="${idx}">
     <div class="flex items-start justify-between gap-3">
       <div class="flex items-center gap-2 min-w-0">
         <span class="w-2 h-2 rounded-full ${dot} shrink-0"></span>
-        <h3 class="font-semibold truncate">${s.title || s.first_message?.slice(0,60) || '(untitled session)'}</h3>
+        <h3 class="font-semibold truncate">${esc(s.title || s.first_message?.slice(0,60) || '(untitled session)')}</h3>
       </div>
       <div class="flex items-center gap-2 shrink-0">${fmtCost(s.cost)} ${badge(s.cli_source, srcCls)}</div>
     </div>
@@ -167,23 +170,44 @@ function renderCard(s, idx){
       ${badge(s.folder_name||'—','bg-slate-100 dark:bg-slate-800 border-slate-300/40 dark:border-slate-700')}
       ${s.session_type?badge(s.session_type,'bg-purple-500/10 text-purple-500 border-purple-500/30'):''}
       ${s.outcome?badge(s.outcome,'bg-green-500/10 text-green-600 border-green-500/30'):''}
-      <span>${s.turn_count} turns</span><span>·</span><span>${s.model_used||''}</span>
+      <span>${esc(s.turn_count)} turns</span><span>·</span><span>${esc(s.model_used||'')}</span>
       <span>·</span><span>${new Date(s.last_activity).toLocaleString()}</span>
     </div>
-    <p class="clamp2 text-sm text-slate-600 dark:text-slate-300 mt-2">${(s.summary||s.first_message||'').replace(/</g,'&lt;')}</p>
+    <p class="clamp2 text-sm text-slate-600 dark:text-slate-300 mt-2">${esc(s.summary||s.first_message||'')}</p>
     <div class="flex flex-wrap gap-1.5 mt-2">${topics}</div>
     <div class="flex flex-wrap gap-2 mt-3">
-      <button onclick="resume('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>
+      <button data-act="resume" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>
       ${reasoningBtn}
-      <button onclick="copyContext('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">📋 Copy Context</button>
-      <button onclick="exportContext('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">⬇ Export</button>
-      <button id="thbtn-${s.session_id}" onclick="toggleThread('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">🧵 Thread</button>
-      <button onclick="toggleBridge('${s.session_id}','${s.cli_source}')" class="text-xs px-2.5 py-1 rounded-md bg-teal-600/90 hover:bg-teal-500 text-white">🌉 Bridge</button>
-      <span id="brmenu-${s.session_id}" class="inline-flex gap-1"></span>
+      <button data-act="copy" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">📋 Copy Context</button>
+      <button data-act="export" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">⬇ Export</button>
+      <button id="thbtn-${sid}" data-act="thread" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">🧵 Thread</button>
+      <button data-act="bridge" data-sid="${sid}" data-src="${esc(s.cli_source)}" class="text-xs px-2.5 py-1 rounded-md bg-teal-600/90 hover:bg-teal-500 text-white">🌉 Bridge</button>
+      <span id="brmenu-${sid}" class="inline-flex gap-1"></span>
     </div>
-    <div id="thread-${s.session_id}" class="hidden mt-3 pl-3 border-l-2 border-slate-300 dark:border-slate-700 space-y-2"></div>
+    <div id="thread-${sid}" class="hidden mt-3 pl-3 border-l-2 border-slate-300 dark:border-slate-700 space-y-2"></div>
   </div>`;
 }
+
+// Single delegated handler for every dynamically-rendered button. Inline
+// onclick="...(‘${data}’)" string-building was an XSS vector — session titles,
+// topics, and folder names come from transcripts and are untrusted.
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-act]');
+  if(!b) return;
+  const sid = b.dataset.sid;
+  switch(b.dataset.act){
+    case 'resume':    resume(sid); break;
+    case 'reasoning': showReasoning(sid); break;
+    case 'copy':      copyContext(sid); break;
+    case 'export':    exportContext(sid); break;
+    case 'thread':    toggleThread(sid); break;
+    case 'bridge':    toggleBridge(sid, b.dataset.src); break;
+    case 'bridge-to': doBridge(sid, b.dataset.target); break;
+    case 'topic':     filterTopic(b.dataset.topic); break;
+    case 'bridge-copy':     bridgeCopy(); break;
+    case 'bridge-download': bridgeDownload(); break;
+  }
+});
 
 function render(){
   const groups = group(STATE.sessions);
@@ -230,7 +254,7 @@ function toggleBridge(id, source){
   if(menu.innerHTML){ menu.innerHTML=''; return; }   // toggle off
   const targets = BRIDGE_TARGETS.filter(t => t !== source);
   menu.innerHTML = `<span class="text-xs text-slate-400 self-center">→</span>` +
-    targets.map(t => `<button onclick="doBridge('${id}','${t}')" class="text-xs px-2 py-1 rounded-md border border-teal-500/40 hover:bg-teal-500/20">${t}</button>`).join('');
+    targets.map(t => `<button data-act="bridge-to" data-sid="${esc(id)}" data-target="${esc(t)}" class="text-xs px-2 py-1 rounded-md border border-teal-500/40 hover:bg-teal-500/20">${esc(t)}</button>`).join('');
 }
 async function doBridge(id, target){
   const menu = document.getElementById('brmenu-'+id);
@@ -242,11 +266,11 @@ async function doBridge(id, target){
   window.__bridge = { id, target, command: r.command };
   $('#modalTitle').textContent = `🌉 Bridge → ${target}`;
   $('#modalBody').innerHTML =
-    `<p class="text-sm text-slate-500 mb-2">Run this to start a fresh <b>${target}</b> session seeded with the full context (no native cross-CLI resume exists):</p>
+    `<p class="text-sm text-slate-500 mb-2">Run this to start a fresh <b>${esc(target)}</b> session seeded with the full context (no native cross-CLI resume exists):</p>
      <pre class="text-xs bg-slate-100 dark:bg-slate-800 rounded p-2 overflow-x-auto whitespace-pre-wrap">${esc(r.command)}</pre>
      <div class="flex gap-2 my-3">
-       <button onclick="bridgeCopy()" class="text-xs px-3 py-1.5 rounded-md bg-teal-600 hover:bg-teal-500 text-white">📋 Copy command</button>
-       <button onclick="bridgeDownload()" class="text-xs px-3 py-1.5 rounded-md bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600">⬇ Download primer</button>
+       <button data-act="bridge-copy" class="text-xs px-3 py-1.5 rounded-md bg-teal-600 hover:bg-teal-500 text-white">📋 Copy command</button>
+       <button data-act="bridge-download" class="text-xs px-3 py-1.5 rounded-md bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600">⬇ Download primer</button>
      </div>
      <details class="mt-2"><summary class="text-xs text-slate-400 cursor-pointer">Preview handoff primer</summary>
        <div class="mt-2 text-sm">${mdToHtml(r.primer)}</div>
@@ -277,9 +301,9 @@ async function toggleThread(id){
   catch(e){ toast('Could not load thread'); btn.textContent='🧵 Thread'; return; }
   const sibs = data.siblings || [];
   if(!sibs.length){
-    box.innerHTML = `<div class="text-xs text-slate-500 py-1">No other sessions in “${data.folder||''}”.</div>`;
+    box.innerHTML = `<div class="text-xs text-slate-500 py-1">No other sessions in “${esc(data.folder||'')}”.</div>`;
   } else {
-    box.innerHTML = `<div class="text-xs text-slate-400 mb-1">${sibs.length} sibling session${sibs.length>1?'s':''} in “${data.folder||''}”</div>` +
+    box.innerHTML = `<div class="text-xs text-slate-400 mb-1">${sibs.length} sibling session${sibs.length>1?'s':''} in “${esc(data.folder||'')}”</div>` +
       sibs.map(renderSibling).join('');
   }
   box.classList.remove('hidden');
@@ -287,19 +311,19 @@ async function toggleThread(id){
 }
 
 function renderSibling(s){
-  const desc = (s.summary || s.title || s.first_message || '(no description)').replace(/</g,'&lt;');
+  const desc = s.summary || s.title || s.first_message || '(no description)';
   const one = desc.length>110 ? desc.slice(0,110)+'…' : desc;
   const srcCls = SOURCE_COLORS[s.cli_source] || 'bg-slate-500/15 text-slate-400 border-slate-500/30';
   return `<div class="flex items-center justify-between gap-3 py-1.5 border-b border-slate-100 dark:border-slate-800 last:border-0">
     <div class="min-w-0">
       <div class="flex items-center gap-2">
-        <span class="font-medium text-sm truncate">${s.title || one.slice(0,50)}</span>
+        <span class="font-medium text-sm truncate">${esc(s.title || one.slice(0,50))}</span>
         ${badge(s.cli_source, srcCls+' shrink-0')}
       </div>
-      <div class="text-xs text-slate-500 dark:text-slate-400 truncate">${one}</div>
-      <div class="text-[11px] text-slate-400">${new Date(s.last_activity).toLocaleString()} · ${s.turn_count} turns</div>
+      <div class="text-xs text-slate-500 dark:text-slate-400 truncate">${esc(one)}</div>
+      <div class="text-[11px] text-slate-400">${new Date(s.last_activity).toLocaleString()} · ${esc(s.turn_count)} turns</div>
     </div>
-    <button onclick="resume('${s.session_id}')" class="shrink-0 text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>
+    <button data-act="resume" data-sid="${esc(s.session_id)}" class="shrink-0 text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>
   </div>`;
 }
 

@@ -29,6 +29,19 @@ PORT = int(sbconfig.CONFIG["ui"]["port"])
 app = Flask(__name__, static_folder=None)
 SOURCES = build_source_registry()
 
+# DNS-rebinding guard: a malicious website can point its own domain at
+# 127.0.0.1 and read this API cross-origin. Only accept requests addressed to
+# the loopback names / the configured host.
+_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]", HOST}
+
+
+@app.before_request
+def _check_host():
+    host = (request.host or "").rsplit(":", 1)[0] if not request.host.startswith("[") \
+        else request.host.split("]")[0] + "]"
+    if host not in _ALLOWED_HOSTS:
+        return Response("Forbidden: bad Host header", status=403)
+
 
 # --- helpers ------------------------------------------------------------------
 def _row_to_dict(row) -> dict:
@@ -68,6 +81,11 @@ def _is_active(last_activity: str | None) -> bool:
 @app.get("/")
 def index():
     return send_from_directory(STATIC_DIR, "index.html")
+
+
+@app.get("/static/<path:filename>")
+def static_files(filename: str):
+    return send_from_directory(STATIC_DIR, filename)
 
 
 @app.get("/health")
@@ -121,10 +139,12 @@ def api_sessions():
         params.append(f'%"{topic}"%')
     if days:
         try:
+            days_i = int(days)  # parse BEFORE touching where/params — a bad value
+        except ValueError:      # must not leave a placeholder without its param
+            days_i = None
+        if days_i is not None:
             where.append("last_activity >= datetime('now', ?)")
-            params.append(f"-{int(days)} days")
-        except ValueError:
-            pass
+            params.append(f"-{days_i} days")
     if sem_ids is not None:
         if not sem_ids:
             return jsonify([])
@@ -201,8 +221,8 @@ def api_resume(sid: str):
     # the directory where you want to continue — it ports the session's memory there
     # and resumes. command_full is the direct script call if `cr` isn't installed.
     wrapper = _REPO / "bin" / "resume-here.sh"
-    command = f"cr {sid}"
-    command_full = f'{shlex.quote(str(wrapper))} {sid} {row["cli_source"]}'
+    command = f"cr {shlex.quote(sid)}"
+    command_full = f'{shlex.quote(str(wrapper))} {shlex.quote(sid)} {row["cli_source"]}'
     return jsonify({"command": command, "command_full": command_full,
                     "raw_command": raw, "origin_cwd": cwd, "cli_source": row["cli_source"]})
 
@@ -253,10 +273,14 @@ def _build_context(conn, sid: str) -> tuple[str, str] | None:
         L += ["", "## Recent reasoning (visible)"]
         for content, turn in reasoning:
             L.append(f"- _turn {turn}:_ {content[:400].strip()}")
+    # project_path is the session dir for copilot (transcript = events.jsonl
+    # inside it) and the project dir for claude (transcript = <sid>.jsonl).
+    transcript = (f"{d.get('project_path')}/events.jsonl" if d["cli_source"] == "copilot"
+                  else f"{d.get('project_path')}/{sid}.jsonl")
     L += [
         "",
         "## Pointers",
-        f"- Transcript: `{d.get('project_path')}/{sid}.jsonl`",
+        f"- Transcript: `{transcript}`",
     ]
     if d.get("reasoning_path"):
         L.append(f"- Full decision trail: `{d['reasoning_path']}`")
@@ -432,4 +456,6 @@ def api_stats():
 if __name__ == "__main__":
     sbconfig.ensure_dirs()
     print(f"Session Browser on http://{HOST}:{PORT}  (sources: {list(SOURCES)})")
-    app.run(host=HOST, port=PORT, debug=False)
+    # threaded: the first semantic query loads the embedding model for seconds —
+    # a single-threaded server would freeze every other request meanwhile.
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
