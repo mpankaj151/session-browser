@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import indexer  # noqa: E402
+import redact as _redact  # noqa: E402
 import sbconfig  # noqa: E402
 from enrichment.provider import get_provider  # noqa: E402
 from sources.registry import build_source_registry  # noqa: E402
@@ -71,6 +72,10 @@ def main() -> None:
                 continue
             facet = provider.summarize(parsed.turns, s["cli_source"],
                                        s["model_used"] or "", s["cwd"] or "")
+            # Belt and suspenders: the prompt is already redacted, but the LLM
+            # could still reconstruct a secret-looking string. Nothing derived
+            # from a transcript is persisted or egressed unredacted.
+            facet = _redact.redact_obj(facet)
             (sbconfig.FACETS_DIR / f"{s['session_id']}.json").write_text(
                 json.dumps(facet, indent=2))
             topics_list = list(facet.get("goal_categories", {}).keys())

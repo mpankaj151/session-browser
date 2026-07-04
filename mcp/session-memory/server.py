@@ -75,7 +75,7 @@ def get_session_summary(session_id: str) -> dict:
         ]
     finally:
         conn.close()
-    return {
+    return common.sanitize({
         "session_id": session_id,
         "summary": r["summary"] or r["title"],
         "topics": _json(r["topics"]),
@@ -85,7 +85,7 @@ def get_session_summary(session_id: str) -> dict:
         "model_used": r["model_used"],
         "cost_usd": r["cost_usd"],
         "decisions": decisions,
-    }
+    })
 
 
 @mcp.tool()
@@ -178,8 +178,8 @@ def get_reasoning(session_id: str, query: str = "") -> dict:
     if not r or not r["reasoning_path"] or not Path(r["reasoning_path"]).exists():
         return {"error": "no reasoning trail; run extract-reasoning.py for this session"}
     md = Path(r["reasoning_path"]).read_text(encoding="utf-8")
-    return {"session_id": session_id, "markdown": md[:6000],
-            "truncated": len(md) > 6000, "path": r["reasoning_path"]}
+    return common.sanitize({"session_id": session_id, "markdown": md[:6000],
+                            "truncated": len(md) > 6000, "path": r["reasoning_path"]})
 
 
 def _json(s):

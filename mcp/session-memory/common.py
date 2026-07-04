@@ -11,9 +11,17 @@ _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO))
 
 import indexer  # noqa: E402
+import redact as _redact  # noqa: E402
 
 DB_PATH = os.environ.get("SESSION_MEMORY_DB", str(indexer.DB_PATH))
 MAX_BYTES = 2048
+
+
+def sanitize(obj):
+    """Tool results leave the machine (they're sent to the model provider), so
+    every string field is redacted on the way out — including rows enriched
+    before redaction-at-persist existed."""
+    return _redact.redact_obj(obj)
 
 
 def connect():
@@ -34,7 +42,9 @@ def connect():
 
 
 def clamp(items: list, serialize=json.dumps) -> list:
-    """Trim a list so its serialized form stays under MAX_BYTES; note what was cut."""
+    """Trim a list so its serialized form stays under MAX_BYTES; note what was cut.
+    Redacts first — every list-returning tool funnels through here."""
+    items = sanitize(items)
     out: list = []
     for i, item in enumerate(items):
         trial = serialize(out + [item])

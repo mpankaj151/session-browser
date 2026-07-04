@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
 REQUIRED_KEYS = {"brief_summary", "goal_categories", "session_type", "outcome"}
 _REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO))
+
+import redact as _redact  # noqa: E402
 
 
 class FacetValidationError(ValueError):
@@ -72,7 +76,9 @@ def render_prompt(turns: list, cli_source: str, model: str, cwd: str,
     lines = []
     for t in turns[:60]:
         role = getattr(t, "role", "?").upper()
-        content = (getattr(t, "content", "") or "")[:1500]
+        # Redact BEFORE the LLM sees the transcript: a summary can't echo a
+        # credential it never received, and summarization doesn't need the value.
+        content = _redact.redact((getattr(t, "content", "") or "")[:1500])
         if content:
             lines.append(f"**{role}:** {content}")
     transcript = "\n\n".join(lines)

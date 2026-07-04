@@ -74,6 +74,41 @@ def test_redaction_json_and_modern_tokens():
     print("  ok  redaction: JSON form + github_pat/npm/xox*")
 
 
+def test_redaction_stripe_urlcreds_keys_auth():
+    # Stripe underscores (the sk- patterns require a hyphen)
+    for leak in ('STRIPE_KEY=sk_live_51H8xAbCdEfGhIj', 'bare sk_live_51H8xAbCdEfGhIj',
+                 'whsec_AbCdEf123456789'):
+        assert 'sk_live' not in redact.redact(leak) or '«REDACTED»' in redact.redact(leak), leak
+        assert '«REDACTED»' in redact.redact(leak), leak
+    # generic *_KEY assignments (not just *SECRET*/API_KEY)
+    for leak, secret in (('ENCRYPTION_KEY=aGVsbG8xMjM0NTY=', 'aGVsbG8xMjM0NTY'),
+                         ('SIGNING_KEY: 9f8e7d6c5b4a', '9f8e7d6c5b4a'),
+                         ('"deploy_key": "abcdef-123456"', 'abcdef-123456')):
+        r = redact.redact(leak)
+        assert '«REDACTED»' in r and secret not in r, leak
+    # URL basic-auth credentials — password masked, structure intact
+    r = redact.redact('DATABASE_URL=postgres://admin:hunter2pw@db.internal/x')
+    assert 'hunter2pw' not in r and '://admin:«REDACTED»@db.internal' in r
+    # Authorization header, any/no scheme
+    for leak in ('Authorization: Bearer shorttok123', 'Authorization: rawOpaque123456'):
+        assert '«REDACTED»' in redact.redact(leak), leak
+    # over-redaction guards: benign shapes survive
+    for keep in ('primary_key=True', 'the monkey=business idiom',
+                 'visit https://github.com/o/r.git today', 'http://localhost:7655/api'):
+        assert redact.redact(keep) == keep, keep
+    print("  ok  redaction: stripe/url-creds/*_KEY/authorization")
+
+
+def test_redact_obj_walks_structures():
+    facet = {"brief_summary": "Wired Stripe with sk_live_51H8xAbCdEfGhIj",
+             "key_decisions": ["use STRIPE_KEY=sk_live_51H8xAbCdEfGhIj"],
+             "goal_categories": {"payments": 2}, "n": 3}
+    out = redact.redact_obj(facet)
+    assert 'sk_live' not in json.dumps(out) and out["n"] == 3
+    assert out["goal_categories"] == {"payments": 2}
+    print("  ok  redact_obj masks nested facet strings")
+
+
 def test_redaction_hash_scoping():
     # bare hashes in prose survive (FTS stays searchable by commit SHA)
     sha = '3031ee3891a699f0000000000000000000000000'

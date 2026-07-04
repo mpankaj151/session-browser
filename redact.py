@@ -22,13 +22,24 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("slack-token", re.compile(r"xox[a-z]-[A-Za-z0-9-]{10,}")),
     ("google-key", re.compile(r"AIza[0-9A-Za-z_\-]{30,}")),
     ("aws-key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    # Stripe uses underscores (sk_live_...), so the hyphenated sk- patterns miss it.
+    ("stripe-key", re.compile(r"\b[rps]k_(?:live|test)_[A-Za-z0-9]{10,}")),
+    ("stripe-webhook-secret", re.compile(r"\bwhsec_[A-Za-z0-9]{10,}")),
+    # Authorization header with any (or no) scheme — raw opaque tokens included.
+    ("assigned-auth-header", re.compile(
+        r"(?i)(\bauthorization\b['\"]?\s*[:=]\s*['\"]?(?:(?:basic|bearer|token)\s+)?)"
+        r"([A-Za-z0-9._~+/=\-]{8,})")),
     ("bearer", re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]{20,}")),
+    # user:password@host in connection strings / authenticated git remotes.
+    ("assigned-url-credentials", re.compile(r"(://[^/\s:@'\"]{1,64}:)([^/\s:@'\"]{3,256})(?=@)")),
     ("jwt", re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
     ("private-key-block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S)),
     # KEY=VALUE / KEY: value / "key": "value" (JSON) assignments for secret-ish names.
     # The optional quotes around the name and before the value make JSON forms match.
+    # [_-]key (not bare "key") so ENCRYPTION_KEY/SIGNING_KEY/APP_KEY match without
+    # masking every dict-literal `key=` in code discussions.
     ("assigned-secret", re.compile(
-        r"(?i)(['\"]?\b[A-Z0-9_]*(?:secret|api[_-]?key|token|password|passwd|access[_-]?key)[A-Z0-9_]*\b['\"]?"
+        r"(?i)(['\"]?\b[A-Z0-9_]*(?:secret|api[_-]?key|token|password|passwd|access[_-]?key|[_-]key|credentials?)[A-Z0-9_]*\b['\"]?"
         r"\s*[:=]\s*['\"]?)([^\s'\"]{6,})")),
     # Long hex runs, but only in a value position (after = : or an opening quote).
     # A bare hash in prose/git-log output (commit SHAs, digests) is left alone so the
@@ -49,6 +60,18 @@ def redact(text: str) -> str:
         else:
             out = pat.sub(_MASK, out)
     return out
+
+
+def redact_obj(obj):
+    """Recursively redact every string in a JSON-like structure (dict keys included —
+    LLM-generated topic keys are content too). Non-string leaves pass through."""
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, dict):
+        return {(redact(k) if isinstance(k, str) else k): redact_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_obj(v) for v in obj]
+    return obj
 
 
 def redact_count(text: str) -> int:
