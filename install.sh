@@ -59,17 +59,32 @@ fi
 # 6. Stop hook
 if [ "$NO_HOOK" -eq 0 ]; then
   echo "==> registering Claude Stop hook"
-  "$PY" - "$REPO" <<'PYEOF'
+  "$PY" - "$REPO" <<'PYEOF' || echo "   ! hook registration failed — everything else still works (watcher covers indexing)"
 import json, sys, shutil
 from pathlib import Path
 repo = Path(sys.argv[1])
 settings = Path.home()/".claude"/"settings.json"
-cfg = json.loads(settings.read_text()) if settings.exists() else {}
+# Back up BEFORE parsing: if the user's file is malformed we must not have
+# touched anything, and they keep a copy either way.
 if settings.exists():
     shutil.copy2(settings, settings.with_suffix(".json.sb-backup"))
-cmd = f"{repo}/.venv/bin/python {repo}/scripts/session-hook.py"
+try:
+    cfg = json.loads(settings.read_text()) if settings.exists() else {}
+except (json.JSONDecodeError, OSError) as e:
+    print(f"   ! ~/.claude/settings.json is not valid JSON ({e}) — skipping hook registration.")
+    print("     Fix the file, then re-run: ./install.sh --no-backfill --no-launchd")
+    sys.exit(0)
+if not isinstance(cfg, dict):
+    print("   ! settings.json is not a JSON object — skipping hook registration"); sys.exit(0)
+# Paths quoted: the hook command runs through a shell, and the repo path may
+# contain spaces (e.g. ~/My Projects/session-browser).
+cmd = f'"{repo}/.venv/bin/python" "{repo}/scripts/session-hook.py"'
 hooks = cfg.setdefault("hooks", {})
-stop = hooks.setdefault("Stop", [])
+if not isinstance(hooks, dict):
+    print("   ! settings.json 'hooks' is not an object — skipping hook registration"); sys.exit(0)
+stop = hooks.get("Stop")
+if not isinstance(stop, list):
+    stop = hooks["Stop"] = []
 already = any("session-hook.py" in json.dumps(h) for h in stop)
 if not already:
     stop.append({"hooks":[{"type":"command","command":cmd}]})
@@ -90,10 +105,19 @@ fi
 if [ "$NO_LAUNCHD" -eq 0 ]; then
   echo "==> installing launchd jobs"
   AGENTS="$HOME/Library/LaunchAgents"; mkdir -p "$AGENTS"
+  # launchd PATH: system dirs + Homebrew (both arches) + wherever the user's CLI
+  # binaries actually live (npm globals, volta, etc.) — enrichment shells out to
+  # `claude`, and a PATH miss silently disables it.
+  JOB_PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$HOME_DIR/.local/bin"
+  for c in claude copilot codex; do
+    B="$(command -v "$c" 2>/dev/null || true)"
+    if [ -n "$B" ]; then D="$(dirname "$B")"; case ":$JOB_PATH:" in *":$D:"*) ;; *) JOB_PATH="$JOB_PATH:$D";; esac; fi
+  done
   # watcher = live indexing; refresh = nightly full pipeline (cost/reasoning/fts/embed/enrich)
   for job in watcher refresh; do
     sed -e "s|__VENV_PY__|$PY|g" -e "s|__REPO__|$REPO|g" \
         -e "s|__LOG_DIR__|$LOG_DIR|g" -e "s|__HOME__|$HOME_DIR|g" \
+        -e "s|__PATH__|$JOB_PATH|g" \
         "$REPO/launchd/$job.plist.template" > "$AGENTS/com.sessionbrowser.$job.plist"
     launchctl unload "$AGENTS/com.sessionbrowser.$job.plist" 2>/dev/null || true
     launchctl load "$AGENTS/com.sessionbrowser.$job.plist"

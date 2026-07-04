@@ -22,8 +22,14 @@ SID="${1:?usage: resume-here.sh <session_id> [cli_source]}"
 CLI="${2:-auto}"
 CUR="$(pwd)"
 
-# Claude encodes a project path by replacing / . _ with - (observed convention).
-encode_path() { printf '%s' "$1" | sed 's/[\/._]/-/g'; }
+# Session ids are used in find -name patterns; refuse glob/path metacharacters.
+case "$SID" in
+  *[\*\?\[\]/]*) echo "cr: invalid session id '$SID'" >&2; exit 1;;
+esac
+
+# Claude Code encodes a project path by replacing every non-alphanumeric
+# character with '-' (spaces, dots, underscores, slashes — all of them).
+encode_path() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
 
 # Auto-detect which CLI owns this session id.
 if [ "$CLI" = "auto" ]; then
@@ -47,6 +53,11 @@ case "$CLI" in
     # Resolve to the REAL file (in case SRC is itself a symlink from a prior cr),
     # so every location links back to one canonical transcript — always in sync.
     SRC_REAL="$(realpath "$SRC" 2>/dev/null || echo "$SRC")"
+    if [ ! -e "$SRC_REAL" ]; then
+      echo "cr: found only a dangling link for $SID — the canonical transcript was deleted" >&2
+      echo "cr: ($SRC -> $SRC_REAL)" >&2
+      exit 1
+    fi
     DEST_DIR="$PROJECTS/$(encode_path "$CUR")"
     DEST="$DEST_DIR/$SID.jsonl"
     if [ "$SRC_REAL" != "$DEST" ] && [ ! -e "$DEST" ]; then

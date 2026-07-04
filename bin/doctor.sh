@@ -13,9 +13,12 @@ echo "[python & deps]"
 if [ -x "$PY" ]; then ok "venv python present"; else bad "venv python missing — run install.sh"; fi
 "$PY" - <<'PYEOF'
 import importlib, sys
-for m in ["flask","numpy","sentence_transformers","watchdog","yaml"]:
+for m in ["flask","numpy","watchdog","yaml"]:
     try: importlib.import_module(m); print(f"  \033[32m✓\033[0m import {m}")
     except Exception as e: print(f"  \033[31m✗\033[0m import {m}: {e}")
+# optional (--lite installs skip it): absence is a mode, not a failure
+try: importlib.import_module("sentence_transformers"); print("  \033[32m✓\033[0m import sentence_transformers")
+except Exception: print("  \033[33m∼\033[0m sentence_transformers absent (--lite: semantic search falls back to keyword/full-text)")
 # sqlite extension capability (optional fast path)
 import sqlite3
 c=sqlite3.connect(":memory:")
@@ -24,8 +27,8 @@ print(f"  {'\033[32m✓\033[0m' if hasattr(c,'enable_load_extension') else '\033
 PYEOF
 
 echo "[database]"
-"$PY" - <<'PYEOF'
-import sys; sys.path.insert(0,".")
+"$PY" - "$REPO" <<'PYEOF'
+import sys; sys.path.insert(0, sys.argv[1])   # repo path, NOT cwd — doctor may run from anywhere
 import indexer, sbconfig
 try:
     c=indexer.connect()
@@ -63,8 +66,8 @@ else:
 PYEOF
 
 echo "[sources]"
-"$PY" - <<'PYEOF'
-import sys; sys.path.insert(0,".")
+"$PY" - "$REPO" <<'PYEOF'
+import sys; sys.path.insert(0, sys.argv[1])
 from sources.registry import build_source_registry
 for name,a in build_source_registry().items():
     avail=a.is_available()

@@ -12,7 +12,7 @@
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>1</integer><key>Minute</key><integer>0</integer></dict>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:__HOME__/.local/bin</string></dict>
+  <dict><key>PATH</key><string>__PATH__</string></dict>
   <key>StandardOutPath</key><string>__LOG_DIR__/refresh.out.log</string>
   <key>StandardErrorPath</key><string>__LOG_DIR__/refresh.err.log</string>
 </dict>

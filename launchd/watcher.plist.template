@@ -9,9 +9,12 @@
     <string>__REPO__/watcher.py</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <!-- Restart only on abnormal exit: the watcher exits 0 on purpose when the
+       singleton lock is held or no sources exist — unconditional KeepAlive
+       would respawn it every ~10s forever. -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string></dict>
+  <dict><key>PATH</key><string>__PATH__</string></dict>
   <key>StandardOutPath</key><string>__LOG_DIR__/watcher.out.log</string>
   <key>StandardErrorPath</key><string>__LOG_DIR__/watcher.err.log</string>
 </dict>
