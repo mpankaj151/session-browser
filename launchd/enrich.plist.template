@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.sessionbrowser.enrich</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__VENV_PY__</string>
+    <string>__REPO__/scripts/enrich-sessions.py</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:__HOME__/.local/bin</string></dict>
+  <key>StandardOutPath</key><string>__LOG_DIR__/enrich.out.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/enrich.err.log</string>
+</dict>
+</plist>

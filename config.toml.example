@@ -1,0 +1,71 @@
+# Session Browser configuration. Copy to config.toml and edit.
+# Paths use ~ for the home directory; they are expanded at load time.
+
+[paths]
+db          = "~/.session-browser/registry.db"
+facets_dir  = "~/.session-browser/facets"
+hook_state  = "~/.session-browser/.hook-state.json"
+log_dir     = "~/.session-browser/logs"
+
+[ui]
+host             = "127.0.0.1"
+port             = 7655
+default_filter   = "all"
+bridge_max_chars = 3000
+show_onboarding  = "auto"
+
+# --- Sources -----------------------------------------------------------------
+# Each enabled source maps to an adapter in sources/. Adding a new CLI
+# (opencode, ollama, codex, ...) is a new sources/<name>.py + a block here.
+
+[sources.claude]
+enabled      = true
+projects_dir = "~/.claude/projects"
+binary       = "claude"
+
+[sources.copilot]
+enabled   = true
+state_dir = "~/.copilot/session-state"
+binary    = "copilot"
+
+# Deferred — present for easy enablement later.
+[sources.codex]
+enabled      = false
+sessions_dir = "~/.codex/sessions"
+binary       = "codex"
+
+# --- Enrichment --------------------------------------------------------------
+[enrichment]
+provider = "claude-headless"   # claude-headless | copilot-headless | none
+
+[enrichment.claude_headless]
+binary          = "claude"
+exec_args       = ["--print"]
+prompt_template = "summarize-multi-source.md"
+timeout_secs    = 180
+
+# --- Reasoning archive (headline feature) ------------------------------------
+# Raw transcripts and rendered "thinking -> decision -> action" trails are
+# written under archive_dir/{raw,readable}/YYYY/MM/.
+[reasoning]
+enabled     = true
+archive_dir = "~/claude-reasoning-archive"
+
+# --- Billing -----------------------------------------------------------------
+# Most users are on a flat-rate subscription, NOT per-token API billing. In
+# "subscription" mode the per-session dollar figure is treated as a NOTIONAL
+# API-equivalent (what it *would* cost on the API) — useful as a usage/intensity
+# signal, but you are not billed per token. Set mode="api" if you actually pay
+# per token.
+[billing]
+mode        = "subscription"   # subscription | api
+plan        = "Claude Max 5x"
+monthly_usd = 100              # flat monthly price of the plan (for context)
+
+# --- Embeddings / semantic search --------------------------------------------
+# Default backend is numpy brute-force cosine over BLOB embeddings (no native
+# extension needed; fast for up to a few thousand sessions). If sqlite-vec is
+# loadable in the active interpreter it is used as an optional fast path.
+[embeddings]
+model   = "all-MiniLM-L6-v2"
+backend = "auto"   # auto | numpy | sqlite-vec

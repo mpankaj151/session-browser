@@ -1,0 +1,70 @@
+"""Semantic search over session embeddings.
+
+Default backend: numpy brute-force cosine over float32 BLOBs stored in
+session_embeddings. No native SQLite extension required and trivially fast for up
+to a few thousand sessions. The SentenceTransformer model is loaded lazily and
+cached so the first query pays the load cost, not import time.
+"""
+from __future__ import annotations
+
+import os
+import struct
+from functools import lru_cache
+
+# Local-first: the model is cached after first download; don't hit the network.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+import numpy as np
+
+import indexer
+import sbconfig
+
+DIM = 384
+
+
+@lru_cache(maxsize=1)
+def get_model():
+    from sentence_transformers import SentenceTransformer
+    try:
+        return SentenceTransformer(sbconfig.EMBED_MODEL)
+    except Exception:  # noqa: BLE001 — model not cached yet: allow one online fetch
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        return SentenceTransformer(sbconfig.EMBED_MODEL)
+
+
+def embed_text(text: str) -> np.ndarray:
+    vec = get_model().encode([text or ""], normalize_embeddings=True)[0]
+    return np.asarray(vec, dtype=np.float32)
+
+
+def pack(vec: np.ndarray) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec.tolist())
+
+
+def unpack(blob: bytes) -> np.ndarray:
+    n = len(blob) // 4
+    return np.asarray(struct.unpack(f"{n}f", blob), dtype=np.float32)
+
+
+def search(query: str, limit: int = 20, conn=None) -> list[tuple[str, float]]:
+    """Return [(session_id, similarity)] sorted high→low. Empty if no embeddings."""
+    own = conn is None
+    conn = conn or indexer.connect()
+    try:
+        rows = conn.execute(
+            "SELECT e.session_id, e.embedding FROM session_embeddings e "
+            "JOIN sessions s ON s.session_id = e.session_id WHERE s.archived = 0"
+        ).fetchall()
+    finally:
+        if own:
+            conn.close()
+    if not rows:
+        return []
+    ids = [r[0] for r in rows]
+    mat = np.vstack([unpack(r[1]) for r in rows])          # (N, 384), already normalized
+    q = embed_text(query)                                  # normalized
+    sims = mat @ q                                         # cosine since unit vectors
+    order = np.argsort(-sims)[:limit]
+    return [(ids[i], float(sims[i])) for i in order]

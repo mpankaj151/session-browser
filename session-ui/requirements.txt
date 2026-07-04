@@ -1,0 +1,7 @@
+flask
+sentence-transformers>=2.7
+numpy>=1.26
+watchdog>=4.0
+pyyaml>=6.0
+# Optional fast-path for semantic search; not required (numpy brute-force is the
+# default backend). On platforms with a wheel: sqlite-vec>=0.1.6

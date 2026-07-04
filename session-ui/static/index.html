@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Session Browser</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🧠</text></svg>"/>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config = { darkMode: 'class' };</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  body { font-family: 'Inter', system-ui, sans-serif; }
+  .clamp2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .kb-active { outline: 2px solid #6366f1; outline-offset: 2px; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 5px; }
+</style>
+</head>
+<body class="bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 min-h-screen">
+<div class="max-w-6xl mx-auto px-4 py-6">
+
+  <!-- Header -->
+  <header class="flex items-center justify-between mb-5">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center text-white font-bold">S</div>
+      <div>
+        <h1 class="text-xl font-bold">Session Browser</h1>
+        <p id="stats" class="text-xs text-slate-500 dark:text-slate-400">loading…</p>
+      </div>
+    </div>
+    <button id="darkToggle" class="text-sm px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800">🌓</button>
+  </header>
+
+  <!-- Filters -->
+  <div class="flex flex-wrap items-center gap-2 mb-3">
+    <input id="search" type="text" placeholder="Search sessions…  (press /)"
+      class="flex-1 min-w-[220px] px-3 py-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 focus:ring-2 focus:ring-indigo-500 outline-none"/>
+    <select id="folder" class="px-2 py-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-sm"></select>
+    <select id="topic"  class="px-2 py-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-sm"></select>
+    <select id="days"   class="px-2 py-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-sm">
+      <option value="">All time</option><option value="1">24h</option><option value="7">7 days</option><option value="30">30 days</option>
+    </select>
+    <select id="mode" title="Search mode" class="px-2 py-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-sm">
+      <option value="">Keyword</option>
+      <option value="semantic">Semantic</option>
+      <option value="fulltext">Full-text</option>
+    </select>
+    <button id="refresh" class="text-sm px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white">Refresh</button>
+  </div>
+
+  <!-- Source pills -->
+  <div id="pills" class="flex gap-2 mb-5"></div>
+
+  <!-- Session list -->
+  <div id="list" class="space-y-6"></div>
+  <div id="empty" class="hidden text-center text-slate-500 py-16">No sessions match.</div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg bg-slate-900 text-white text-sm shadow-lg opacity-0 transition-opacity pointer-events-none"></div>
+
+<!-- Modal (reasoning, etc.) -->
+<div id="modal" class="hidden fixed inset-0 bg-black/50 z-40 flex items-center justify-center p-4" onclick="if(event.target===this)closeModal()">
+  <div class="bg-white dark:bg-slate-900 rounded-2xl max-w-3xl w-full max-h-[85vh] overflow-auto p-6 shadow-2xl">
+    <div class="flex items-center justify-between mb-3">
+      <h2 id="modalTitle" class="text-lg font-semibold"></h2>
+      <button onclick="closeModal()" class="text-slate-400 hover:text-slate-200 text-xl">×</button>
+    </div>
+    <div id="modalBody" class="prose prose-sm dark:prose-invert max-w-none whitespace-pre-wrap text-sm leading-relaxed"></div>
+  </div>
+</div>
+
+<script>
+const SOURCE_COLORS = {
+  claude: 'bg-orange-500/15 text-orange-600 dark:text-orange-300 border-orange-500/30',
+  copilot: 'bg-sky-500/15 text-sky-600 dark:text-sky-300 border-sky-500/30',
+  codex: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border-emerald-500/30',
+};
+let STATE = { source: 'all', sessions: [], kbIndex: -1 };
+
+const $ = s => document.querySelector(s);
+async function fetchJson(url){ const r = await fetch(url); if(!r.ok) throw new Error(r.status); return r.json(); }
+function toast(msg){ const t=$('#toast'); t.textContent=msg; t.style.opacity='1'; setTimeout(()=>t.style.opacity='0',1600); }
+function closeModal(){ $('#modal').classList.add('hidden'); }
+function openModal(title, body){ $('#modalTitle').textContent=title; $('#modalBody').textContent=body; $('#modal').classList.remove('hidden'); }
+function openModalMd(title, md){ $('#modalTitle').textContent=title; $('#modalBody').innerHTML=mdToHtml(md); $('#modal').classList.remove('hidden'); $('#modalBody').scrollTop=0; }
+
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function mdToHtml(md){
+  const out=[]; let inList=false;
+  for(let raw of md.split('\n')){
+    let line=esc(raw);
+    line=line.replace(/`([^`]+)`/g,'<code class="px-1 rounded bg-slate-200 dark:bg-slate-800">$1</code>')
+             .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>');
+    const flush=()=>{ if(inList){ out.push('</ul>'); inList=false; } };
+    if(/^## /.test(raw)){ flush(); out.push(`<h3 class="font-semibold mt-4 mb-1 text-indigo-500">${line.slice(3)}</h3>`); }
+    else if(/^# /.test(raw)){ flush(); out.push(`<h2 class="font-bold text-lg mb-2">${line.slice(2)}</h2>`); }
+    else if(/^> /.test(raw)){ flush(); out.push(`<blockquote class="border-l-2 border-indigo-400 pl-3 my-1 text-slate-600 dark:text-slate-300">${line.slice(2)}</blockquote>`); }
+    else if(/^- /.test(raw)){ if(!inList){ out.push('<ul class="list-disc ml-5 my-1">'); inList=true; } out.push(`<li>${line.slice(2)}</li>`); }
+    else if(/^---/.test(raw)){ flush(); out.push('<hr class="my-3 border-slate-200 dark:border-slate-800"/>'); }
+    else if(line.trim()===''){ flush(); }
+    else { flush(); out.push(`<p class="my-1">${line}</p>`); }
+  }
+  if(inList) out.push('</ul>');
+  return out.join('');
+}
+
+function humanTokens(n){
+  n = n||0;
+  if(n>=1e9) return (n/1e9).toFixed(1)+'B';
+  if(n>=1e6) return (n/1e6).toFixed(1)+'M';
+  if(n>=1e3) return (n/1e3).toFixed(1)+'K';
+  return ''+n;
+}
+function fmtCost(c){
+  if(c==null || typeof c !== 'object') return '';
+  const v = c.usd;
+  const total = (c.input||0)+(c.output||0)+(c.cache_read||0)+(c.cache_write||0);
+  const notional = c.notional;
+  let out = '';
+  // token volume (always, if we have any)
+  if(total>0){
+    out += `<span class="text-xs font-mono text-slate-400" title="in ${c.input||0} · out ${c.output||0} · cache-read ${c.cache_read||0} · cache-write ${c.cache_write||0}">${humanTokens(total)} tok</span>`;
+  }
+  // cost (public API list-price equivalent)
+  if(v!=null){
+    const cls = v>=1 ? 'text-red-500' : v>=0.1 ? 'text-amber-500' : 'text-slate-500';
+    const prefix = notional ? '≈' : '';
+    const tip = notional
+      ? 'Public API list-price equivalent — NOT billed (flat-rate subscription)'
+      : 'Estimated actual API cost (public list price)';
+    out += ` <span class="${cls} text-xs font-mono" title="${tip}">${prefix}$${v.toFixed(v<0.01?4:2)}</span>`;
+  }
+  return out;
+}
+
+function group(sessions){
+  const now=new Date(), groups={Today:[],Yesterday:[],'This week':[],Older:[]};
+  for(const s of sessions){
+    const d=new Date(s.last_activity); const days=(now-d)/86400000;
+    if(days<1 && d.getDate()===now.getDate()) groups.Today.push(s);
+    else if(days<2) groups.Yesterday.push(s);
+    else if(days<7) groups['This week'].push(s);
+    else groups.Older.push(s);
+  }
+  return groups;
+}
+
+function badge(text, cls){ return `<span class="px-2 py-0.5 rounded-md text-xs border ${cls}">${text}</span>`; }
+
+function renderCard(s, idx){
+  const dot = s.is_active ? 'bg-emerald-500' : (s.summary ? 'bg-indigo-500' : 'bg-slate-400');
+  const srcCls = SOURCE_COLORS[s.cli_source] || 'bg-slate-500/15 text-slate-400 border-slate-500/30';
+  const topics = (s.topics||[]).slice(0,4).map(t=>`<button onclick="filterTopic('${t}')" class="px-2 py-0.5 rounded-md text-xs bg-slate-200 dark:bg-slate-800 hover:bg-indigo-500/20">#${t}</button>`).join(' ');
+  const reasoningBtn = s.has_reasoning
+    ? `<button onclick="showReasoning('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-violet-600/90 hover:bg-violet-500 text-white">🧠 Reasoning</button>` : '';
+  return `<div class="card border border-slate-200 dark:border-slate-800 rounded-xl p-4 bg-white dark:bg-slate-900 hover:border-indigo-400/50 transition" data-idx="${idx}">
+    <div class="flex items-start justify-between gap-3">
+      <div class="flex items-center gap-2 min-w-0">
+        <span class="w-2 h-2 rounded-full ${dot} shrink-0"></span>
+        <h3 class="font-semibold truncate">${s.title || s.first_message?.slice(0,60) || '(untitled session)'}</h3>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">${fmtCost(s.cost)} ${badge(s.cli_source, srcCls)}</div>
+    </div>
+    <div class="flex flex-wrap items-center gap-1.5 mt-2 text-xs text-slate-500">
+      ${badge(s.folder_name||'—','bg-slate-100 dark:bg-slate-800 border-slate-300/40 dark:border-slate-700')}
+      ${s.session_type?badge(s.session_type,'bg-purple-500/10 text-purple-500 border-purple-500/30'):''}
+      ${s.outcome?badge(s.outcome,'bg-green-500/10 text-green-600 border-green-500/30'):''}
+      <span>${s.turn_count} turns</span><span>·</span><span>${s.model_used||''}</span>
+      <span>·</span><span>${new Date(s.last_activity).toLocaleString()}</span>
+    </div>
+    <p class="clamp2 text-sm text-slate-600 dark:text-slate-300 mt-2">${(s.summary||s.first_message||'').replace(/</g,'&lt;')}</p>
+    <div class="flex flex-wrap gap-1.5 mt-2">${topics}</div>
+    <div class="flex flex-wrap gap-2 mt-3">
+      <button onclick="resume('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>
+      ${reasoningBtn}
+      <button onclick="copyContext('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">📋 Copy Context</button>
+      <button onclick="exportContext('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">⬇ Export</button>
+      <button id="thbtn-${s.session_id}" onclick="toggleThread('${s.session_id}')" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">🧵 Thread</button>
+      <button onclick="toggleBridge('${s.session_id}','${s.cli_source}')" class="text-xs px-2.5 py-1 rounded-md bg-teal-600/90 hover:bg-teal-500 text-white">🌉 Bridge</button>
+      <span id="brmenu-${s.session_id}" class="inline-flex gap-1"></span>
+    </div>
+    <div id="thread-${s.session_id}" class="hidden mt-3 pl-3 border-l-2 border-slate-300 dark:border-slate-700 space-y-2"></div>
+  </div>`;
+}
+
+function render(){
+  const groups = group(STATE.sessions);
+  const list = $('#list'); list.innerHTML='';
+  let idx=0;
+  for(const [name, items] of Object.entries(groups)){
+    if(!items.length) continue;
+    const sec=document.createElement('div');
+    sec.innerHTML = `<h2 class="text-xs uppercase tracking-wide text-slate-400 font-semibold mb-2">${name} · ${items.length}</h2>`;
+    const wrap=document.createElement('div'); wrap.className='space-y-3';
+    for(const s of items){ wrap.insertAdjacentHTML('beforeend', renderCard(s, idx++)); }
+    sec.appendChild(wrap); list.appendChild(sec);
+  }
+  $('#empty').classList.toggle('hidden', STATE.sessions.length>0);
+}
+
+async function resume(id){
+  const r = await fetchJson(`/api/sessions/${id}/resume`);
+  await navigator.clipboard.writeText(r.command);
+  toast(`Copied "${r.command}" — run it in the directory where you want to resume`);
+}
+async function showReasoning(id){
+  try{
+    const r = await fetchJson(`/api/sessions/${id}/reasoning`);
+    openModalMd('🧠 Decision trail', r.markdown || '(no reasoning captured)');
+  }catch(e){ toast('No reasoning available'); }
+}
+async function copyContext(id){
+  try{
+    const r = await fetchJson(`/api/sessions/${id}/context`);
+    await navigator.clipboard.writeText(r.markdown);
+    toast('Context copied — paste into another session to carry it over');
+  }catch(e){ toast('Could not build context'); }
+}
+function exportContext(id){
+  // triggers a browser download of the context .md
+  window.location = `/api/sessions/${id}/context?download=1`;
+  toast('Downloading context file…');
+}
+
+const BRIDGE_TARGETS = ['claude','copilot','codex'];
+function toggleBridge(id, source){
+  const menu = document.getElementById('brmenu-'+id);
+  if(menu.innerHTML){ menu.innerHTML=''; return; }   // toggle off
+  const targets = BRIDGE_TARGETS.filter(t => t !== source);
+  menu.innerHTML = `<span class="text-xs text-slate-400 self-center">→</span>` +
+    targets.map(t => `<button onclick="doBridge('${id}','${t}')" class="text-xs px-2 py-1 rounded-md border border-teal-500/40 hover:bg-teal-500/20">${t}</button>`).join('');
+}
+async function doBridge(id, target){
+  const menu = document.getElementById('brmenu-'+id);
+  menu.innerHTML='';
+  let r;
+  try{ r = await fetchJson(`/api/sessions/${id}/bridge?target=${target}`); }
+  catch(e){ toast('Could not build bridge'); return; }
+  // stash for the modal buttons
+  window.__bridge = { id, target, command: r.command };
+  $('#modalTitle').textContent = `🌉 Bridge → ${target}`;
+  $('#modalBody').innerHTML =
+    `<p class="text-sm text-slate-500 mb-2">Run this to start a fresh <b>${target}</b> session seeded with the full context (no native cross-CLI resume exists):</p>
+     <pre class="text-xs bg-slate-100 dark:bg-slate-800 rounded p-2 overflow-x-auto whitespace-pre-wrap">${esc(r.command)}</pre>
+     <div class="flex gap-2 my-3">
+       <button onclick="bridgeCopy()" class="text-xs px-3 py-1.5 rounded-md bg-teal-600 hover:bg-teal-500 text-white">📋 Copy command</button>
+       <button onclick="bridgeDownload()" class="text-xs px-3 py-1.5 rounded-md bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600">⬇ Download primer</button>
+     </div>
+     <details class="mt-2"><summary class="text-xs text-slate-400 cursor-pointer">Preview handoff primer</summary>
+       <div class="mt-2 text-sm">${mdToHtml(r.primer)}</div>
+     </details>`;
+  $('#modal').classList.remove('hidden'); $('#modalBody').scrollTop=0;
+}
+async function bridgeCopy(){
+  await navigator.clipboard.writeText(window.__bridge.command);
+  toast(`Command copied — paste in a terminal to continue in ${window.__bridge.target}`);
+}
+function bridgeDownload(){
+  const b = window.__bridge;
+  window.location = `/api/sessions/${b.id}/bridge?target=${b.target}&download=1`;
+  toast('Downloading handoff primer…');
+}
+function filterTopic(t){ $('#topic').value=t; applyFilters(); }
+
+async function toggleThread(id){
+  const box = document.getElementById('thread-'+id);
+  const btn = document.getElementById('thbtn-'+id);
+  if(!box.classList.contains('hidden')){          // open -> collapse
+    box.classList.add('hidden'); box.innerHTML=''; btn.textContent='🧵 Thread';
+    return;
+  }
+  btn.textContent='🧵 Thread …';
+  let data;
+  try { data = await fetchJson(`/api/sessions/${id}/thread`); }
+  catch(e){ toast('Could not load thread'); btn.textContent='🧵 Thread'; return; }
+  const sibs = data.siblings || [];
+  if(!sibs.length){
+    box.innerHTML = `<div class="text-xs text-slate-500 py-1">No other sessions in “${data.folder||''}”.</div>`;
+  } else {
+    box.innerHTML = `<div class="text-xs text-slate-400 mb-1">${sibs.length} sibling session${sibs.length>1?'s':''} in “${data.folder||''}”</div>` +
+      sibs.map(renderSibling).join('');
+  }
+  box.classList.remove('hidden');
+  btn.textContent=`🧵 Thread (${sibs.length}) ▲`;
+}
+
+function renderSibling(s){
+  const desc = (s.summary || s.title || s.first_message || '(no description)').replace(/</g,'&lt;');
+  const one = desc.length>110 ? desc.slice(0,110)+'…' : desc;
+  const srcCls = SOURCE_COLORS[s.cli_source] || 'bg-slate-500/15 text-slate-400 border-slate-500/30';
+  return `<div class="flex items-center justify-between gap-3 py-1.5 border-b border-slate-100 dark:border-slate-800 last:border-0">
+    <div class="min-w-0">
+      <div class="flex items-center gap-2">
+        <span class="font-medium text-sm truncate">${s.title || one.slice(0,50)}</span>
+        ${badge(s.cli_source, srcCls+' shrink-0')}
+      </div>
+      <div class="text-xs text-slate-500 dark:text-slate-400 truncate">${one}</div>
+      <div class="text-[11px] text-slate-400">${new Date(s.last_activity).toLocaleString()} · ${s.turn_count} turns</div>
+    </div>
+    <button onclick="resume('${s.session_id}')" class="shrink-0 text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>
+  </div>`;
+}
+
+async function applyFilters(){
+  const p = new URLSearchParams();
+  if($('#search').value) p.set('search',$('#search').value);
+  if($('#folder').value) p.set('folder',$('#folder').value);
+  if($('#topic').value) p.set('topic',$('#topic').value);
+  if($('#days').value) p.set('days',$('#days').value);
+  if($('#mode').value) p.set('mode',$('#mode').value);
+  if(STATE.source!=='all') p.set('source',STATE.source);
+  STATE.sessions = await fetchJson('/api/sessions?'+p.toString());
+  render();
+}
+
+async function loadMeta(){
+  const stats = await fetchJson('/api/stats');
+  let line = `${stats.total} sessions · ${stats.enriched} enriched · ${stats.folders} folders`;
+  if(stats.billing && stats.billing.mode === 'subscription'){
+    line += ` · ${stats.billing.plan} (costs ≈ API-equiv, not billed)`;
+  }
+  $('#stats').textContent = line;
+  const pills=$('#pills'); pills.innerHTML='';
+  const sources = [['all','All',stats.total], ...Object.entries(stats.by_source).map(([k,v])=>[k,k,v])];
+  for(const [key,label,count] of sources){
+    const b=document.createElement('button');
+    b.className='px-3 py-1 rounded-full text-sm border '+(STATE.source===key?'bg-indigo-600 text-white border-indigo-600':'border-slate-300 dark:border-slate-700');
+    b.textContent=`${label} ${count??''}`;
+    b.onclick=()=>{ STATE.source=key; loadMeta(); applyFilters(); };
+    pills.appendChild(b);
+  }
+  const folders = await fetchJson('/api/sessions/folders');
+  $('#folder').innerHTML = '<option value="">All folders</option>'+folders.map(f=>`<option>${f}</option>`).join('');
+  const topics = await fetchJson('/api/sessions/topics');
+  $('#topic').innerHTML = '<option value="">All topics</option>'+topics.map(t=>`<option>${t}</option>`).join('');
+}
+
+// debounced search
+let deb; $('#search').addEventListener('input',()=>{ clearTimeout(deb); deb=setTimeout(applyFilters,280); });
+['folder','topic','days','mode'].forEach(id=>$('#'+id).addEventListener('change',applyFilters));
+$('#refresh').onclick=()=>{ loadMeta(); applyFilters(); };
+$('#darkToggle').onclick=()=>document.documentElement.classList.toggle('dark');
+
+// keyboard nav
+document.addEventListener('keydown',e=>{
+  if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)){ if(e.key==='Escape')e.target.blur(); return; }
+  const cards=[...document.querySelectorAll('.card')];
+  if(e.key==='/'){ e.preventDefault(); $('#search').focus(); }
+  else if(e.key==='j'||e.key==='k'){
+    STATE.kbIndex = Math.max(0, Math.min(cards.length-1, STATE.kbIndex+(e.key==='j'?1:-1)));
+    cards.forEach(c=>c.classList.remove('kb-active'));
+    const c=cards[STATE.kbIndex]; if(c){ c.classList.add('kb-active'); c.scrollIntoView({block:'center',behavior:'smooth'}); }
+  } else if(e.key==='r' && STATE.kbIndex>=0){ resume(STATE.sessions[STATE.kbIndex].session_id); }
+  else if(e.key==='Escape'){ closeModal(); }
+});
+
+loadMeta().then(applyFilters);
+</script>
+</body>
+</html>

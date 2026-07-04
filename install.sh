@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Session Browser installer.
+#   ./install.sh [--no-hook] [--no-launchd] [--no-backfill] [--enrich] [--lite]
+# Idempotent. Creates the venv, builds the DB, backfills, optionally registers the
+# Claude Stop hook and (macOS) launchd jobs.
+#   --lite  skip sentence-transformers/torch (~2 GB download); semantic search
+#           falls back to keyword + full-text.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$REPO/.venv/bin/python"
+HOME_DIR="$HOME"
+LOG_DIR="$HOME/.session-browser/logs"
+
+NO_HOOK=0; NO_LAUNCHD=0; NO_BACKFILL=0; NO_ENRICH=1; LITE=0   # enrich off by default (uses LLM quota)
+for a in "$@"; do case "$a" in
+  --no-hook) NO_HOOK=1;; --no-launchd) NO_LAUNCHD=1;;
+  --no-backfill) NO_BACKFILL=1;; --enrich) NO_ENRICH=0;; --lite) LITE=1;;
+  *) echo "unknown flag: $a"; exit 1;; esac; done
+
+echo "==> Session Browser install ($REPO)"
+
+# Python 3.11+ required (tomllib, sqlite FTS5)
+python3 - <<'PYEOF' || { echo "!! python3 >= 3.11 required"; exit 1; }
+import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)
+PYEOF
+
+# 1. venv + dependencies (idempotent — pip skips what's already satisfied).
+#    --system-site-packages reuses an existing torch/sentence-transformers
+#    install when one is present; harmless otherwise.
+if [ ! -x "$PY" ]; then
+  echo "==> creating venv"
+  python3 -m venv --system-site-packages "$REPO/.venv"
+  "$PY" -m pip install --quiet --upgrade pip
+fi
+echo "==> installing dependencies"
+"$PY" -m pip install --quiet -r "$REPO/requirements.txt"
+if [ "$LITE" -eq 0 ]; then
+  "$PY" -m pip install --quiet "sentence-transformers>=2.7" \
+    || echo "   ! sentence-transformers install failed — semantic search will fall back to keyword"
+fi
+
+# 2. config
+[ -f "$REPO/config.toml" ] || cp "$REPO/config.toml.example" "$REPO/config.toml"
+
+# 3. runtime dirs + schema
+mkdir -p "$LOG_DIR"
+"$PY" "$REPO/scripts/migrate-db.py"
+
+# 4. backfill + full processing pipeline (idempotent)
+if [ "$NO_BACKFILL" -eq 0 ]; then
+  echo "==> running full pipeline (backfill, cost, reasoning, full-text, embeddings)"
+  if [ "$NO_ENRICH" -eq 0 ]; then
+    "$PY" "$REPO/scripts/refresh-all.py" --enrich
+  else
+    "$PY" "$REPO/scripts/refresh-all.py"
+  fi
+fi
+
+# 6. Stop hook
+if [ "$NO_HOOK" -eq 0 ]; then
+  echo "==> registering Claude Stop hook"
+  "$PY" - "$REPO" <<'PYEOF'
+import json, sys, shutil
+from pathlib import Path
+repo = Path(sys.argv[1])
+settings = Path.home()/".claude"/"settings.json"
+cfg = json.loads(settings.read_text()) if settings.exists() else {}
+if settings.exists():
+    shutil.copy2(settings, settings.with_suffix(".json.sb-backup"))
+cmd = f"{repo}/.venv/bin/python {repo}/scripts/session-hook.py"
+hooks = cfg.setdefault("hooks", {})
+stop = hooks.setdefault("Stop", [])
+already = any("session-hook.py" in json.dumps(h) for h in stop)
+if not already:
+    stop.append({"hooks":[{"type":"command","command":cmd}]})
+    settings.write_text(json.dumps(cfg, indent=2))
+    print("   hook added (backup: settings.json.sb-backup)")
+else:
+    print("   hook already present")
+PYEOF
+fi
+
+# 7. launchd (macOS only; on Linux schedule watcher.py + refresh-all.py via systemd/cron)
+if [ "$(uname)" != "Darwin" ] && [ "$NO_LAUNCHD" -eq 0 ]; then
+  NO_LAUNCHD=1
+  echo "==> skipping launchd (not macOS). Schedule these yourself:"
+  echo "      watcher (live indexing):  $PY $REPO/watcher.py"
+  echo "      nightly refresh:          $PY $REPO/scripts/refresh-all.py --enrich"
+fi
+if [ "$NO_LAUNCHD" -eq 0 ]; then
+  echo "==> installing launchd jobs"
+  AGENTS="$HOME/Library/LaunchAgents"; mkdir -p "$AGENTS"
+  # watcher = live indexing; refresh = nightly full pipeline (cost/reasoning/fts/embed/enrich)
+  for job in watcher refresh; do
+    sed -e "s|__VENV_PY__|$PY|g" -e "s|__REPO__|$REPO|g" \
+        -e "s|__LOG_DIR__|$LOG_DIR|g" -e "s|__HOME__|$HOME_DIR|g" \
+        "$REPO/launchd/$job.plist.template" > "$AGENTS/com.sessionbrowser.$job.plist"
+    launchctl unload "$AGENTS/com.sessionbrowser.$job.plist" 2>/dev/null || true
+    launchctl load "$AGENTS/com.sessionbrowser.$job.plist"
+  done
+fi
+
+echo "==> done. Start the UI:  $REPO/bin/start-session-ui.sh  ->  http://127.0.0.1:7655"
+echo "    Health check:        $REPO/bin/doctor.sh"

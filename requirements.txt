@@ -1,0 +1,10 @@
+# Core runtime — always required.
+flask>=3.0
+watchdog>=4.0
+pyyaml>=6.0
+numpy>=1.26
+mcp>=1.0
+
+# Semantic search (optional but recommended). Pulls in torch (~2 GB).
+# Skip with `./install.sh --lite`; search then falls back to keyword/full-text.
+# sentence-transformers>=2.7   <- installed by install.sh unless --lite

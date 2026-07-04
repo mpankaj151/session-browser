@@ -1,0 +1,16 @@
+# Virtualenv & Python artifacts
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Per-machine config (copy from config.toml.example)
+config.toml
+
+# Personal data — never commit session content
+docs/screenshot-ui.png
+*.log
+*.db
+
+# OS noise
+.DS_Store
