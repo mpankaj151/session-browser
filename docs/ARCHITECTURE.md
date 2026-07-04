@@ -77,11 +77,13 @@ automatically. The stored `dim` is the true vector length, so changing
 `[embeddings].model` triggers a clean re-embed instead of a crash.
 
 **Redaction at every egress.** Anything that leaves the tool — Copy Context,
-Export, Bridge, the full-text index, and the reasoning archive — passes through
-`redact.py`, which masks API keys, tokens (`sk-`, `github_pat_`, `npm_`, `xox*`,
-AWS, Google, JWTs, bearer tokens), `*_SECRET`/`*_KEY` assignments (including
-JSON form), and private-key blocks. Bare hashes in prose survive so the FTS
-index stays searchable by commit SHA.
+Export, Bridge, the full-text index, the reasoning archive, the LLM enrichment
+prompt and its persisted output, and every MCP tool result — passes through
+`redact.py`, which masks API keys, tokens (`sk-`, `sk_live_`, `github_pat_`,
+`npm_`, `xox*`, AWS, Google, JWTs, `Authorization:` headers), `*_SECRET`/`*_KEY`
+assignments (including JSON form), `user:password@` URL credentials, and
+private-key blocks. Bare hashes in prose survive so the FTS index stays
+searchable by commit SHA.
 
 **Cost is notional under a subscription.** Token totals are real; the dollar
 figure is the public-API list-price equivalent. Under a flat plan (`[billing]

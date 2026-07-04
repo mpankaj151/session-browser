@@ -118,9 +118,11 @@ command, and pointers to the transcript + trail.
 ### Privacy: secret redaction
 
 Every primer that leaves the tool (Copy, Export, Bridge), the full-text index,
-and the reasoning archive pass through `redact.py`, which masks API keys, tokens
-(`sk-`, `github_pat_`, `npm_`, `xox*`, AWS, Google, JWT, bearer),
-`*_SECRET`/`*_KEY` assignments (including JSON form), and private-key blocks.
+the reasoning archive, LLM enrichment (both the prompt and what gets stored),
+and every MCP tool result pass through `redact.py`, which masks API keys and
+tokens (`sk-`, `sk_live_`, `github_pat_`, `npm_`, `xox*`, AWS, Google, JWT,
+`Authorization:` headers), `*_SECRET`/`*_KEY` assignments (including JSON
+form), `user:password@` URL credentials, and private-key blocks.
 
 ### MCP server — let Claude recall past work
 

@@ -359,8 +359,14 @@ def _build_bridge(conn, sid: str, target: str) -> dict | None:
             "target": target, "source": source}
 
 
-@app.get("/api/sessions/<sid>/bridge")
+@app.post("/api/sessions/<sid>/bridge")
 def api_bridge(sid: str):
+    # This endpoint writes a primer file to disk. POST + a custom header keeps
+    # cross-origin pages out: an <img>/<form> can send neither, and fetch()
+    # with a custom header is blocked by CORS preflight. (The SPA downloads
+    # the primer client-side from the JSON — no separate download route.)
+    if not request.headers.get("X-Requested-With"):
+        return jsonify({"error": "missing X-Requested-With header"}), 403
     target = (request.args.get("target") or "").lower()
     if target not in _BRIDGE_CMD:
         return jsonify({"error": f"target must be one of {list(_BRIDGE_CMD)}"}), 400
@@ -371,10 +377,6 @@ def api_bridge(sid: str):
         conn.close()
     if built is None:
         return jsonify({"error": "not found"}), 404
-    if request.args.get("download"):
-        fname = Path(built["path"]).name
-        return Response(built["primer"], mimetype="text/markdown",
-                        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
     return jsonify(built)
 
 
@@ -426,7 +428,10 @@ def api_reasoning(sid: str):
     rp = row["reasoning_path"]
     if not rp or not Path(rp).exists():
         return jsonify({"error": "no reasoning captured", "markdown": ""}), 404
-    markdown = Path(rp).read_text(encoding="utf-8")
+    # trails are written redacted, but re-redact on the way out: archives from
+    # before that fix (and hand-edited files) shouldn't leak. 2MB cap.
+    with open(rp, "r", encoding="utf-8", errors="replace") as fh:
+        markdown = _redact.redact(fh.read(2_000_000))
     if request.args.get("format") == "md":
         from flask import Response
         return Response(markdown, mimetype="text/markdown")

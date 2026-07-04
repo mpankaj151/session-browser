@@ -32,9 +32,16 @@ RACE_GUARD_S = 30
 LOG = sbconfig.LOG_DIR / "watcher.log"
 
 
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
 def _log(msg: str) -> None:
     line = f"{datetime.now(timezone.utc).isoformat()}  {msg}\n"
     try:
+        # crude size cap: a long-lived daemon logging one line per index event
+        # would otherwise grow the file forever
+        if LOG.exists() and LOG.stat().st_size > _LOG_MAX_BYTES:
+            LOG.rename(LOG.with_suffix(".log.1"))
         with open(LOG, "a") as fh:
             fh.write(line)
     except OSError:
@@ -84,6 +91,8 @@ class _Handler(FileSystemEventHandler):
             timer.start()
 
     def _process(self, path_str: str):
+        with self._lock:
+            self._timers.pop(path_str, None)  # fired — drop the dead Timer
         path = Path(path_str)
         if not path.exists() or path.suffix != ".jsonl":
             return
@@ -114,6 +123,16 @@ class _Handler(FileSystemEventHandler):
     def on_modified(self, event):
         if not event.is_directory:
             self._schedule(event.src_path)
+
+    def on_moved(self, event):
+        # A rename is a delete at src + a create at dest (Finder's "Move to
+        # Trash" is a rename out of the tree) — treat it as exactly that.
+        if event.is_directory:
+            return
+        self.on_deleted(event)
+        dest = getattr(event, "dest_path", "")
+        if dest and str(dest).endswith(".jsonl"):
+            self._schedule(dest)
 
     def on_deleted(self, event):
         if event.is_directory or not str(event.src_path).endswith(".jsonl"):
@@ -148,9 +167,12 @@ def _acquire_singleton_lock():
     manual). Returns the held lock file handle, or None if another instance owns it."""
     import fcntl
     lock_path = sbconfig.LOG_DIR.parent / ".watcher.lock"
-    fh = open(lock_path, "w")
+    # "a+" not "w": opening must not truncate the pid a live holder recorded
+    fh = open(lock_path, "a+")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.seek(0)
+        fh.truncate()
         fh.write(str(os.getpid()))
         fh.flush()
         return fh

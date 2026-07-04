@@ -18,11 +18,11 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
-# Point the whole stack at a temp DB BEFORE importing anything that resolves paths.
-_DB = Path(tempfile.gettempdir()) / "session-browser-demo.db"
+# Point the whole stack at a temp DB BEFORE importing anything that resolves
+# paths. mkdtemp gives a fresh private (0700) dir — a fixed /tmp name would
+# collide (and race) with other users on a shared host.
+_DB = Path(tempfile.mkdtemp(prefix="session-browser-demo-")) / "demo.db"
 os.environ["SB_DB"] = str(_DB)
-if _DB.exists():
-    _DB.unlink()
 
 import indexer  # noqa: E402
 

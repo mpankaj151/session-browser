@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 from pathlib import Path
 from typing import Iterator, Optional
@@ -144,7 +145,7 @@ class CopilotSource:
         return path.parent.name if path.name == "events.jsonl" else None
 
     def resume_command(self, session_id: str) -> str:
-        return f"copilot --resume={session_id}"
+        return f"copilot --resume={shlex.quote(session_id)}"
 
     def is_available(self) -> bool:
         return shutil.which("copilot") is not None and self.state_dir.exists()

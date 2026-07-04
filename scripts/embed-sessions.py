@@ -8,11 +8,17 @@ source text changes). No-op rows are skipped.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# This is the explicit batch job for the semantic stack the user opted into at
+# install — fetching a missing model here is expected. Interactive queries
+# (UI / MCP) stay strictly offline.
+os.environ.setdefault("SB_ALLOW_MODEL_DOWNLOAD", "1")
 
 import indexer  # noqa: E402
 import semsearch  # noqa: E402

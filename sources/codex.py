@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 from pathlib import Path
 from typing import Iterator, Optional
@@ -167,7 +168,7 @@ class CodexSource:
 
     # -- resume / availability -------------------------------------------------
     def resume_command(self, session_id: str) -> str:
-        return f"codex resume {session_id}"
+        return f"codex resume {shlex.quote(session_id)}"
 
     def is_available(self) -> bool:
         return shutil.which("codex") is not None and self.sessions_dir.exists()

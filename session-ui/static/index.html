@@ -89,7 +89,7 @@ const SOURCE_COLORS = {
 let STATE = { source: 'all', sessions: [], kbIndex: -1 };
 
 const $ = s => document.querySelector(s);
-async function fetchJson(url){ const r = await fetch(url); if(!r.ok) throw new Error(r.status); return r.json(); }
+async function fetchJson(url, opts){ const r = await fetch(url, opts); if(!r.ok) throw new Error(r.status); return r.json(); }
 function toast(msg){ const t=$('#toast'); t.textContent=msg; t.style.opacity='1'; setTimeout(()=>t.style.opacity='0',1600); }
 function closeModal(){ $('#modal').classList.add('hidden'); }
 function openModal(title, body){ $('#modalTitle').textContent=title; $('#modalBody').textContent=body; $('#modal').classList.remove('hidden'); }
@@ -234,26 +234,26 @@ function render(){
 }
 
 async function resume(id){
-  const r = await fetchJson(`/api/sessions/${id}/resume`);
+  const r = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/resume`);
   await navigator.clipboard.writeText(r.command);
   toast(`Copied "${r.command}" — run it in the directory where you want to resume`);
 }
 async function showReasoning(id){
   try{
-    const r = await fetchJson(`/api/sessions/${id}/reasoning`);
+    const r = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/reasoning`);
     openModalMd('🧠 Decision trail', r.markdown || '(no reasoning captured)');
   }catch(e){ toast('No reasoning available'); }
 }
 async function copyContext(id){
   try{
-    const r = await fetchJson(`/api/sessions/${id}/context`);
+    const r = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/context`);
     await navigator.clipboard.writeText(r.markdown);
     toast('Context copied — paste into another session to carry it over');
   }catch(e){ toast('Could not build context'); }
 }
 function exportContext(id){
   // triggers a browser download of the context .md
-  window.location = `/api/sessions/${id}/context?download=1`;
+  window.location = `/api/sessions/${encodeURIComponent(id)}/context?download=1`;
   toast('Downloading context file…');
 }
 
@@ -269,10 +269,13 @@ async function doBridge(id, target){
   const menu = document.getElementById('brmenu-'+id);
   menu.innerHTML='';
   let r;
-  try{ r = await fetchJson(`/api/sessions/${id}/bridge?target=${target}`); }
+  // POST + custom header: the endpoint writes a primer file, and forms/imgs
+  // can't send either — a drive-by page can no longer trigger the write.
+  try{ r = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/bridge?target=${encodeURIComponent(target)}`,
+                           {method:'POST', headers:{'X-Requested-With':'session-browser'}}); }
   catch(e){ toast('Could not build bridge'); return; }
   // stash for the modal buttons
-  window.__bridge = { id, target, command: r.command };
+  window.__bridge = { id, target, command: r.command, primer: r.primer, fname: (r.path||'primer.md').split('/').pop() };
   $('#modalTitle').textContent = `🌉 Bridge → ${target}`;
   $('#modalBody').innerHTML =
     `<p class="text-sm text-slate-500 mb-2">Run this to start a fresh <b>${esc(target)}</b> session seeded with the full context (no native cross-CLI resume exists):</p>
@@ -292,7 +295,10 @@ async function bridgeCopy(){
 }
 function bridgeDownload(){
   const b = window.__bridge;
-  window.location = `/api/sessions/${b.id}/bridge?target=${b.target}&download=1`;
+  // client-side Blob: the primer is already in hand, no second request needed
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([b.primer], {type:'text/markdown'}));
+  a.download = b.fname; a.click(); URL.revokeObjectURL(a.href);
   toast('Downloading handoff primer…');
 }
 function filterTopic(t){ $('#topic').value=t; applyFilters(); }
@@ -306,7 +312,7 @@ async function toggleThread(id){
   }
   btn.textContent='🧵 Thread …';
   let data;
-  try { data = await fetchJson(`/api/sessions/${id}/thread`); }
+  try { data = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/thread`); }
   catch(e){ toast('Could not load thread'); btn.textContent='🧵 Thread'; return; }
   const sibs = data.siblings || [];
   if(!sibs.length){
@@ -365,9 +371,9 @@ async function loadMeta(){
     pills.appendChild(b);
   }
   const folders = await fetchJson('/api/sessions/folders');
-  $('#folder').innerHTML = '<option value="">All folders</option>'+folders.map(f=>`<option>${f}</option>`).join('');
+  $('#folder').innerHTML = '<option value="">All folders</option>'+folders.map(f=>`<option>${esc(f)}</option>`).join('');
   const topics = await fetchJson('/api/sessions/topics');
-  $('#topic').innerHTML = '<option value="">All topics</option>'+topics.map(t=>`<option>${t}</option>`).join('');
+  $('#topic').innerHTML = '<option value="">All topics</option>'+topics.map(t=>`<option>${esc(t)}</option>`).join('');
 }
 
 // ---- Usage dashboard --------------------------------------------------------

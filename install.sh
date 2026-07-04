@@ -37,6 +37,17 @@ echo "==> installing dependencies"
 if [ "$LITE" -eq 0 ]; then
   "$PY" -m pip install --quiet "sentence-transformers>=2.7" \
     || echo "   ! sentence-transformers install failed — semantic search will fall back to keyword"
+  # Pre-download the embedding model NOW (the one moment a big fetch is
+  # expected). Runtime queries never go online — semsearch is offline-only
+  # unless SB_ALLOW_MODEL_DOWNLOAD=1.
+  echo "==> caching the embedding model (one-time download)"
+  SB_REPO="$REPO" SB_ALLOW_MODEL_DOWNLOAD=1 "$PY" - <<'PYEOF' \
+    || echo "   ! model download failed — the nightly embed job will retry"
+import os, sys
+sys.path.insert(0, os.environ["SB_REPO"])
+import semsearch
+semsearch.get_model()
+PYEOF
 fi
 
 # 2. config

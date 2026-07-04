@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 from itertools import islice
 from pathlib import Path
@@ -142,7 +143,7 @@ class ClaudeSource:
         return path.stem if path.suffix == ".jsonl" else None
 
     def resume_command(self, session_id: str) -> str:
-        return f"claude --resume {session_id}"
+        return f"claude --resume {shlex.quote(session_id)}"
 
     def is_available(self) -> bool:
         return shutil.which("claude") is not None and self.projects_dir.exists()

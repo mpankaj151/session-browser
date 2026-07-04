@@ -28,10 +28,19 @@ def get_model():
     from sentence_transformers import SentenceTransformer
     try:
         return SentenceTransformer(sbconfig.EMBED_MODEL)
-    except Exception:  # noqa: BLE001 — model not cached yet: allow one online fetch
-        os.environ.pop("HF_HUB_OFFLINE", None)
-        os.environ.pop("TRANSFORMERS_OFFLINE", None)
-        return SentenceTransformer(sbconfig.EMBED_MODEL)
+    except Exception:
+        # Model not in the local cache. Fetching it silently would contradict
+        # the no-external-requests promise, so going online is opt-in;
+        # install.sh (non --lite) pre-downloads, making this branch rare.
+        # Callers catch this and fall back to keyword search.
+        if os.environ.get("SB_ALLOW_MODEL_DOWNLOAD") == "1":
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            return SentenceTransformer(sbconfig.EMBED_MODEL)
+        raise RuntimeError(
+            f"embedding model '{sbconfig.EMBED_MODEL}' is not cached locally; "
+            "set SB_ALLOW_MODEL_DOWNLOAD=1 to fetch it once (or re-run "
+            "install.sh without --lite)")
 
 
 def embed_text(text: str) -> np.ndarray:
