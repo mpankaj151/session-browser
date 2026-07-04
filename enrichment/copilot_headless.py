@@ -1,4 +1,11 @@
-"""Enrichment via the Copilot CLI in headless mode (`copilot -p`)."""
+"""Enrichment via the Copilot CLI in headless mode (`copilot -p`).
+
+Note: the Copilot CLI only accepts the prompt as an argv parameter (no stdin
+mode), so the rendered transcript is briefly visible in the local process list
+while the call runs. The prompt is capped well below ARG_MAX so the call can
+never fail with E2BIG. If Copilot gains a stdin prompt mode, switch to it (see
+claude_headless.py for the pattern).
+"""
 from __future__ import annotations
 
 import shutil
@@ -24,6 +31,7 @@ class CopilotHeadless:
 
     def summarize(self, turns: list, cli_source: str, model: str = "", cwd: str = "") -> dict:
         prompt = render_prompt(turns, cli_source, model, cwd, self.template)
+        prompt = prompt[:120_000]  # argv-passed; stay far below ARG_MAX
         proc = subprocess.run(
             [self.binary, *self.exec_args, prompt],
             capture_output=True, text=True, timeout=self.timeout,

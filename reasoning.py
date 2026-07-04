@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import redact as _redact
 import sbconfig
 
 ARCHIVE = sbconfig.REASONING_ARCHIVE
@@ -195,7 +196,9 @@ def render_markdown(steps: list[ReasoningStep], header: dict) -> str:
             for a in s.actions:
                 lines.append(f"- `{a['tool']}` {a['input']}")
         lines.append("\n---\n")
-    return "\n".join(lines)
+    # Trails are shareable artifacts — a tool command like `export TOKEN=ghp_...`
+    # must not survive into the archive verbatim.
+    return _redact.redact("\n".join(lines))
 
 
 def _quote(text: str) -> str:
@@ -233,8 +236,15 @@ def archive_raw(transcript_path: Path, header: dict) -> Path:
 
 def write_readable(steps: list[ReasoningStep], header: dict) -> Path:
     dest_dir = _ym_dir(ARCHIVE / "readable", header.get("last_activity", ""))
-    fname = f"{header.get('session_id','')[:8]}-{_slug(header.get('title') or header.get('first_message',''))}.md"
+    sid8 = header.get("session_id", "")[:8]
+    fname = f"{sid8}-{_slug(header.get('title') or header.get('first_message',''))}.md"
     dest = dest_dir / fname
+    # A later title (from enrichment) or a month rollover changes the path; remove
+    # the session's previous renders so the archive holds exactly one trail per session.
+    if sid8:
+        for old in (ARCHIVE / "readable").glob(f"*/*/{sid8}-*.md"):
+            if old != dest:
+                old.unlink(missing_ok=True)
     dest.write_text(render_markdown(steps, header), encoding="utf-8")
     return dest
 
@@ -263,7 +273,7 @@ def persist(session_id: str, steps: list[ReasoningStep], readable_path: Path,
             conn.execute(
                 "INSERT INTO session_artifacts (session_id, type, content, turn_index) "
                 "VALUES (?, 'reasoning', ?, ?)",
-                (session_id, content[:8000], s.turn_index),
+                (session_id, _redact.redact(content[:8000]), s.turn_index),
             )
         if own:
             conn.commit()
