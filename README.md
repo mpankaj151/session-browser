@@ -10,6 +10,8 @@ and a **decision/reasoning trail** for every session.
 Everything runs and stays on your machine: SQLite + Flask + vanilla JS. No
 cloud services, no telemetry.
 
+![Session Browser UI](docs/screenshot.png)
+
 ## Requirements
 
 - **Python 3.11+** (3.12 recommended)
