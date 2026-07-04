@@ -16,7 +16,7 @@ cd session-browser
 ```bash
 python tests/test_smoke.py       # must pass (isolated temp DB; no real data touched)
 python -m compileall -q sources scripts session-ui mcp enrichment *.py
-for f in install.sh uninstall.sh bin/*.sh; do bash -n "$f"; done
+for f in install.sh uninstall.sh bootstrap.sh bin/*.sh; do bash -n "$f"; done
 ```
 
 CI runs these on Ubuntu + macOS across Python 3.11 and 3.12.

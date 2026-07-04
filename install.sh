@@ -114,11 +114,23 @@ if [ "$NO_LAUNCHD" -eq 0 ]; then
     if [ -n "$B" ]; then D="$(dirname "$B")"; case ":$JOB_PATH:" in *":$D:"*) ;; *) JOB_PATH="$JOB_PATH:$D";; esac; fi
   done
   # watcher = live indexing; refresh = nightly full pipeline (cost/reasoning/fts/embed/enrich)
+  # Rendered in Python, not sed: paths containing &, <, > or sed metacharacters
+  # would otherwise produce malformed plist XML and abort the install half-done.
   for job in watcher refresh; do
-    sed -e "s|__VENV_PY__|$PY|g" -e "s|__REPO__|$REPO|g" \
-        -e "s|__LOG_DIR__|$LOG_DIR|g" -e "s|__HOME__|$HOME_DIR|g" \
-        -e "s|__PATH__|$JOB_PATH|g" \
-        "$REPO/launchd/$job.plist.template" > "$AGENTS/com.sessionbrowser.$job.plist"
+    SB_TEMPLATE="$REPO/launchd/$job.plist.template" \
+    SB_DEST="$AGENTS/com.sessionbrowser.$job.plist" \
+    SB_VENV_PY="$PY" SB_REPO="$REPO" SB_LOG_DIR="$LOG_DIR" \
+    SB_HOME_DIR="$HOME_DIR" SB_JOB_PATH="$JOB_PATH" \
+    "$PY" - <<'PYEOF'
+import os
+from xml.sax.saxutils import escape
+tpl = open(os.environ["SB_TEMPLATE"], encoding="utf-8").read()
+for marker, env in (("__VENV_PY__", "SB_VENV_PY"), ("__REPO__", "SB_REPO"),
+                    ("__LOG_DIR__", "SB_LOG_DIR"), ("__HOME__", "SB_HOME_DIR"),
+                    ("__PATH__", "SB_JOB_PATH")):
+    tpl = tpl.replace(marker, escape(os.environ[env]))
+open(os.environ["SB_DEST"], "w", encoding="utf-8").write(tpl)
+PYEOF
     launchctl unload "$AGENTS/com.sessionbrowser.$job.plist" 2>/dev/null || true
     launchctl load "$AGENTS/com.sessionbrowser.$job.plist"
   done

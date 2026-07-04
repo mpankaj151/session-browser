@@ -82,8 +82,10 @@ case "$CLI" in
     if [ -f "$WS" ]; then
       cp "$WS" "$WS.bak"
       if grep -q '^cwd:' "$WS"; then
-        # -i.tmp works on both BSD (macOS) and GNU sed; .bak above is the real backup
-        sed -i.tmp "s|^cwd:.*|cwd: $CUR|" "$WS" && rm -f "$WS.tmp"
+        # awk via ENVIRON, not sed: & and | in the directory path are literal here,
+        # where a sed replacement would corrupt workspace.yaml
+        CUR="$CUR" awk 'BEGIN{cur=ENVIRON["CUR"]} /^cwd:/{print "cwd: " cur; next} {print}' \
+          "$WS" > "$WS.tmp" && mv "$WS.tmp" "$WS"
       else
         printf 'cwd: %s\n' "$CUR" >> "$WS"
       fi

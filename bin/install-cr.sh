@@ -5,8 +5,14 @@
 # Idempotent — safe to run repeatedly. Targets ~/.zshrc (or ~/.bashrc if zsh absent).
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RC="$HOME/.zshrc"
-[ -f "$RC" ] || RC="$HOME/.bashrc"
+# Pick the rc by the LOGIN SHELL, not file existence: a fresh macOS account has
+# zsh but no ~/.zshrc yet — writing to ~/.bashrc there installs functions that
+# the user's shell never sources.
+case "${SHELL:-}" in
+  */zsh)  RC="$HOME/.zshrc" ;;
+  */bash) RC="$HOME/.bashrc" ;;
+  *)      RC="$HOME/.zshrc"; [ -f "$RC" ] || RC="$HOME/.bashrc" ;;
+esac
 
 if ! grep -qF "# >>> session-browser cr >>>" "$RC" 2>/dev/null; then
   cat >> "$RC" <<EOF
@@ -29,7 +35,7 @@ if ! grep -qF "# >>> session-browser sb >>>" "$RC" 2>/dev/null; then
 sb() {
   local REPO="$REPO"
   case "\${1:-}" in
-    ui)      nohup "\$REPO/.venv/bin/python" "\$REPO/session-ui/app.py" >/tmp/sb-app.log 2>&1 & echo "Session Browser UI -> http://127.0.0.1:7655" ;;
+    ui)      mkdir -p "\$HOME/.session-browser/logs"; nohup "\$REPO/.venv/bin/python" "\$REPO/session-ui/app.py" >"\$HOME/.session-browser/logs/ui.log" 2>&1 & echo "Session Browser UI -> http://127.0.0.1:7655" ;;
     stop)    lsof -ti tcp:7655 2>/dev/null | xargs kill 2>/dev/null && echo "UI stopped" || echo "UI not running" ;;
     open)    open http://127.0.0.1:7655 2>/dev/null || xdg-open http://127.0.0.1:7655 ;;
     stats)   "\$REPO/.venv/bin/python" "\$REPO/scripts/stats-report.py" "\${@:2}" ;;

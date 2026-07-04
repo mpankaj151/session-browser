@@ -32,9 +32,13 @@ one searchable index and adds the things the CLIs don't give you:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mpankaj151/session-browser/main/bootstrap.sh | bash
-source ~/.zshrc
-sb ui          # http://127.0.0.1:7655
+source ~/.zshrc   # or ~/.bashrc — the installer prints which
+sb ui             # http://127.0.0.1:7655
 ```
+
+> Heads-up: the default install includes the semantic-search ML stack (~2 GB).
+> Skip it with `SB_INSTALL_ARGS=--lite` before the one-liner — everything else
+> works; search falls back to keyword + full-text.
 
 No sessions yet? See the whole thing with synthetic data:
 

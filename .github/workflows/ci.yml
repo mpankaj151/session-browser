@@ -36,6 +36,6 @@ jobs:
       - name: Shell syntax check
         if: runner.os != 'Windows'
         run: |
-          for f in install.sh uninstall.sh bin/*.sh; do
+          for f in install.sh uninstall.sh bootstrap.sh bin/*.sh; do
             bash -n "$f" && echo "ok  $f"
           done
