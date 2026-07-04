@@ -7,10 +7,14 @@ __pycache__/
 # Per-machine config (copy from config.toml.example)
 config.toml
 
-# Personal data — never commit session content
+# Personal data — never commit session content.
+# docs/screenshot.png and screenshot-usage.png are SYNTHETIC demo data (safe).
 docs/screenshot-ui.png
 *.log
 *.db
+
+# Playwright scratch output
+.playwright-mcp/
 
 # OS noise
 .DS_Store
