@@ -22,8 +22,11 @@ except Exception: print("  \033[33m∼\033[0m sentence_transformers absent (--li
 # sqlite extension capability (optional fast path)
 import sqlite3
 c=sqlite3.connect(":memory:")
-print(f"  {'\033[32m✓\033[0m' if hasattr(c,'enable_load_extension') else '\033[33m∼\033[0m'} "
-      f"sqlite loadable-extensions {'available' if hasattr(c,'enable_load_extension') else 'absent (numpy backend in use)'}")
+# no backslashes inside f-string {} — that's a SyntaxError before Python 3.12 (PEP 701)
+loadable = hasattr(c, "enable_load_extension")
+mark = "\033[32m✓\033[0m" if loadable else "\033[33m∼\033[0m"
+state = "available" if loadable else "absent (numpy backend in use)"
+print(f"  {mark} sqlite loadable-extensions {state}")
 PYEOF
 
 echo "[database]"

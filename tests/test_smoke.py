@@ -53,6 +53,21 @@ def _header(sid="__smoke__", **kw) -> SessionHeader:
     return SessionHeader(**base)
 
 
+# --- shell-embedded python --------------------------------------------------
+def test_shell_heredoc_python_compiles():
+    """Python inside .sh heredocs is invisible to compileall — a 3.12-only
+    f-string there once shipped green through CI while breaking 3.11 users."""
+    import re as _re
+    blocks = 0
+    for sh in list(_REPO.glob("*.sh")) + list((_REPO / "bin").glob("*.sh")):
+        text = sh.read_text(encoding="utf-8")
+        for m in _re.finditer(r"<<'?(PYEOF)'?\n(.*?)\n\1", text, _re.S):
+            compile(m.group(2), f"{sh.name}:heredoc", "exec")
+            blocks += 1
+    assert blocks >= 3, f"expected to find python heredocs, got {blocks}"
+    print(f"  ok  {blocks} shell-heredoc python blocks compile on this interpreter")
+
+
 # --- redaction ------------------------------------------------------------------
 def test_redaction_core():
     assert redact.redact('K=ctx7sk-00000000-aaaa-bbbb-cccc') == 'K=«REDACTED»'
