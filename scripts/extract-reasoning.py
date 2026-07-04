@@ -43,11 +43,13 @@ def process_one(adapter, path: Path, do_archive: bool, conn=None, force=False) -
     if extractor is None:
         return False
     steps = extractor(path)
+    # Archive the raw transcript FIRST — even a session with no reasoning steps
+    # (user-only, aborted) deserves its durable raw copy when --archive was asked.
+    if do_archive and sbconfig.REASONING_ENABLED:
+        reasoning.archive_raw(path, header)
     if not steps:
         return False
     readable = reasoning.write_readable(steps, header)
-    if do_archive and sbconfig.REASONING_ENABLED:
-        reasoning.archive_raw(path, header)
     reasoning.persist(sid, steps, readable, conn=conn)
     return True
 

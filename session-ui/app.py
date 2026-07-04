@@ -23,8 +23,9 @@ import sbconfig  # noqa: E402
 from sources.registry import build_source_registry  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-HOST = sbconfig.CONFIG["ui"]["host"]
-PORT = int(sbconfig.CONFIG["ui"]["port"])
+_UI = sbconfig.CONFIG.get("ui", {})
+HOST = _UI.get("host", "127.0.0.1")
+PORT = int(_UI.get("port", 7655))
 
 app = Flask(__name__, static_folder=None)
 SOURCES = build_source_registry()

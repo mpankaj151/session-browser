@@ -107,6 +107,9 @@ def process(path: Path, adapter, conn) -> dict | None:
     pricing = costs.load_pricing()
     total_cost = 0.0
     for model, toks in per_model.items():
+        if costs.tier_for_model(model, pricing) is None and any(toks.values()):
+            print(f"  ? unknown model '{model}' ({header.session_id[:8]}) — cost counted as $0; "
+                  f"add an alias for it in pricing.json", file=sys.stderr)
         total_cost += costs.cost_usd(model, toks, pricing)
     # dominant model = most output tokens
     dominant = max(per_model, key=lambda m: per_model[m]["output"], default=header.model_used)

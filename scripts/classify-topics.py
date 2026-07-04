@@ -15,8 +15,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import indexer  # noqa: E402
 
+# NOTE: alternations must be grouped — r"\ba|b\b" binds \b to only the first
+# and last branch, letting middle keywords match inside longer words.
 TOPIC_PATTERNS = {
-    "python": r"\bpython|fastapi|django|pytest|pydantic\b",
+    "python": r"\b(python|fastapi|django|pytest|pydantic)\b",
     "javascript": r"\b(javascript|typescript|node|react|vue|npm)\b",
     "database": r"\b(sql|sqlite|postgres|database|schema|migration)\b",
     "testing": r"\b(test|pytest|unittest|coverage|tdd)\b",
@@ -24,8 +26,8 @@ TOPIC_PATTERNS = {
     "ci-cd": r"\b(ci|cd|pipeline|github actions|deploy|docker)\b",
     "data": r"\b(data|etl|attribution|analytics|dataframe|pandas)\b",
     "finance": r"\b(stock|portfolio|trading|multibagger|paytm|dividend)\b",
-    "mcp": r"\bmcp|model context protocol|tool server\b",
-    "agent": r"\b(agent|subagent|orchestrat|workflow)\b",
+    "mcp": r"\b(mcp|model context protocol|tool server)\b",
+    "agent": r"\b(agent|subagent|orchestrat\w*|workflow)\b",
     "review": r"\b(review|audit|gap|improvement)\b",
     "planning": r"\b(plan|brainstorm|design|spec)\b",
 }

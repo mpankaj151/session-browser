@@ -3,28 +3,32 @@
 
 Order: migrate -> backfill -> classify-topics -> compute-costs -> reasoning
 -> full-text -> embeddings -> (optional) enrich. Each step is idempotent and
-isolated, so one failing step doesn't abort the rest. Run nightly (launchd) or
-on demand: `refresh-all.py [--enrich]`.
+isolated, so one failing step doesn't abort the rest — but failures are
+COLLECTED and reported, and the run exits nonzero if any step failed.
+Run nightly (launchd) or on demand: `refresh-all.py [--enrich]`.
 """
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-PY = str(REPO / ".venv" / "bin" / "python")
+# Whatever interpreter launched this script runs the steps too — never assume
+# a .venv at a fixed path (conda/system/venv-elsewhere installs all exist).
+PY = sys.executable
 SCRIPTS = REPO / "scripts"
 
 
-def run(label: str, args: list[str]) -> None:
+def run(label: str, args: list[str]) -> tuple[str, int]:
     print(f"\n=== {label} ===", flush=True)
     try:
-        subprocess.run([PY, *args], cwd=str(REPO), check=False)
+        proc = subprocess.run([PY, *args], cwd=str(REPO), check=False)
+        return label, proc.returncode
     except Exception as e:  # noqa: BLE001
-        print(f"  ! {label} failed: {e}", file=sys.stderr)
+        print(f"  ! {label} failed to launch: {e}", file=sys.stderr)
+        return label, -1
 
 
 def main() -> None:
@@ -44,8 +48,17 @@ def main() -> None:
     if args.enrich:
         steps.append(("enrichment", [str(SCRIPTS / "enrich-sessions.py")]))
 
+    failed: list[tuple[str, int]] = []
     for label, a in steps:
-        run(label, a)
+        label, rc = run(label, a)
+        if rc != 0:
+            failed.append((label, rc))
+
+    if failed:
+        print("\nrefresh-all finished WITH FAILURES:", file=sys.stderr)
+        for label, rc in failed:
+            print(f"  ✗ {label} (exit {rc})", file=sys.stderr)
+        sys.exit(1)
     print("\nrefresh-all complete.")
 
 

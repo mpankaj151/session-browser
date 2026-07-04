@@ -62,9 +62,18 @@ def search(query: str, limit: int = 20, conn=None) -> list[tuple[str, float]]:
             conn.close()
     if not rows:
         return []
-    ids = [r[0] for r in rows]
-    mat = np.vstack([unpack(r[1]) for r in rows])          # (N, 384), already normalized
     q = embed_text(query)                                  # normalized
+    # Only rows embedded at the query's dimensionality are comparable. Stale
+    # rows from a previous [embeddings].model would otherwise crash np.vstack;
+    # embed-sessions.py re-embeds them on its next run.
+    usable = [(r[0], r[1]) for r in rows if len(r[1]) // 4 == q.shape[0]]
+    if len(usable) < len(rows):
+        print(f"[semsearch] skipping {len(rows) - len(usable)} embeddings with a stale "
+              f"dimension — run scripts/embed-sessions.py to refresh them")
+    if not usable:
+        return []
+    ids = [sid for sid, _ in usable]
+    mat = np.vstack([unpack(blob) for _, blob in usable])  # (N, dim), already normalized
     sims = mat @ q                                         # cosine since unit vectors
     order = np.argsort(-sims)[:limit]
     return [(ids[i], float(sims[i])) for i in order]

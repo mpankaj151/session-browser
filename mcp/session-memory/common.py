@@ -17,7 +17,20 @@ MAX_BYTES = 2048
 
 
 def connect():
-    return indexer.connect(DB_PATH)
+    # Friendly failure pre-install: FastMCP surfaces the exception message as
+    # the tool error, so make it actionable instead of a raw SQLite error.
+    if not Path(DB_PATH).exists():
+        raise RuntimeError(
+            "Session index not built yet — run ./install.sh (or scripts/migrate-db.py "
+            "+ scripts/backfill.py) in the session-browser repo first.")
+    conn = indexer.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone()
+    if row is None:
+        conn.close()
+        raise RuntimeError(
+            "Session database has no schema — run scripts/migrate-db.py first.")
+    return conn
 
 
 def clamp(items: list, serialize=json.dumps) -> list:

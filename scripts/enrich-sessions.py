@@ -59,6 +59,7 @@ def main() -> None:
     print(f"{len(sessions)} sessions to enrich")
 
     done = 0
+    consecutive_failures = 0
     for s in sessions:
         adapter, path = _find_transcript(adapters, s)
         if path is None:
@@ -72,13 +73,23 @@ def main() -> None:
                                        s["model_used"] or "", s["cwd"] or "")
             (sbconfig.FACETS_DIR / f"{s['session_id']}.json").write_text(
                 json.dumps(facet, indent=2))
-            topics = json.dumps(list(facet.get("goal_categories", {}).keys()))
-            conn.execute(
-                "UPDATE sessions SET summary=?, topics=COALESCE(topics, ?), session_type=?, "
-                "outcome=?, enriched_at=CURRENT_TIMESTAMP WHERE session_id=?",
-                (facet["brief_summary"], topics, facet["session_type"],
-                 facet["outcome"], s["session_id"]),
-            )
+            topics_list = list(facet.get("goal_categories", {}).keys())
+            if topics_list:
+                # LLM topics are authoritative — they must override the cheap
+                # keyword-classifier fallbacks written earlier in the pipeline.
+                conn.execute(
+                    "UPDATE sessions SET summary=?, topics=?, session_type=?, "
+                    "outcome=?, enriched_at=CURRENT_TIMESTAMP WHERE session_id=?",
+                    (facet["brief_summary"], json.dumps(topics_list),
+                     facet["session_type"], facet["outcome"], s["session_id"]),
+                )
+            else:  # empty facet must not wipe existing topics
+                conn.execute(
+                    "UPDATE sessions SET summary=?, session_type=?, outcome=?, "
+                    "enriched_at=CURRENT_TIMESTAMP WHERE session_id=?",
+                    (facet["brief_summary"], facet["session_type"],
+                     facet["outcome"], s["session_id"]),
+                )
             # store key decisions as artifacts
             conn.execute("DELETE FROM session_artifacts WHERE session_id=? AND type='decision'",
                          (s["session_id"],))
@@ -88,9 +99,17 @@ def main() -> None:
                     "VALUES (?, 'decision', ?, ?)", (s["session_id"], str(dec)[:1000], i))
             conn.commit()
             done += 1
+            consecutive_failures = 0
             print(f"  ✓ {s['session_id'][:8]} [{s['cli_source']}] {facet['brief_summary'][:70]}")
         except Exception as e:  # noqa: BLE001
             print(f"  ! {s['session_id'][:8]}: {e}", file=sys.stderr)
+            consecutive_failures += 1
+            if consecutive_failures >= 5:
+                # circuit breaker: exhausted quota / broken provider would
+                # otherwise burn one failing LLM call per remaining session
+                print("  !! 5 consecutive failures — provider likely down or "
+                      "quota exhausted; aborting this run", file=sys.stderr)
+                break
         time.sleep(args.rate_limit)
 
     conn.close()

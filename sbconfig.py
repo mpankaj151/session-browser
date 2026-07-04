@@ -36,13 +36,16 @@ CONFIG = load_config()
 REPO_ROOT = _REPO_ROOT
 
 # --- Canonical paths (dual DB-path resolution: new location, legacy fallback) --
-_NEW_DB = _expand(CONFIG["paths"]["db"])
+# .get() with defaults everywhere: a hand-edited config.toml missing a key must
+# degrade to the documented default, not KeyError every tool at import time.
+_PATHS = CONFIG.get("paths", {})
+_NEW_DB = _expand(_PATHS.get("db", "~/.session-browser/registry.db"))
 _OLD_DB = Path.home() / ".claude" / "session-registry.db"
 DB_PATH = _NEW_DB if _NEW_DB.exists() else (_OLD_DB if _OLD_DB.exists() else _NEW_DB)
 
-FACETS_DIR = _expand(CONFIG["paths"]["facets_dir"])
-HOOK_STATE = _expand(CONFIG["paths"]["hook_state"])
-LOG_DIR = _expand(CONFIG["paths"]["log_dir"])
+FACETS_DIR = _expand(_PATHS.get("facets_dir", "~/.session-browser/facets"))
+HOOK_STATE = _expand(_PATHS.get("hook_state", "~/.session-browser/.hook-state.json"))
+LOG_DIR = _expand(_PATHS.get("log_dir", "~/.session-browser/logs"))
 
 REASONING_ENABLED = bool(CONFIG.get("reasoning", {}).get("enabled", True))
 REASONING_ARCHIVE = _expand(CONFIG.get("reasoning", {}).get("archive_dir", "~/claude-reasoning-archive"))
