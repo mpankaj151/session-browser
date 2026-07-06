@@ -13,7 +13,10 @@ between CLIs, and read a decision/reasoning trail for every one.
 Everything runs and stays on your machine: SQLite + Flask + vanilla JS + numpy.
 No cloud services, no telemetry, no external requests — the UI even works offline.
 
-![Session Browser — sessions view](docs/screenshot.png)
+![Session Browser demo — search, cross-CLI bridge, usage dashboard, light/dark](docs/demo.gif)
+
+*30-second tour on synthetic `sb demo` data — sessions list, search, cross-CLI
+bridge, the usage dashboard, and light mode.*
 
 ## Why
 
