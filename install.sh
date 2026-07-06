@@ -96,13 +96,18 @@ if not isinstance(hooks, dict):
 stop = hooks.get("Stop")
 if not isinstance(stop, list):
     stop = hooks["Stop"] = []
-already = any("session-hook.py" in json.dumps(h) for h in stop)
-if not already:
-    stop.append({"hooks":[{"type":"command","command":cmd}]})
-    settings.write_text(json.dumps(cfg, indent=2))
-    print("   hook added (backup: settings.json.sb-backup)")
-else:
+# Presence isn't enough: after the repo is moved, a session-hook.py entry still
+# exists but points at the dead path. Rebuild the desired state (all non-ours
+# entries + exactly one entry with the CURRENT path) and write only on change.
+kept = [h for h in stop if "session-hook.py" not in json.dumps(h)]
+desired = kept + [{"hooks": [{"type": "command", "command": cmd}]}]
+if json.dumps(desired, sort_keys=True) == json.dumps(stop, sort_keys=True):
     print("   hook already present")
+else:
+    hooks["Stop"] = desired
+    settings.write_text(json.dumps(cfg, indent=2))
+    verb = "updated to this repo path" if len(kept) != len(stop) else "added"
+    print(f"   hook {verb} (backup: settings.json.sb-backup)")
 PYEOF
 fi
 

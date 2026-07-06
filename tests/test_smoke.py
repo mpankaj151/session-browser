@@ -61,11 +61,86 @@ def test_shell_heredoc_python_compiles():
     blocks = 0
     for sh in list(_REPO.glob("*.sh")) + list((_REPO / "bin").glob("*.sh")):
         text = sh.read_text(encoding="utf-8")
-        for m in _re.finditer(r"<<'?(PYEOF)'?\n(.*?)\n\1", text, _re.S):
+        # Openers may carry a suffix (<<'PYEOF' || echo ...) or spill onto the
+        # next line with a backslash continuation — the python body only starts
+        # after the full shell command, and none of it may escape compilation.
+        for m in _re.finditer(r"<<'?(PYEOF)'?(?:[^\n]*\\\n)*[^\n]*\n(.*?)\n\1", text, _re.S):
             compile(m.group(2), f"{sh.name}:heredoc", "exec")
             blocks += 1
     assert blocks >= 3, f"expected to find python heredocs, got {blocks}"
     print(f"  ok  {blocks} shell-heredoc python blocks compile on this interpreter")
+
+
+def test_install_cr_repairs_moved_repo_paths():
+    """Re-running install-cr.sh after the repo moves must REPLACE the managed
+    rc blocks — presence-checking alone left cr/sb pointing at the dead path."""
+    import os
+    import subprocess
+    with tempfile.TemporaryDirectory() as home:
+        rc = Path(home) / ".zshrc"
+        stale = "/tmp/old-location/session-browser"
+        rc.write_text(
+            "export KEEP_ME=1\n\n"
+            "# >>> session-browser cr >>>\n"
+            f'cr() {{ "{stale}/bin/resume-here.sh" "$@"; }}\n'
+            "# <<< session-browser cr <<<\n\n"
+            "# >>> session-browser sb >>>\n"
+            f'sb() {{ local REPO="{stale}"; }}\n'
+            "# <<< session-browser sb <<<\n"
+        )
+        env = {**os.environ, "HOME": home, "SHELL": "/bin/zsh"}
+        run = lambda: subprocess.run(  # noqa: E731
+            ["bash", str(_REPO / "bin" / "install-cr.sh")],
+            env=env, capture_output=True, text=True)
+        r = run()
+        assert r.returncode == 0, r.stderr
+        assert "Updated" in r.stdout, r.stdout
+        text = rc.read_text()
+        assert "export KEEP_ME=1" in text, "unmanaged rc content must survive"
+        assert stale not in text, "stale repo path must be gone"
+        assert str(_REPO) in text, "current repo path must be installed"
+        for tag in ("cr", "sb"):
+            assert text.count(f"# >>> session-browser {tag} >>>") == 1
+        r2 = run()  # second run: idempotent
+        assert r2.returncode == 0 and rc.read_text() == text
+    print("  ok  install-cr.sh replaces stale rc blocks after a repo move")
+
+
+def test_install_hook_repairs_moved_repo_path():
+    """install.sh's hook registration must repoint a stale session-hook entry
+    (repo moved), keep foreign Stop hooks, and no-op when already correct."""
+    import os
+    import re as _re
+    import subprocess
+    block = next(
+        m.group(2)
+        for m in _re.finditer(r"<<'?(PYEOF)'?(?:[^\n]*\\\n)*[^\n]*\n(.*?)\n\1",
+                              (_REPO / "install.sh").read_text(), _re.S)
+        if "session-hook.py" in m.group(2))
+    with tempfile.TemporaryDirectory() as home:
+        settings = Path(home) / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        foreign = {"hooks": [{"type": "command", "command": "echo other-tool"}]}
+        stale = {"hooks": [{"type": "command",
+                            "command": '"/old/path/.venv/bin/python" "/old/path/scripts/session-hook.py"'}]}
+        settings.write_text(json.dumps({"hooks": {"Stop": [foreign, stale]}}))
+        env = {**os.environ, "HOME": home}
+        run = lambda: subprocess.run(  # noqa: E731
+            [sys.executable, "-", str(_REPO)],
+            input=block, env=env, capture_output=True, text=True)
+        r = run()
+        assert r.returncode == 0, r.stderr
+        assert "updated" in r.stdout, r.stdout
+        stop = json.loads(settings.read_text())["hooks"]["Stop"]
+        ours = [h for h in stop if "session-hook.py" in json.dumps(h)]
+        assert len(ours) == 1 and str(_REPO) in ours[0]["hooks"][0]["command"]
+        assert "/old/path" not in json.dumps(stop)
+        assert foreign in stop, "foreign Stop hooks must survive"
+        assert settings.with_suffix(".json.sb-backup").exists()
+        before = settings.read_text()
+        r2 = run()  # second run: correct entry -> no rewrite
+        assert "already present" in r2.stdout and settings.read_text() == before
+    print("  ok  install.sh repoints a stale Stop hook after a repo move")
 
 
 # --- redaction ------------------------------------------------------------------

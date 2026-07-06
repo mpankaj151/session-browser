@@ -2,7 +2,9 @@
 # Add the `cr` and `sb` shell functions to your shell rc so you can:
 #   cr <session_id>   resume any Claude/Copilot session in the CURRENT directory
 #   sb ui|open|stop|doctor|refresh   control the Session Browser
-# Idempotent — safe to run repeatedly. Targets ~/.zshrc (or ~/.bashrc if zsh absent).
+# Idempotent — safe to run repeatedly. Re-running REPLACES the managed blocks,
+# so it also repairs stale paths after the repo directory is moved.
+# Targets ~/.zshrc (or ~/.bashrc if zsh absent).
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Pick the rc by the LOGIN SHELL, not file existence: a fresh macOS account has
@@ -14,22 +16,39 @@ case "${SHELL:-}" in
   *)      RC="$HOME/.zshrc"; [ -f "$RC" ] || RC="$HOME/.bashrc" ;;
 esac
 
-if ! grep -qF "# >>> session-browser cr >>>" "$RC" 2>/dev/null; then
-  cat >> "$RC" <<EOF
+# Remove an existing managed block (between its >>> / <<< markers) so the
+# append below always installs the current repo path. Presence-checking alone
+# left stale paths behind after a repo move.
+strip_block() {
+  local tag="$1"
+  [ -f "$RC" ] || return 0
+  grep -qF "# >>> session-browser $tag >>>" "$RC" || return 0
+  # A failed rewrite must ABORT (not fall through to append) — appending on top
+  # of an unstripped block would leave two competing function definitions.
+  awk -v start="# >>> session-browser $tag >>>" -v end="# <<< session-browser $tag <<<" '
+    index($0, start) == 1 {skip=1; next}
+    index($0, end)   == 1 {skip=0; next}
+    !skip {print}
+  ' "$RC" > "$RC.sb-tmp" || { rm -f "$RC.sb-tmp"; echo "! failed to rewrite $RC" >&2; exit 1; }
+  mv "$RC.sb-tmp" "$RC"
+  return 42   # signal "replaced" to the caller
+}
 
+CR_STATE="Added"
+strip_block "cr" || CR_STATE="Updated"
+if [ "$CR_STATE" = "Added" ]; then printf '\n' >> "$RC"; fi
+cat >> "$RC" <<EOF
 # >>> session-browser cr >>>
 # Resume any Claude/Copilot session in the CURRENT directory: cr <session_id>
 cr() { "$REPO/bin/resume-here.sh" "\$@"; }
 # <<< session-browser cr <<<
 EOF
-  echo "Added cr() to $RC"
-else
-  echo "cr already installed in $RC"
-fi
+echo "$CR_STATE cr() in $RC"
 
-if ! grep -qF "# >>> session-browser sb >>>" "$RC" 2>/dev/null; then
-  cat >> "$RC" <<EOF
-
+SB_STATE="Added"
+strip_block "sb" || SB_STATE="Updated"
+if [ "$SB_STATE" = "Added" ]; then printf '\n' >> "$RC"; fi
+cat >> "$RC" <<EOF
 # >>> session-browser sb >>>
 # Control the Session Browser: sb {ui|stop|open|stats|demo|doctor|refresh [--enrich]}
 sb() {
@@ -47,9 +66,6 @@ sb() {
 }
 # <<< session-browser sb <<<
 EOF
-  echo "Added sb() to $RC"
-else
-  echo "sb already installed in $RC"
-fi
+echo "$SB_STATE sb() in $RC"
 
 echo "Run:  source $RC   (or open a new terminal), then:  cr <session_id>  /  sb ui"

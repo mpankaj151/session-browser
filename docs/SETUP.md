@@ -140,4 +140,4 @@ The reasoning archive at `~/claude-reasoning-archive` is always left intact.
 | Enrichment summaries never appear | The nightly job needs `claude`/`copilot` on PATH. On Intel Macs check `sb doctor` → sources; re-run `./install.sh` so the launchd PATH picks up your binary. |
 | Semantic search crashes after changing `[embeddings].model` | Run `sb refresh` (or `scripts/embed-sessions.py --force`) to re-embed at the new dimension. |
 | Something else — where are the logs? | `~/.session-browser/logs/`: `watcher.log` (live indexing), `refresh.log` + `refresh.err` (nightly pipeline), `ui.log` (`sb ui`). |
-| Everything broke after moving the repo | The venv, launchd jobs, Stop hook, and `cr`/`sb` functions bake in absolute paths. After relocating, re-run `./install.sh && ./bin/install-cr.sh` from the new location (and delete the old rc block if the path changed). |
+| Everything broke after moving the repo | The launchd jobs, Stop hook, and `cr`/`sb` functions bake in absolute paths. Re-run `./install.sh && ./bin/install-cr.sh` from the new location — both repoint stale entries automatically — then restart the UI (`sb stop; sb ui`) and confirm with `sb doctor`. |
