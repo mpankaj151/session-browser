@@ -11,10 +11,6 @@ import os
 import struct
 from functools import lru_cache
 
-# Local-first: the model is cached after first download; don't hit the network.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
 import numpy as np
 
 import indexer
@@ -27,15 +23,18 @@ DIM = 384
 def get_model():
     from sentence_transformers import SentenceTransformer
     try:
-        return SentenceTransformer(sbconfig.EMBED_MODEL)
+        # Offline-first via the local_files_only KWARG, never via the
+        # HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE env vars: huggingface_hub freezes
+        # those into module constants at import time, so flipping the env after
+        # this first attempt can't re-enable the network — the authorized
+        # download below would be a guaranteed no-op on a cold machine.
+        return SentenceTransformer(sbconfig.EMBED_MODEL, local_files_only=True)
     except Exception:
         # Model not in the local cache. Fetching it silently would contradict
         # the no-external-requests promise, so going online is opt-in;
         # install.sh (non --lite) pre-downloads, making this branch rare.
         # Callers catch this and fall back to keyword search.
         if os.environ.get("SB_ALLOW_MODEL_DOWNLOAD") == "1":
-            os.environ.pop("HF_HUB_OFFLINE", None)
-            os.environ.pop("TRANSFORMERS_OFFLINE", None)
             return SentenceTransformer(sbconfig.EMBED_MODEL)
         raise RuntimeError(
             f"embedding model '{sbconfig.EMBED_MODEL}' is not cached locally; "

@@ -106,6 +106,31 @@ def test_install_cr_repairs_moved_repo_paths():
     print("  ok  install-cr.sh replaces stale rc blocks after a repo move")
 
 
+def test_semsearch_offline_gate():
+    """With no cached model and no SB_ALLOW_MODEL_DOWNLOAD, get_model() must
+    fail fast with the friendly RuntimeError and never attempt the network.
+    Regression: the old env-var approach (HF_HUB_OFFLINE) froze into
+    huggingface_hub at import, so even the AUTHORIZED download retry was a
+    permanent no-op on machines without a warm cache."""
+    import importlib.util
+    import os
+    import subprocess
+    if importlib.util.find_spec("sentence_transformers") is None:
+        print("  skip semsearch offline gate (sentence-transformers not installed)")
+        return
+    env = {**os.environ, "HF_HOME": tempfile.mkdtemp(prefix="sb-hf-empty-")}
+    for k in ("SB_ALLOW_MODEL_DOWNLOAD", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        env.pop(k, None)
+    r = subprocess.run(
+        [sys.executable, "-c",
+         f"import sys; sys.path.insert(0, {str(_REPO)!r}); "
+         "import semsearch; semsearch.get_model()"],
+        env=env, capture_output=True, text=True, timeout=180)
+    assert r.returncode != 0, "expected failure with an empty model cache"
+    assert "not cached locally" in r.stderr, r.stderr[-800:]
+    print("  ok  semsearch: cold cache + no opt-in -> fast friendly error, no download")
+
+
 def test_install_hook_repairs_moved_repo_path():
     """install.sh's hook registration must repoint a stale session-hook entry
     (repo moved), keep foreign Stop hooks, and no-op when already correct."""

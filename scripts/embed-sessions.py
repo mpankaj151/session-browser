@@ -48,7 +48,15 @@ def main() -> None:
     # A config [embeddings].model change means a new dimensionality — stored
     # rows at the old dim are unusable and must be re-embedded even if their
     # source_text is unchanged.
-    model_dim = semsearch.get_model().get_sentence_embedding_dimension()
+    try:
+        model = semsearch.get_model()
+    except Exception as e:
+        msg = str(e).strip().splitlines()
+        print(f"! embedding model unavailable: {type(e).__name__}: {msg[-1] if msg else e}")
+        print("  Semantic search falls back to keyword + full-text until the model is cached.")
+        print("  Check access to huggingface.co (proxy/firewall?), then re-run: sb refresh")
+        sys.exit(1)
+    model_dim = model.get_sentence_embedding_dimension()
 
     todo = []
     for r in rows:
