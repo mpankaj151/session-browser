@@ -91,5 +91,12 @@ if grep -q sessionbrowser.watcher <<< "$JOBS"; then ok "watcher launchd job load
   printf "  \033[33m∼\033[0m watcher launchd job not loaded\n"; fi
 if grep -q sessionbrowser.refresh <<< "$JOBS"; then ok "nightly refresh job loaded"; else
   printf "  \033[33m∼\033[0m nightly refresh job not loaded (run refresh-all.py manually to update)\n"; fi
-if curl -s localhost:7655/health >/dev/null 2>&1; then ok "UI responding on :7655"; else
-  printf "  \033[33m∼\033[0m UI not running (start with bin/start-session-ui.sh)\n"; fi
+# --max-time: a wedged/suspended process holding the port accepts the TCP
+# connect but never answers — without a deadline this health check hangs forever.
+if curl -s --max-time 3 localhost:7655/health >/dev/null 2>&1; then ok "UI responding on :7655"; else
+  if lsof -ti tcp:7655 >/dev/null 2>&1; then
+    printf "  \033[31m✗\033[0m :7655 is held by a process that isn't answering — try: sb stop, then sb ui\n"
+  else
+    printf "  \033[33m∼\033[0m UI not running (start with: sb ui)\n"
+  fi
+fi
