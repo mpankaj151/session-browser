@@ -165,5 +165,10 @@ PYEOF
   done
 fi
 
-echo "==> done. Start the UI:  $REPO/bin/start-session-ui.sh  ->  http://127.0.0.1:7655"
-echo "    Health check:        $REPO/bin/doctor.sh"
+printf '\n\033[1;32m✓ Session Browser installed.\033[0m\n\n'
+echo "Next:"
+echo "  ./bin/install-cr.sh      # once — adds the cr / sb shell commands"
+echo "  source ~/.zshrc          # or open a new terminal (installer prints which rc)"
+echo "  sb ui                    # start the web UI  ->  http://127.0.0.1:7655"
+echo "  sb demo                  # or try it on synthetic data first"
+echo "  sb doctor                # health check"
