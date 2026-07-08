@@ -18,10 +18,15 @@ main() {
   local INSTALL_ARGS="${SB_INSTALL_ARGS:-}"
 
   command -v git >/dev/null 2>&1 || die "git is required. Install it and re-run."
-  command -v python3 >/dev/null 2>&1 || die "python3 is required (3.11+). Install it and re-run."
-  python3 - <<'PYEOF' || die "Python 3.11+ is required (found older)."
-import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)
-PYEOF
+  # macOS's stock `python3` is often 3.9 (Xcode CLT); accept any 3.11+ interpreter.
+  local PYOK=""
+  for c in python3.13 python3.12 python3.11 python3; do
+    if command -v "$c" >/dev/null 2>&1 && \
+       "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+      PYOK="$c"; break
+    fi
+  done
+  [ -n "$PYOK" ] || die "Python 3.11+ is required (found: $(python3 -V 2>/dev/null || echo none)). macOS: brew install python@3.12 — Linux: sudo apt install python3.12 python3.12-venv. Then re-run."
 
   case "$(uname)" in
     Darwin|Linux) : ;;

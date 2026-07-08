@@ -19,17 +19,30 @@ for a in "$@"; do case "$a" in
 
 echo "==> Session Browser install ($REPO)"
 
-# Python 3.11+ required (tomllib, sqlite FTS5)
-python3 - <<'PYEOF' || { echo "!! python3 >= 3.11 required"; exit 1; }
-import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)
-PYEOF
+# Python 3.11+ required (tomllib, sqlite FTS5). Don't hard-require that plain
+# `python3` be new: stock macOS resolves it to the Xcode CLT build (often 3.9)
+# even when a modern interpreter is installed as python3.12 — hunt for one.
+PYBOOT=""
+for c in python3.13 python3.12 python3.11 python3; do
+  if command -v "$c" >/dev/null 2>&1 && \
+     "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    PYBOOT="$(command -v "$c")"; break
+  fi
+done
+if [ -z "$PYBOOT" ]; then
+  echo "!! Python 3.11+ is required (found: $(python3 -V 2>/dev/null || echo none))."
+  echo "   macOS:  brew install python@3.12"
+  echo "   Linux:  sudo apt install python3.12 python3.12-venv  (or your distro's equivalent)"
+  echo "   Then re-run this script."
+  exit 1
+fi
 
 # 1. venv + dependencies (idempotent — pip skips what's already satisfied).
 #    --system-site-packages reuses an existing torch/sentence-transformers
 #    install when one is present; harmless otherwise.
 if [ ! -x "$PY" ]; then
-  echo "==> creating venv"
-  python3 -m venv --system-site-packages "$REPO/.venv"
+  echo "==> creating venv ($PYBOOT)"
+  "$PYBOOT" -m venv --system-site-packages "$REPO/.venv"
   "$PY" -m pip install --quiet --upgrade pip
 fi
 echo "==> installing dependencies"

@@ -33,6 +33,9 @@ one searchable index and adds the things the CLIs don't give you:
 
 ## Quick start
 
+**Prereqs:** git and Python 3.11+ — macOS: `brew install python@3.12` (the stock
+`python3` on a Mac is often 3.9) · Debian/Ubuntu: `sudo apt install python3.12 python3.12-venv`.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mpankaj151/session-browser/main/bootstrap.sh | bash
 source ~/.zshrc   # or ~/.bashrc — the installer prints which
