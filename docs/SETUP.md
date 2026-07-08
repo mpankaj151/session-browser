@@ -50,7 +50,15 @@ source ~/.zshrc
 6. **macOS:** installs launchd jobs (live watcher + nightly 01:00 refresh).
    **Linux:** prints the two commands to schedule yourself.
 
-Install flags: `--lite`, `--enrich`, `--no-hook`, `--no-launchd`, `--no-backfill`.
+Install flags:
+
+| Flag | Effect |
+|---|---|
+| `--lite` | Skip the ~2 GB semantic-search ML stack; search falls back to keyword + full-text |
+| `--enrich` | Also LLM-summarize your **existing** history during install (spends your plan's quota; the nightly job enriches *new* sessions regardless). Later: `sb refresh --enrich` |
+| `--no-hook` | Don't register the Claude Stop hook |
+| `--no-launchd` | Don't install macOS launchd jobs |
+| `--no-backfill` | Don't index existing sessions now |
 
 ## 4. Post-install checklist
 

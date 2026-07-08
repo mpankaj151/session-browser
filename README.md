@@ -91,6 +91,23 @@ Also available in the terminal: `sb stats` (today / 7d / 30d / all).
 **Full-text** (FTS5 over the actual conversation — find sessions by what was
 *discussed*). Filter by folder, source, topic, or time.
 
+### AI summaries & topics (uses your own quota)
+
+The one-line summaries, topic tags, and session-type/outcome labels on the cards
+are written by an LLM through your **own** CLI (`claude --print` / `copilot`) —
+no API key, but it spends your plan's quota. So it's split by cost:
+
+- **Your existing history is NOT enriched at install** (that could be hundreds of
+  sessions). Summarize it once with `sb refresh --enrich`, or opt in up front
+  with `./install.sh --enrich`. Until then, cards show each session's first
+  message instead of a summary.
+- **New sessions are enriched automatically** by the nightly job — a small
+  incremental spend, since only sessions without a summary are ever sent.
+
+Everything else (search, costs, resume, bridge, reasoning trails) works with
+enrichment never run. Transcripts are redacted *before* the LLM sees them (see
+Privacy below).
+
 ### Resume from anywhere — `cr <session_id>`
 
 A plain `claude --resume` only works from the session's original directory. `cr`
