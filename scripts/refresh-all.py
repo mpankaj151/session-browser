@@ -47,6 +47,8 @@ def main() -> None:
     ]
     if args.enrich:
         steps.append(("enrichment", [str(SCRIPTS / "enrich-sessions.py")]))
+    # Last so it sees tonight's enrichment; no LLM cost, so never gated on --enrich.
+    steps.append(("daily digest", [str(SCRIPTS / "daily-digest.py")]))
 
     failed: list[tuple[str, int]] = []
     for label, a in steps:

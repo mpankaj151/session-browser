@@ -153,14 +153,29 @@ Six stdio tools (`search_sessions`, `get_session_summary`, `get_session_snippet`
 `list_recent`, `get_decisions`, `get_reasoning`). Registration in
 [docs/SETUP.md](docs/SETUP.md).
 
+### Work journal — your performance review, already written
+
+Every session is journaled automatically: a **SessionEnd hook** enriches the
+just-ended session into accomplishments, key decisions with rationale,
+explorations that were set aside, open threads, and a reusability note.
+Resumed sessions re-journal incrementally instead of going stale. A nightly
+**daily digest** assembles `daily-logs/YYYY-MM-DD.md` per day (no LLM cost),
+and the **work-journal skill** (linked into `~/.claude/skills` at install)
+turns any window into a report: ask Claude *"what did I do last week"*,
+*"monthly summary"*, or *"draft my self-assessment for the last quarter"* and
+get a paste-ready Markdown summary plus a self-contained HTML timeline —
+generated from the journal, never by re-reading months of transcripts.
+
 ## How it stays fresh
 
-- **Stop hook** indexes a Claude session the moment it ends (always exits 0 — it
-  can never block your session).
+- **Stop hook** indexes a Claude session the moment it stops responding
+  (always exits 0 — it can never block your session).
+- **SessionEnd hook** additionally journals the ended session (detached; a
+  re-fire with no new activity costs nothing).
 - **Watcher** (launchd daemon) catches Copilot/Codex and anything else via
   filesystem events.
 - **Nightly refresh** (01:00) runs the full pipeline: costs, reasoning, full-text,
-  embeddings, LLM summaries.
+  embeddings, LLM journals for anything the hooks missed, daily digests.
 
 macOS wires these via launchd automatically; Linux uses systemd/cron (commands in
 [docs/SETUP.md](docs/SETUP.md)).
@@ -178,7 +193,6 @@ Adding another (Gemini, OpenCode, Aider, Ollama, …) is one file — see
 
 ## Roadmap
 
-- Daily digest / auto-standup from the day's sessions
 - Decision-trail → PR description export
 - Gemini CLI, OpenCode, Aider adapters
 - Budget alerts on notional spend

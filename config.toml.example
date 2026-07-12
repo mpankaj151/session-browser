@@ -39,9 +39,28 @@ provider = "claude-headless"   # claude-headless | copilot-headless | none
 
 [enrichment.claude_headless]
 binary          = "claude"
+# Model for journal enrichment. Pinned (not the CLI's default model) so spend
+# stays predictable — on API billing, Sonnet runs ~$0.05-0.08 per session vs
+# ~5x that on Opus-tier defaults. Set to "" to use the CLI's default model.
+model           = "claude-sonnet-5"
 exec_args       = ["--print"]
 prompt_template = "summarize-multi-source.md"
 timeout_secs    = 180
+
+# --- Daily digest --------------------------------------------------------------
+# The nightly refresh assembles daily-logs/YYYY-MM-DD.md from enriched sessions
+# (deterministic — no LLM call). Self-healing: any past day whose file is
+# missing or stale is (re)written on the next run.
+[digest]
+daily_dir = "~/.session-browser/daily-logs"
+
+# --- Reports (work-journal skill) ----------------------------------------------
+# Where generated summaries/timelines land, and an OPTIONAL personal style file
+# layered over the skill's default report structure (keeps company-specific
+# performance-review framing out of this repo). The override file need not exist.
+[reports]
+out_dir        = "~/.session-browser/reports"
+style_override = "~/.session-browser/report-style.md"
 
 # --- Reasoning archive (headline feature) ------------------------------------
 # Raw transcripts and rendered "thinking -> decision -> action" trails are

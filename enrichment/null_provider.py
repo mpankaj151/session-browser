@@ -11,13 +11,19 @@ class NullProvider:
     def is_available(self) -> bool:
         return True
 
-    def summarize(self, turns: list, cli_source: str, model: str = "", cwd: str = "") -> dict:
+    def summarize(self, turns: list, cli_source: str, model: str = "", cwd: str = "",
+                  prior: dict | None = None) -> dict:
         first_user = next((t.content for t in turns if getattr(t, "role", "") == "user"), "")
         summary = (first_user or "").strip().split("\n")[0][:160]
         if summary and summary[-1] not in ".!?":
             summary += "…"
         return {
             "brief_summary": summary or "(no summary)",
+            "goal": "",
+            "accomplishments": [],
+            "explorations": [],
+            "open_threads": [],
+            "reusability": "",
             "goal_categories": {},
             "session_type": "unknown",
             "outcome": "unknown",

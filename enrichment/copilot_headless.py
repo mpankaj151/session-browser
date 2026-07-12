@@ -32,8 +32,9 @@ class CopilotHeadless:
     def is_available(self) -> bool:
         return shutil.which(self.binary) is not None
 
-    def summarize(self, turns: list, cli_source: str, model: str = "", cwd: str = "") -> dict:
-        prompt = render_prompt(turns, cli_source, model, cwd, self.template)
+    def summarize(self, turns: list, cli_source: str, model: str = "", cwd: str = "",
+                  prior: dict | None = None) -> dict:
+        prompt = render_prompt(turns, cli_source, model, cwd, self.template, prior=prior)
         prompt = prompt[:120_000]  # argv-passed; stay far below ARG_MAX
         proc = subprocess.run(
             [self.binary, *self.exec_args, prompt],

@@ -155,17 +155,18 @@ def test_install_hook_repairs_moved_repo_path():
             input=block, env=env, capture_output=True, text=True)
         r = run()
         assert r.returncode == 0, r.stderr
-        assert "updated" in r.stdout, r.stdout
-        stop = json.loads(settings.read_text())["hooks"]["Stop"]
-        ours = [h for h in stop if "session-hook.py" in json.dumps(h)]
-        assert len(ours) == 1 and str(_REPO) in ours[0]["hooks"][0]["command"]
-        assert "/old/path" not in json.dumps(stop)
-        assert foreign in stop, "foreign Stop hooks must survive"
+        assert "registered" in r.stdout, r.stdout
+        hooks = json.loads(settings.read_text())["hooks"]
+        for event in ("Stop", "SessionEnd"):
+            ours = [h for h in hooks[event] if "session-hook.py" in json.dumps(h)]
+            assert len(ours) == 1 and str(_REPO) in ours[0]["hooks"][0]["command"], event
+        assert "/old/path" not in json.dumps(hooks)
+        assert foreign in hooks["Stop"], "foreign Stop hooks must survive"
         assert settings.with_suffix(".json.sb-backup").exists()
         before = settings.read_text()
-        r2 = run()  # second run: correct entry -> no rewrite
+        r2 = run()  # second run: correct entries -> no rewrite
         assert "already present" in r2.stdout and settings.read_text() == before
-    print("  ok  install.sh repoints a stale Stop hook after a repo move")
+    print("  ok  install.sh registers Stop + SessionEnd, repoints stale paths")
 
 
 # --- redaction ------------------------------------------------------------------
