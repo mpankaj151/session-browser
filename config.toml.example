@@ -39,6 +39,10 @@ provider = "claude-headless"   # claude-headless | copilot-headless | none
 
 [enrichment.claude_headless]
 binary          = "claude"
+# Model for journal enrichment. Pinned (not the CLI's default model) so spend
+# stays predictable — on API billing, Sonnet runs ~$0.05-0.08 per session vs
+# ~5x that on Opus-tier defaults. Set to "" to use the CLI's default model.
+model           = "claude-sonnet-5"
 exec_args       = ["--print"]
 prompt_template = "summarize-multi-source.md"
 timeout_secs    = 180

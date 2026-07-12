@@ -166,6 +166,18 @@ def test_select_session_fast_path_honors_staleness():
     print("  ok  --session fast path: fresh=$0, resumed/force selected, unknown=empty")
 
 
+def test_claude_headless_pins_enrichment_model():
+    """Enrichment must not silently inherit the CLI's default model (which may
+    be an expensive tier) — sonnet-5 by default, overridable, ""-disableable."""
+    from enrichment.claude_headless import ClaudeHeadless
+    assert ClaudeHeadless({}).command() == ["claude", "--print", "--model", "claude-sonnet-5"]
+    assert ClaudeHeadless({"model": "claude-haiku-4-5"}).command() == \
+        ["claude", "--print", "--model", "claude-haiku-4-5"]
+    # escape hatch: empty model -> CLI default, no --model flag
+    assert ClaudeHeadless({"model": ""}).command() == ["claude", "--print"]
+    print("  ok  claude-headless pins claude-sonnet-5 (override + escape hatch)")
+
+
 def test_find_transcript_uses_adapter_mapping():
     """Codex names files rollout-<ts>-<uuid>.jsonl — a stem match never hits
     them, which silently left every codex session unenriched. The adapter's

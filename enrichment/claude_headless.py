@@ -18,15 +18,29 @@ _SUPPRESS = {"SESSION_BROWSER_SUPPRESS_HOOK": "1"}
 
 _REPO = Path(__file__).resolve().parent.parent
 
+# Journal extraction is structured summarization — Sonnet-tier quality at a
+# fraction of Opus/Fable cost. Pinning (rather than inheriting whatever model
+# the user's CLI defaults to) keeps enrichment spend predictable on both
+# flat-rate plans and API billing. Override with [enrichment.claude_headless]
+# model = "..." in config.toml; set model = "" to fall back to the CLI default.
+_DEFAULT_MODEL = "claude-sonnet-5"
+
 
 class ClaudeHeadless:
     name = "claude-headless"
 
     def __init__(self, config: dict):
         self.binary = config.get("binary", "claude")
+        self.model = config.get("model", _DEFAULT_MODEL)
         self.exec_args = config.get("exec_args", ["--print"])
         self.timeout = int(config.get("timeout_secs", 180))
         self.template = _REPO / "prompts" / config.get("prompt_template", "summarize-multi-source.md")
+
+    def command(self) -> list[str]:
+        args = [self.binary, *self.exec_args]
+        if self.model:
+            args += ["--model", self.model]
+        return args
 
     def is_available(self) -> bool:
         return shutil.which(self.binary) is not None
@@ -35,7 +49,7 @@ class ClaudeHeadless:
                   prior: dict | None = None) -> dict:
         prompt = render_prompt(turns, cli_source, model, cwd, self.template, prior=prior)
         proc = subprocess.run(
-            [self.binary, *self.exec_args],
+            self.command(),
             input=prompt, capture_output=True, text=True, timeout=self.timeout,
             env={**os.environ, **_SUPPRESS},
         )
