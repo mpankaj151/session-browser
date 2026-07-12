@@ -128,6 +128,27 @@ else:
 PYEOF
 fi
 
+# 6b. Claude skills — symlink each shipped skill into ~/.claude/skills so the
+#     work-journal / snapshot / checkpoint skills are discoverable. Symlinks (not
+#     copies) so a repo update updates the skills; skill updates ride git pull.
+if [ "$NO_HOOK" -eq 0 ]; then
+  echo "==> linking Claude skills"
+  mkdir -p "$HOME/.claude/skills"
+  for d in "$REPO"/skills/*/; do
+    name="$(basename "$d")"
+    target="$HOME/.claude/skills/$name"
+    if [ -L "$target" ]; then
+      # repoint after a repo move; no-op when already correct
+      [ "$(readlink "$target")" = "${d%/}" ] || { ln -sfn "${d%/}" "$target"; echo "   repointed $name"; }
+    elif [ -e "$target" ]; then
+      echo "   ! ~/.claude/skills/$name exists and is not ours — leaving it alone"
+    else
+      ln -s "${d%/}" "$target"
+      echo "   linked $name"
+    fi
+  done
+fi
+
 # 7. launchd (macOS only; on Linux schedule watcher.py + refresh-all.py via systemd/cron)
 if [ "$(uname)" != "Darwin" ] && [ "$NO_LAUNCHD" -eq 0 ]; then
   NO_LAUNCHD=1

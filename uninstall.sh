@@ -14,28 +14,40 @@ if [ "$(uname)" = "Darwin" ]; then
   done
 fi
 
-echo "==> removing Stop hook"
-# The repo venv may already be gone — any python3 can strip the hook.
+echo "==> removing Stop + SessionEnd hooks"
+# The repo venv may already be gone — any python3 can strip the hooks.
 UNPY="$REPO/.venv/bin/python"
 [ -x "$UNPY" ] || UNPY="$(command -v python3 || true)"
 if [ -n "$UNPY" ]; then
-  "$UNPY" - <<'PYEOF' || echo "   ! could not edit ~/.claude/settings.json — remove the session-hook.py Stop hook manually"
+  "$UNPY" - <<'PYEOF' || echo "   ! could not edit ~/.claude/settings.json — remove the session-hook.py hooks manually"
 import json
 from pathlib import Path
 s = Path.home()/".claude"/"settings.json"
 if s.exists():
     cfg = json.loads(s.read_text())
-    stop = cfg.get("hooks",{}).get("Stop",[])
-    if isinstance(stop, list):
-        stop = [h for h in stop if "session-hook.py" not in json.dumps(h)]
-        if stop: cfg["hooks"]["Stop"]=stop
-        elif "hooks" in cfg and "Stop" in cfg["hooks"]: del cfg["hooks"]["Stop"]
-        s.write_text(json.dumps(cfg, indent=2))
-        print("   hook removed")
+    hooks = cfg.get("hooks", {})
+    for event in ("Stop", "SessionEnd"):
+        entries = hooks.get(event, [])
+        if isinstance(entries, list):
+            entries = [h for h in entries if "session-hook.py" not in json.dumps(h)]
+            if entries: hooks[event] = entries
+            elif event in hooks: del hooks[event]
+    s.write_text(json.dumps(cfg, indent=2))
+    print("   hooks removed")
 PYEOF
 else
-  echo "   ! no python3 found — remove the session-hook.py Stop hook from ~/.claude/settings.json manually"
+  echo "   ! no python3 found — remove the session-hook.py hooks from ~/.claude/settings.json manually"
 fi
+
+echo "==> removing Claude skill links"
+for d in "$REPO"/skills/*/; do
+  name="$(basename "$d")"
+  target="$HOME/.claude/skills/$name"
+  # only remove links that point INTO this repo — never a user's own skill
+  if [ -L "$target" ] && [ "$(readlink "$target")" = "${d%/}" ]; then
+    rm -f "$target" && echo "   unlinked $name"
+  fi
+done
 
 echo "==> removing cr/sb shell functions"
 for RC in "$HOME/.zshrc" "$HOME/.bashrc"; do
