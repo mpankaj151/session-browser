@@ -65,14 +65,58 @@ def parse_facet_json(raw: str, provider_name: str, model: str | None = None) -> 
         data["goal_categories"] = {}
     data["key_decisions"] = list(data.get("key_decisions") or [])
     data["files_touched"] = list(data.get("files_touched") or [])
+    # Journal-grade keys are optional (older facets and the null provider lack
+    # them) — coerce to their shape so downstream code never branches on absence.
+    for key in ("accomplishments", "explorations", "open_threads"):
+        data[key] = [str(x) for x in (data.get(key) or [])]
+    data["goal"] = str(data.get("goal") or "").strip()
+    data["reusability"] = str(data.get("reusability") or "").strip()
     data["brief_summary"] = _finalize_summary(data.get("brief_summary", ""))
     data["_meta"] = {"provider": provider_name, "model": model,
                      "enriched_at": datetime.now(timezone.utc).isoformat()}
     return data
 
 
+_JOURNAL_SECTIONS = (
+    ("accomplishments", "Accomplishments"),
+    ("key_decisions", "Key decisions"),
+    ("explorations", "Explorations (not kept)"),
+    ("open_threads", "Open threads"),
+)
+
+
+def render_journal_markdown(facet: dict) -> str:
+    """Deterministic journal markdown from a facet — the durable per-session
+    record surfaced by daily digests and review reports. Empty sections are
+    omitted; an all-empty facet yields ''. """
+    parts: list[str] = []
+    for key, heading in _JOURNAL_SECTIONS:
+        items = [str(x).strip() for x in (facet.get(key) or []) if str(x).strip()]
+        if items:
+            parts.append(f"## {heading}\n" + "\n".join(f"- {i}" for i in items))
+    reuse = str(facet.get("reusability") or "").strip()
+    if reuse:
+        parts.append(f"## Reusability\n{reuse}")
+    return "\n\n".join(parts)
+
+
+def render_prior_context(prior: dict) -> str:
+    """The incremental re-enrichment block: shows the previous journal so the
+    model UPDATES it from the new turns instead of starting over."""
+    lines = ["", "This session was previously journaled. Prior entry:",
+             f"- Summary: {prior.get('brief_summary', '')}"]
+    journal = render_journal_markdown(prior)
+    if journal:
+        lines.append(journal)
+    lines.append(
+        "The transcript below contains only turns SINCE that entry. Merge: keep "
+        "prior facts that still hold, integrate what is new, and move resolved "
+        "open threads into accomplishments. Return the full updated JSON.")
+    return "\n".join(lines) + "\n"
+
+
 def render_prompt(turns: list, cli_source: str, model: str, cwd: str,
-                  template_path: Path) -> str:
+                  template_path: Path, prior: dict | None = None) -> str:
     lines = []
     for t in turns[:60]:
         role = getattr(t, "role", "?").upper()
@@ -86,6 +130,7 @@ def render_prompt(turns: list, cli_source: str, model: str, cwd: str,
     return (template.replace("{cli_source}", cli_source)
                     .replace("{model}", model or "")
                     .replace("{cwd}", cwd or "")
+                    .replace("{prior_context}", render_prior_context(prior) if prior else "")
                     .replace("{transcript}", transcript))
 
 
