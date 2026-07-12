@@ -212,6 +212,88 @@ def test_load_prior_reads_turns_seen(tmp_dir: Path | None = None):
     print("  ok  _load_prior: facet turns_seen / missing file / --force")
 
 
+# --- daily digest ---------------------------------------------------------------
+def _digest_fixture(conn):
+    """3 sessions across 2 projects on 2026-06-01 (UTC), one unsummarized."""
+    specs = [
+        ("a1", "x", "Refresh the MCP token", "2026-06-01T04:30:00.000Z",
+         "Refreshed and verified the expired OAuth tokens.", "ops", "completed"),
+        ("a2", "x", None, "2026-06-01T09:00:00.000Z", None, None, None),
+        ("b1", "y", "Fix flaky DAG", "2026-06-01T11:15:00.000Z",
+         "Stabilized the airflow DAG retries.", "debugging", "completed"),
+    ]
+    for sid, folder, title, start, summary, stype, outcome in specs:
+        indexer.upsert(_header(sid=sid, folder_name=folder, title=title,
+                               start_time=start, last_activity=start,
+                               first_message="please fix the dag"), conn=conn)
+        if summary:
+            conn.execute(
+                "UPDATE sessions SET summary=?, session_type=?, outcome=?, "
+                "enriched_at=? WHERE session_id=?",
+                (summary, stype, outcome, "2026-06-01T12:00:00.000Z", sid))
+    conn.execute("INSERT INTO session_artifacts (session_id, type, content) "
+                 "VALUES ('a1', 'journal', '## Accomplishments\n- refreshed both tokens')")
+    conn.commit()
+
+
+def test_daily_digest_render_day():
+    from datetime import timezone as _tz
+    dd = _load_script("daily-digest")
+    conn = _temp_db()
+    try:
+        _digest_fixture(conn)
+        days = dd.collect_days(conn, tz=_tz.utc)
+        assert set(days) == {"2026-06-01"} and len(days["2026-06-01"]) == 3
+        journals = {"a1": "## Accomplishments\n- refreshed both tokens"}
+        md = dd.render_day("2026-06-01", days["2026-06-01"], journals, tz=_tz.utc)
+        assert md.startswith("# Work log — 2026-06-01 (Monday)")
+        assert "*3 sessions · 2 projects · claude ×3*" in md
+        assert md.index("## x") < md.index("## y"), "busier project first"
+        assert "### 04:30 — Refresh the MCP token  `ops · completed · claude · 0 min`" in md
+        assert "#### Accomplishments" in md and "\n## Accomplishments" not in md, \
+            "journal headings must demote under the session heading"
+        assert "_(unsummarized)_ please fix the dag" in md
+    finally:
+        conn.close()
+    print("  ok  render_day: grouping, badges, journal demotion, unsummarized fallback")
+
+
+def test_daily_digest_local_date_grouping():
+    from datetime import timedelta, timezone as _tz
+    dd = _load_script("daily-digest")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="tz1", start_time="2026-06-01T20:30:00.000Z",
+                               last_activity="2026-06-01T20:30:00.000Z"), conn=conn)
+        ist = _tz(timedelta(hours=5, minutes=30))
+        assert set(dd.collect_days(conn, tz=ist)) == {"2026-06-02"}
+        assert set(dd.collect_days(conn, tz=_tz.utc)) == {"2026-06-01"}
+    finally:
+        conn.close()
+    print("  ok  collect_days groups by LOCAL date of start_time")
+
+
+def test_daily_digest_needs_write_staleness():
+    import os
+    dd = _load_script("daily-digest")
+    conn = _temp_db()
+    try:
+        _digest_fixture(conn)
+        rows = dd.collect_days(conn)[next(iter(dd.collect_days(conn)))]
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "2026-06-01.md"
+            assert dd.needs_write(f, rows), "missing file must be written"
+            f.write_text("x")
+            assert not dd.needs_write(f, rows), "fresh file (mtime now) is kept"
+            # age the file to before the sessions' enriched_at -> stale
+            old = 1_700_000_000  # 2023 — well before any fixture timestamp
+            os.utime(f, (old, old))
+            assert dd.needs_write(f, rows), "re-enriched session must refresh its day"
+    finally:
+        conn.close()
+    print("  ok  needs_write: missing/stale rewritten, fresh kept")
+
+
 # --- persistence ----------------------------------------------------------------
 def test_persist_writes_snapshot_and_journal_idempotently():
     es = _load_script("enrich-sessions")

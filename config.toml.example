@@ -43,6 +43,13 @@ exec_args       = ["--print"]
 prompt_template = "summarize-multi-source.md"
 timeout_secs    = 180
 
+# --- Daily digest --------------------------------------------------------------
+# The nightly refresh assembles daily-logs/YYYY-MM-DD.md from enriched sessions
+# (deterministic — no LLM call). Self-healing: any past day whose file is
+# missing or stale is (re)written on the next run.
+[digest]
+daily_dir = "~/.session-browser/daily-logs"
+
 # --- Reasoning archive (headline feature) ------------------------------------
 # Raw transcripts and rendered "thinking -> decision -> action" trails are
 # written under archive_dir/{raw,readable}/YYYY/MM/.
