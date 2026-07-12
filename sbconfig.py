@@ -58,6 +58,10 @@ REASONING_ARCHIVE = _expand(CONFIG.get("reasoning", {}).get("archive_dir", "~/cl
 
 DAILY_DIR = _expand(CONFIG.get("digest", {}).get("daily_dir", "~/.session-browser/daily-logs"))
 
+REPORTS_DIR = _expand(CONFIG.get("reports", {}).get("out_dir", "~/.session-browser/reports"))
+REPORT_STYLE_OVERRIDE = _expand(CONFIG.get("reports", {}).get(
+    "style_override", "~/.session-browser/report-style.md"))
+
 EMBED_MODEL = CONFIG.get("embeddings", {}).get("model", "all-MiniLM-L6-v2")
 EMBED_BACKEND = CONFIG.get("embeddings", {}).get("backend", "auto")
 

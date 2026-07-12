@@ -50,6 +50,14 @@ timeout_secs    = 180
 [digest]
 daily_dir = "~/.session-browser/daily-logs"
 
+# --- Reports (work-journal skill) ----------------------------------------------
+# Where generated summaries/timelines land, and an OPTIONAL personal style file
+# layered over the skill's default report structure (keeps company-specific
+# performance-review framing out of this repo). The override file need not exist.
+[reports]
+out_dir        = "~/.session-browser/reports"
+style_override = "~/.session-browser/report-style.md"
+
 # --- Reasoning archive (headline feature) ------------------------------------
 # Raw transcripts and rendered "thinking -> decision -> action" trails are
 # written under archive_dir/{raw,readable}/YYYY/MM/.

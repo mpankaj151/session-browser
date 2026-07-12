@@ -46,7 +46,10 @@ source ~/.zshrc
 3. Builds the SQLite schema and backfills every existing session.
 4. Computes costs, extracts reasoning trails, builds the full-text and vector
    indexes.
-5. Registers the Claude Stop hook in `~/.claude/settings.json` (backup kept).
+5. Registers the Claude Stop + SessionEnd hooks in `~/.claude/settings.json`
+   (backup kept) — Stop indexes instantly; SessionEnd journals the ended
+   session — and links the shipped skills (work-journal, snapshot, checkpoint)
+   into `~/.claude/skills`.
 6. **macOS:** installs launchd jobs (live watcher + nightly 01:00 refresh).
    **Linux:** prints the two commands to schedule yourself.
 
@@ -55,8 +58,8 @@ Install flags:
 | Flag | Effect |
 |---|---|
 | `--lite` | Skip the ~2 GB semantic-search ML stack; search falls back to keyword + full-text |
-| `--enrich` | Also LLM-summarize your **existing** history during install (spends your plan's quota; the nightly job enriches *new* sessions regardless). Later: `sb refresh --enrich` |
-| `--no-hook` | Don't register the Claude Stop hook |
+| `--enrich` | Also LLM-journal your **existing** history during install (spends your plan's quota; the hooks + nightly job cover *new* sessions regardless). Later: `sb refresh --enrich` |
+| `--no-hook` | Don't register the Claude hooks or link the skills |
 | `--no-launchd` | Don't install macOS launchd jobs |
 | `--no-backfill` | Don't index existing sessions now |
 
