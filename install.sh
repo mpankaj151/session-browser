@@ -80,9 +80,10 @@ if [ "$NO_BACKFILL" -eq 0 ]; then
   fi
 fi
 
-# 6. Stop hook
+# 6. Stop + SessionEnd hooks (Stop = instant indexing; SessionEnd = indexing +
+#    journal-grade enrichment of the just-ended session)
 if [ "$NO_HOOK" -eq 0 ]; then
-  echo "==> registering Claude Stop hook"
+  echo "==> registering Claude Stop + SessionEnd hooks"
   "$PY" - "$REPO" <<'PYEOF' || echo "   ! hook registration failed — everything else still works (watcher covers indexing)"
 import json, sys, shutil
 from pathlib import Path
@@ -106,21 +107,24 @@ cmd = f'"{repo}/.venv/bin/python" "{repo}/scripts/session-hook.py"'
 hooks = cfg.setdefault("hooks", {})
 if not isinstance(hooks, dict):
     print("   ! settings.json 'hooks' is not an object — skipping hook registration"); sys.exit(0)
-stop = hooks.get("Stop")
-if not isinstance(stop, list):
-    stop = hooks["Stop"] = []
-# Presence isn't enough: after the repo is moved, a session-hook.py entry still
-# exists but points at the dead path. Rebuild the desired state (all non-ours
-# entries + exactly one entry with the CURRENT path) and write only on change.
-kept = [h for h in stop if "session-hook.py" not in json.dumps(h)]
-desired = kept + [{"hooks": [{"type": "command", "command": cmd}]}]
-if json.dumps(desired, sort_keys=True) == json.dumps(stop, sort_keys=True):
-    print("   hook already present")
+changed = []
+for event in ("Stop", "SessionEnd"):
+    entries = hooks.get(event)
+    if not isinstance(entries, list):
+        entries = hooks[event] = []
+    # Presence isn't enough: after the repo is moved, a session-hook.py entry
+    # still exists but points at the dead path. Rebuild the desired state (all
+    # non-ours entries + exactly one entry with the CURRENT path).
+    kept = [h for h in entries if "session-hook.py" not in json.dumps(h)]
+    desired = kept + [{"hooks": [{"type": "command", "command": cmd}]}]
+    if json.dumps(desired, sort_keys=True) != json.dumps(entries, sort_keys=True):
+        hooks[event] = desired
+        changed.append(event)
+if not changed:
+    print("   hooks already present")
 else:
-    hooks["Stop"] = desired
     settings.write_text(json.dumps(cfg, indent=2))
-    verb = "updated to this repo path" if len(kept) != len(stop) else "added"
-    print(f"   hook {verb} (backup: settings.json.sb-backup)")
+    print(f"   hook(s) registered for {', '.join(changed)} (backup: settings.json.sb-backup)")
 PYEOF
 fi
 

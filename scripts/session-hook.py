@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Claude Code Stop hook — instant indexing + deferred reasoning archive.
+"""Claude Code Stop + SessionEnd hook — instant indexing, deferred heavy work.
 
 Two tiers so perceived latency stays in the tens of milliseconds:
   Inline (waited): read transcript_path from stdin JSON -> parse_header ->
                    indexer.upsert -> write .hook-state.json -> exit.
   Deferred (detached, not waited): spawn extract-reasoning.py to archive the raw
-                   transcript and render the readable decision trail.
+                   transcript and render the readable decision trail. On
+                   SessionEnd ONLY, additionally spawn
+                   `enrich-sessions.py --session <id>` so the session gets its
+                   journal-grade summary the moment it ends. (Stop fires after
+                   EVERY assistant response — enriching there would pay one LLM
+                   call per turn; SessionEnd fires once, and the enricher's
+                   staleness check makes a no-activity re-fire cost nothing.)
 
-Registered in ~/.claude/settings.json as:
-  { "hooks": { "Stop": [ { "hooks": [ {
-      "type": "command",
-      "command": "\"<venv-python>\" \"<repo>/scripts/session-hook.py\"" } ] } ] } }
+Registered in ~/.claude/settings.json under BOTH events (install.sh does this):
+  { "hooks": { "Stop":       [ { "hooks": [ { "type": "command", "command": CMD } ] } ],
+               "SessionEnd": [ { "hooks": [ { "type": "command", "command": CMD } ] } ] } }
+  where CMD = "\"<venv-python>\" \"<repo>/scripts/session-hook.py\""
 The command MUST use the absolute venv interpreter (launchd/hook PATH lacks pyenv).
 
 CONTRACT: this process must ALWAYS exit 0. A nonzero Stop-hook exit blocks
@@ -31,6 +37,7 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 EXTRACT = _REPO / "scripts" / "extract-reasoning.py"
+ENRICH = _REPO / "scripts" / "enrich-sessions.py"
 
 # Our own enrichment providers run `claude --print` with this set, so the hook
 # their headless sessions trigger is a no-op (belt to the entrypoint=="sdk-cli"
@@ -125,6 +132,21 @@ def main() -> None:
         )
     except Exception as e:  # noqa: BLE001
         print(f"[session-hook] spawn error: {e}", file=sys.stderr)
+
+    # --- SessionEnd only: journal-grade enrichment for the ended session ---
+    # Detached like the reasoning tier; the enricher itself skips fresh sessions
+    # (staleness check) and its headless LLM child inherits _SUPPRESS_ENV, so
+    # this can neither block shutdown nor recurse.
+    if payload.get("hook_event_name") == "SessionEnd":
+        try:
+            elog = open(sbconfig.LOG_DIR / "enrich-hook.log", "a")
+            subprocess.Popen(
+                [sys.executable, str(ENRICH), "--session", header.session_id],
+                stdin=subprocess.DEVNULL, stdout=elog, stderr=elog,
+                start_new_session=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[session-hook] enrich spawn error: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

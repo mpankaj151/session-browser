@@ -144,6 +144,28 @@ def test_stale_predicate_selects_resumed_sessions():
     print("  ok  stale predicate: new + resumed eligible (either spelling), fresh skipped")
 
 
+def test_select_session_fast_path_honors_staleness():
+    """The hook fires --session on every SessionEnd; a re-fire with no new
+    activity must select nothing (cost $0), while --force always selects."""
+    es = _load_script("enrich-sessions")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="h1", last_activity="2026-06-01T10:00:00.000Z"), conn=conn)
+        conn.execute("UPDATE sessions SET summary='done.', enriched_at=? WHERE session_id='h1'",
+                     ("2026-06-01T10:05:00.000Z",))
+        assert es._select_sessions(conn, "h1", force=False) == []
+        assert len(es._select_sessions(conn, "h1", force=True)) == 1
+        # resumed since enrichment -> selected again
+        conn.execute("UPDATE sessions SET last_activity='2026-06-02T08:00:00.000Z' "
+                     "WHERE session_id='h1'")
+        assert len(es._select_sessions(conn, "h1", force=False)) == 1
+        # unknown id -> empty, not an error
+        assert es._select_sessions(conn, "nope", force=False) == []
+    finally:
+        conn.close()
+    print("  ok  --session fast path: fresh=$0, resumed/force selected, unknown=empty")
+
+
 # --- incremental slicing --------------------------------------------------------
 def test_slice_turns():
     es = _load_script("enrich-sessions")

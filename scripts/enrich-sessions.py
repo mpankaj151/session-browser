@@ -46,6 +46,22 @@ STALE_PREDICATE = ("(summary IS NULL "
                    "OR last_activity > COALESCE(replace(enriched_at, ' ', 'T'), ''))")
 
 
+def _select_sessions(conn, session_id: str | None, force: bool) -> list:
+    """Which sessions this run enriches. --session is the hook fast path and
+    still honors staleness (a SessionEnd with no new activity must cost $0);
+    --force bypasses it either way."""
+    if session_id:
+        pred = "" if force else f" AND {STALE_PREDICATE}"
+        return conn.execute(
+            "SELECT * FROM sessions WHERE archived = 0 AND session_id = ?" + pred,
+            (session_id,)).fetchall()
+    sel = "SELECT * FROM sessions WHERE archived = 0"
+    if not force:
+        sel += f" AND {STALE_PREDICATE}"
+    sel += " ORDER BY last_activity DESC"
+    return conn.execute(sel).fetchall()
+
+
 def _find_transcript(adapters, session) -> tuple[object, Path] | tuple[None, None]:
     src = session["cli_source"]
     adapter = adapters.get(src)
@@ -151,19 +167,13 @@ def main() -> None:
 
     adapters = build_source_registry(only_available=True)
     conn = indexer.connect()
-    if args.session:
-        sessions = conn.execute(
-            "SELECT * FROM sessions WHERE archived = 0 AND session_id = ?",
-            (args.session,)).fetchall()
-        if not sessions:
-            print(f"session {args.session} not found (or archived)", file=sys.stderr)
-            sys.exit(1)
-    else:
-        sel = "SELECT * FROM sessions WHERE archived = 0"
-        if not args.force:
-            sel += f" AND {STALE_PREDICATE}"
-        sel += " ORDER BY last_activity DESC"
-        sessions = conn.execute(sel).fetchall()
+    sessions = _select_sessions(conn, args.session, args.force)
+    if args.session and not sessions:
+        # Fresh, unindexed, or archived — all fine outcomes for the hook path,
+        # which must never surface an error into session shutdown.
+        print(f"session {args.session}: up to date (or not indexed); nothing to do")
+        conn.close()
+        return
     if args.limit:
         sessions = sessions[:args.limit]
     print(f"{len(sessions)} sessions to enrich")
