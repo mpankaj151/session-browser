@@ -294,6 +294,64 @@ def test_daily_digest_needs_write_staleness():
     print("  ok  needs_write: missing/stale rewritten, fresh kept")
 
 
+# --- report data ----------------------------------------------------------------
+def test_resolve_window_deterministic():
+    from datetime import date
+    rd = _load_script("report-data")
+    today = date(2026, 7, 8)  # a Wednesday
+    cases = {
+        "last-week": (date(2026, 6, 29), date(2026, 7, 5)),
+        "this-week": (date(2026, 7, 6), today),
+        "last-month": (date(2026, 6, 1), date(2026, 6, 30)),
+        "last-quarter": (date(2026, 4, 1), date(2026, 6, 30)),
+        "last-6-months": (date(2026, 1, 1), date(2026, 6, 30)),
+        "7d": (date(2026, 7, 2), today),
+        "yesterday": (date(2026, 7, 7), date(2026, 7, 7)),
+    }
+    for spec, (lo, hi) in cases.items():
+        got = rd.resolve_window(spec, None, None, today=today)[:2]
+        assert got == (lo, hi), f"{spec}: {got}"
+    lo, hi, _ = rd.resolve_window(None, "2026-01-15", "2026-03-01", today=today)
+    assert (lo, hi) == (date(2026, 1, 15), date(2026, 3, 1))
+    # quarter boundary: today in Q1 -> last quarter is Q4 of the prior year
+    lo, hi, _ = rd.resolve_window("last-quarter", None, None, today=date(2026, 2, 10))
+    assert (lo, hi) == (date(2025, 10, 1), date(2025, 12, 31))
+    print("  ok  resolve_window: named windows, Nd, --from/--to, year boundary")
+
+
+def test_build_report_structure():
+    from datetime import date, timezone as _tz
+    rd = _load_script("report-data")
+    conn = _temp_db()
+    try:
+        _digest_fixture(conn)  # 3 sessions on 2026-06-01, one unsummarized
+        conn.execute("UPDATE sessions SET turn_count=8, cost_usd=1.25 "
+                     "WHERE session_id='a1'")
+        conn.execute("INSERT INTO session_artifacts (session_id, type, content, turn_index) "
+                     "VALUES ('a1','decision','ship it — see https://github.com/x/y/pull/7',0)")
+        conn.commit()
+        rep = rd.build_report(conn, date(2026, 6, 1), date(2026, 6, 30), "June",
+                              tz=_tz.utc)
+        assert rep["stats"]["sessions"] == 3 and rep["stats"]["active_days"] == 1
+        assert rep["coverage"]["enriched"] == 2
+        assert rep["coverage"]["unenriched_ids"] == ["a2"]
+        assert rep["stats"]["by_source"] == {"claude": 3}
+        assert rep["projects"][0]["name"] == "x", "busiest project first"
+        a1 = next(s for p in rep["projects"] for s in p["sessions"]
+                  if s["session_id"] == "a1")
+        assert a1["journal"].startswith("## Accomplishments")
+        assert a1["links"] == ["https://github.com/x/y/pull/7"]
+        assert a1["week"] == "2026-W23" and not a1["trivial"]
+        assert rep["stats"]["cost_usd"] == 1.25
+        # out-of-window -> empty
+        empty = rd.build_report(conn, date(2026, 7, 1), date(2026, 7, 31), "July",
+                                tz=_tz.utc)
+        assert empty["stats"]["sessions"] == 0 and empty["projects"] == []
+    finally:
+        conn.close()
+    print("  ok  build_report: coverage, grouping, journal+links, window filter")
+
+
 # --- persistence ----------------------------------------------------------------
 def test_persist_writes_snapshot_and_journal_idempotently():
     es = _load_script("enrich-sessions")
