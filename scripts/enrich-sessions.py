@@ -67,8 +67,15 @@ def _find_transcript(adapters, session) -> tuple[object, Path] | tuple[None, Non
     adapter = adapters.get(src)
     if adapter is None:
         return None, None
+    sid = session["session_id"]
     for path in adapter.discover():
-        if path.stem == session["session_id"] or path.parent.name == session["session_id"]:
+        # The adapter owns filename → session-id mapping (codex names files
+        # rollout-<ts>-<uuid>.jsonl, so a bare stem match never hits them).
+        try:
+            mapped = adapter.session_id_for_path(path)
+        except Exception:  # noqa: BLE001 — fall back to path heuristics
+            mapped = None
+        if mapped == sid or path.stem == sid or path.parent.name == sid:
             return adapter, path
     return adapter, None
 

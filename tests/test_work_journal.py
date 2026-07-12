@@ -166,6 +166,30 @@ def test_select_session_fast_path_honors_staleness():
     print("  ok  --session fast path: fresh=$0, resumed/force selected, unknown=empty")
 
 
+def test_find_transcript_uses_adapter_mapping():
+    """Codex names files rollout-<ts>-<uuid>.jsonl — a stem match never hits
+    them, which silently left every codex session unenriched. The adapter's
+    session_id_for_path must drive the match."""
+    es = _load_script("enrich-sessions")
+    rollout = Path("/x/2026/05/02/rollout-2026-05-02T11-54-27-"
+                   "019de853-51bd-70f3-b934-6f3beb948d40.jsonl")
+
+    class FakeCodex:
+        def discover(self):
+            yield rollout
+
+        def session_id_for_path(self, p):
+            return "-".join(p.stem.split("-")[-5:])
+
+    row = {"cli_source": "codex", "session_id": "019de853-51bd-70f3-b934-6f3beb948d40"}
+    adapter, path = es._find_transcript({"codex": FakeCodex()}, row)
+    assert path == rollout, "adapter-mapped id must match the rollout file"
+    _, missing = es._find_transcript({"codex": FakeCodex()},
+                                     {"cli_source": "codex", "session_id": "nope"})
+    assert missing is None
+    print("  ok  _find_transcript matches via adapter.session_id_for_path (codex)")
+
+
 # --- incremental slicing --------------------------------------------------------
 def test_slice_turns():
     es = _load_script("enrich-sessions")
