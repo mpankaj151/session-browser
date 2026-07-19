@@ -25,6 +25,8 @@ PROJECTS_DIR = Path(os.path.expanduser("~/.claude/projects"))
 _CMD_LINE = re.compile(r"^\s*<(command-name|command-message|command-args|local-command|"
                        r"bash-input|bash-stdout|bash-stderr|system-reminder)")
 _USER_MARKER = '"type":"user"'
+# Subdir a session's multi-agent sidechain transcripts live under; never a session.
+_SUBAGENT_DIR = "subagents"
 
 
 class ClaudeSource:
@@ -46,6 +48,12 @@ class ClaudeSource:
 
     # -- cheap header ----------------------------------------------------------
     def parse_header(self, path: Path) -> Optional[SessionHeader]:
+        # Defense in depth: the Stop hook parses whatever transcript_path it is
+        # handed without ever calling session_id_for_path(). parse_header is the
+        # chokepoint every entry path shares, so the not-a-session check lives here
+        # too — same shape as the sdk-cli exclusion below.
+        if _SUBAGENT_DIR in path.parts:
+            return None
         head = _read_head(path, 60)
         if not head:
             return None
@@ -140,7 +148,22 @@ class ClaudeSource:
 
     # -- identity / resume / availability ----------------------------------------
     def session_id_for_path(self, path: Path) -> Optional[str]:
-        return path.stem if path.suffix == ".jsonl" else None
+        # Mirrors discover()'s `*/*.jsonl`: a session transcript is a direct child
+        # of a project dir. This gate — not the glob — is what the watcher uses to
+        # decide if a path is a session at all, and it walks recursive=True, so it
+        # must reject the same things the glob does.
+        #
+        # A multi-agent run writes its sidechains under the parent session's dir:
+        #   <project>/<session-uuid>/subagents/agent-<id>.jsonl
+        #   <project>/<session-uuid>/subagents/workflows/<wf-id>/{agent-<id>,journal}.jsonl
+        # Those belong to the parent session. Every record in them is isSidechain,
+        # so _is_substantive_user() rejects all of them and they index as
+        # permanently-empty rows — one per subagent, swamping the UI. Worse, every
+        # workflow journal has stem "journal", so they'd all collide onto a single
+        # bogus session row.
+        if path.suffix != ".jsonl" or _SUBAGENT_DIR in path.parts:
+            return None
+        return path.stem
 
     def resume_command(self, session_id: str) -> str:
         return f"claude --resume {shlex.quote(session_id)}"

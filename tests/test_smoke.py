@@ -339,6 +339,53 @@ def test_adapters():
     print(f"  ok  adapters registered + path->id mapping: {list(reg)}")
 
 
+def test_claude_ignores_subagent_transcripts():
+    """A multi-agent run writes sidechain transcripts under <session>/subagents/.
+
+    They are part of their parent session, not sessions themselves: every record
+    is isSidechain, so they'd index as permanently-empty rows. The watcher walks
+    recursive=True and gates purely on session_id_for_path(), so the gate — not
+    discover()'s glob — is what has to reject them.
+    """
+    from sources.claude import ClaudeSource
+    src = ClaudeSource()
+    root = "/p/-Users-me-proj/6550180f-14ff-4b91-a93d-d951ed98c2f7"
+    # real transcript still maps to its id (the discover() `*/*.jsonl` shape)
+    assert src.session_id_for_path(Path("/p/-Users-me-proj/abc-1.jsonl")) == "abc-1"
+    # direct subagent sidechain
+    assert src.session_id_for_path(Path(f"{root}/subagents/agent-a0c125.jsonl")) is None
+    # nested under a workflow dir — same tree, deeper
+    assert src.session_id_for_path(
+        Path(f"{root}/subagents/workflows/wf_3433eeec-4b7/agent-a921527.jsonl")) is None
+    # workflow journals: every one of these has stem "journal", so without the
+    # gate they all collide onto a single bogus session row keyed "journal".
+    assert src.session_id_for_path(
+        Path(f"{root}/subagents/workflows/wf_ffba7666-ae0/journal.jsonl")) is None
+    print("  ok  claude adapter rejects subagent/workflow sidechain transcripts")
+
+
+def test_claude_parse_header_rejects_subagent_path():
+    """Defense in depth: the Stop hook calls parse_header() directly on the path it
+    is handed, never consulting session_id_for_path(). parse_header is the one
+    chokepoint every entry path (hook, watcher, backfill, enrich) goes through, so
+    the 'is this a session?' invariant has to hold there too."""
+    from sources.claude import ClaudeSource
+    rec = {"type": "user", "isSidechain": True, "cwd": "/w", "timestamp": "2026-01-01T00:00:00Z",
+           "message": {"content": "spawned task"}}
+    with tempfile.TemporaryDirectory() as d:
+        sub = Path(d) / "sess-uuid" / "subagents"
+        sub.mkdir(parents=True)
+        agent = sub / "agent-a0c125.jsonl"
+        agent.write_text(json.dumps(rec) + "\n")
+        assert ClaudeSource().parse_header(agent) is None
+        # a normal transcript at the same depth-2 shape still parses
+        normal = Path(d) / "proj" / "abc-1.jsonl"
+        normal.parent.mkdir(parents=True)
+        normal.write_text(json.dumps({**rec, "isSidechain": False}) + "\n")
+        assert ClaudeSource().parse_header(normal) is not None
+    print("  ok  parse_header refuses subagent transcripts (hook path defended)")
+
+
 def test_reasoning_extract():
     rec = {"type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
            "message": {"content": [
