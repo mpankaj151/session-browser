@@ -501,6 +501,214 @@ def test_archive_resurrect_roundtrip():
     print("  ok  archive -> upsert resurrects (no one-way trapdoor)")
 
 
+# --- codex adapter: paginated dialect, compression, archived root -----------
+# Codex ~0.144+ writes every non-ephemeral CLI thread in "paginated" history
+# mode (codex-rs/tui/src/app_server_session.rs, codex-rs/exec/src/lib.rs both
+# set `history_mode: (!ephemeral).then_some(Paginated)`), and a background
+# worker zstd-compresses rollouts older than 7 days. The line shapes below are
+# copied from Codex's own fixture (codex-rs/tui/src/lib.rs) so these tests fail
+# if we drift from what the CLI actually writes.
+_CX_ID = "019e18fa-0d21-7461-922c-5ccaad36df05"
+_CX_NAME = f"rollout-2026-08-01T10-00-00-{_CX_ID}.jsonl"
+
+
+def _cx_line(ordinal, payload):
+    return {"timestamp": "2026-08-01T10:00:00Z", "type": "event_msg",
+            "payload": payload, "ordinal": ordinal}
+
+
+def _cx_rollout(mode="paginated") -> str:
+    """One rollout's JSONL text in the `legacy` or `paginated` dialect."""
+    meta = {"id": _CX_ID, "timestamp": "2026-08-01T10:00:00Z", "cwd": "/Users/x/proj",
+            "originator": "codex_cli_rs", "cli_version": "0.150.1",
+            "history_mode": mode, "model_provider": "openai"}
+    lines = [{"timestamp": "2026-08-01T10:00:00Z", "type": "session_meta", "payload": meta},
+             _cx_line(2, {"type": "turn_context", "model": "gpt-5.5"})]
+    if mode == "paginated":
+        item = lambda n, t, i, c: _cx_line(n, {  # noqa: E731
+            "type": "item_completed", "thread_id": _CX_ID, "turn_id": "t1",
+            "item": {"type": t, "id": i, "content": c}})
+        lines += [
+            item(3, "UserMessage", "u0", [{"type": "text", "text": "why is codex missing?"}]),
+            item(4, "AgentMessage", "a0", [{"type": "Text", "text": "the format changed"}]),
+            item(5, "UserMessage", "u1", [{"type": "text", "text": "fix it"}]),
+        ]
+    else:
+        lines += [
+            _cx_line(3, {"type": "user_message", "message": "why is codex missing?"}),
+            _cx_line(4, {"type": "agent_message", "message": "the format changed"}),
+            _cx_line(5, {"type": "user_message", "message": "fix it"}),
+        ]
+    return "".join(json.dumps(rec) + "\n" for rec in lines)
+
+
+def _cx_tree(tmp: Path, text: str, root="sessions", compress=False) -> Path:
+    """Write one rollout into <tmp>/<root>/2026/08/01/ and return its path."""
+    day = tmp / root / "2026" / "08" / "01"
+    day.mkdir(parents=True, exist_ok=True)
+    path = day / _CX_NAME
+    if compress:
+        import zstandard
+        path = day / (_CX_NAME + ".zst")
+        path.write_bytes(zstandard.ZstdCompressor().compress(text.encode()))
+    else:
+        path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _cx_source(tmp: Path):
+    from sources.codex import CodexSource
+    return CodexSource(tmp / "sessions")
+
+
+def test_codex_paginated_rollout_parses_turns():
+    """Paginated rollouts carry item_completed/TurnItem instead of user_message.
+    Parsing only the legacy events yielded turn_count==0, which parse_header
+    treated as 'not browsable' — every new Codex session vanished silently."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = _cx_tree(tmp, _cx_rollout("paginated"))
+        h = _cx_source(tmp).parse_header(path)
+        assert h is not None, "paginated rollout parsed as unbrowsable"
+        assert h.turn_count == 2, f"expected 2 user turns, got {h.turn_count}"
+        assert h.first_message == "why is codex missing?", h.first_message
+        assert h.session_id == _CX_ID and h.model_used == "gpt-5.5"
+    print("  ok  codex paginated rollout yields turns + first_message")
+
+
+def test_codex_legacy_rollout_still_parses():
+    """Regression guard: widening the parser must not drop the old dialect."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        h = _cx_source(tmp).parse_header(_cx_tree(tmp, _cx_rollout("legacy")))
+        assert h is not None and h.turn_count == 2, h
+        assert h.first_message == "why is codex missing?"
+    print("  ok  codex legacy rollout still parses")
+
+
+def test_codex_compressed_rollout_matches_plain():
+    """Codex zstd-compresses rollouts older than 7 days in place. A .jsonl.zst
+    must produce the same header as its plain twin, not disappear."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        text = _cx_rollout("paginated")
+        plain = _cx_source(tmp).parse_header(_cx_tree(tmp, text))
+        for p in (tmp / "sessions" / "2026" / "08" / "01").iterdir():
+            p.unlink()
+        gz = _cx_tree(tmp, text, compress=True)
+        comp = _cx_source(tmp).parse_header(gz)
+        assert comp is not None, ".jsonl.zst rollout parsed as unbrowsable"
+        assert (comp.session_id, comp.turn_count, comp.first_message) == \
+               (plain.session_id, plain.turn_count, plain.first_message)
+    print("  ok  codex .jsonl.zst parses identically to plain .jsonl")
+
+
+def test_codex_session_id_for_path_variants():
+    """.zst suffix and reverted-thread names (rollout-<ts>-<thread>_<rollout>)
+    both broke the old 'last five dash-separated groups' heuristic."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _cx_source(Path(td))
+        base = Path(f"/s/2026/08/01/rollout-2026-08-01T10-00-00-{_CX_ID}.jsonl")
+        assert src.session_id_for_path(base) == _CX_ID
+        assert src.session_id_for_path(Path(str(base) + ".zst")) == _CX_ID
+        rev = base.with_name(f"rollout-2026-08-01T10-00-00-{_CX_ID}_019e0000-1111-2222-3333-444455556666.jsonl")
+        assert src.session_id_for_path(rev) == _CX_ID, src.session_id_for_path(rev)
+        assert src.session_id_for_path(Path("/s/notes.txt")) is None
+    print("  ok  codex session_id_for_path handles .zst and reverted names")
+
+
+def test_codex_discovers_archived_sessions():
+    """`codex archive` MOVES rollouts to ~/.codex/archived_sessions/. They are
+    still the user's work and must stay searchable."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _cx_tree(tmp, _cx_rollout("paginated"), root="archived_sessions")
+        found = list(_cx_source(tmp).discover())
+        assert len(found) == 1, f"archived_sessions not discovered: {found}"
+    print("  ok  codex discovers archived_sessions as a second root")
+
+
+def test_codex_unrecognised_schema_is_not_silent():
+    """The outage was invisible because 'no user turns' and 'I do not
+    understand this file' both returned None. A rollout with records but no
+    recognised turn types must still index (turn_count 0), not vanish."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        future = "".join(json.dumps(rec) + "\n" for rec in [
+            {"timestamp": "2026-08-01T10:00:00Z", "type": "session_meta",
+             "payload": {"id": _CX_ID, "timestamp": "2026-08-01T10:00:00Z",
+                         "cwd": "/Users/x/proj", "cli_version": "9.9.9"}},
+            _cx_line(2, {"type": "quantum_message", "message": "hello from 2027"}),
+            _cx_line(3, {"type": "quantum_message", "message": "goodbye"}),
+        ])
+        h = _cx_source(tmp).parse_header(_cx_tree(tmp, future))
+        assert h is not None, "unrecognised schema silently dropped (the original bug)"
+        assert h.session_id == _CX_ID and h.turn_count == 0
+    print("  ok  codex unrecognised rollout schema indexes instead of vanishing")
+
+
+def test_codex_truly_empty_rollout_still_skipped():
+    """A meta-only rollout genuinely has nothing to browse — it must stay
+    skipped, or every aborted Codex launch litters the browser."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        only_meta = json.dumps({"timestamp": "2026-08-01T10:00:00Z", "type": "session_meta",
+                                "payload": {"id": _CX_ID, "cwd": "/Users/x/proj"}}) + "\n"
+        assert _cx_source(tmp).parse_header(_cx_tree(tmp, only_meta)) is None
+    print("  ok  codex meta-only rollout still skipped")
+
+
+def test_codex_parse_full_reads_both_dialects():
+    """parse_full feeds the reasoning archive and enrichment — it needs the
+    message bodies out of paginated items, not just the header counts."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        parsed = _cx_source(tmp).parse_full(_cx_tree(tmp, _cx_rollout("paginated")))
+        assert parsed is not None
+        roles = [(t.role, t.content) for t in parsed.turns]
+        assert roles == [("user", "why is codex missing?"),
+                         ("assistant", "the format changed"),
+                         ("user", "fix it")], roles
+    print("  ok  codex parse_full extracts paginated message bodies")
+
+
+def test_codex_available_without_binary_on_path():
+    """is_available() gated a filesystem watcher on `which codex`. The unified
+    ChatGPT/Codex app moves the binary, so the watcher silently stopped
+    watching ~/.codex/sessions with no log line at all."""
+    import os
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / "sessions").mkdir()
+        old = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = str(tmp / "no-bins")
+            assert _cx_source(tmp).is_available(), \
+                "codex source unavailable purely because the binary left $PATH"
+        finally:
+            os.environ["PATH"] = old
+    print("  ok  codex source availability does not depend on $PATH")
+
+
+def test_watcher_ignores_compression_representation_change():
+    """Compressing rollout.jsonl -> rollout.jsonl.zst deletes the plain file.
+    Treating that delete as a session deletion archived live sessions out of
+    the browser about a week after they were written."""
+    import watcher
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        plain = tmp / _CX_NAME
+        comp = tmp / (_CX_NAME + ".zst")
+        comp.write_bytes(b"\x28\xb5\x2f\xfd")
+        assert watcher._is_representation_change(plain) is True
+        comp.unlink()
+        plain.write_text("{}\n")
+        assert watcher._is_representation_change(comp) is True
+        plain.unlink()
+        assert watcher._is_representation_change(plain) is False
+    print("  ok  watcher treats compression as a representation change, not a delete")
+
+
 if __name__ == "__main__":
     print("Session Browser smoke + regression tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

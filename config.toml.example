@@ -31,6 +31,10 @@ binary    = "copilot"
 [sources.codex]
 enabled      = true
 sessions_dir = "~/.codex/sessions"
+# `codex archive` MOVES a rollout into this sibling tree. Indexed and watched
+# alongside sessions_dir so archiving in Codex does not erase the work here.
+# Defaults to <sessions_dir>/../archived_sessions when omitted.
+archived_sessions_dir = "~/.codex/archived_sessions"
 binary       = "codex"
 
 # --- Enrichment --------------------------------------------------------------
