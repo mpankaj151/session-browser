@@ -4,6 +4,9 @@ watchdog>=4.0
 pyyaml>=6.0
 numpy>=1.26
 mcp>=1.0
+# Codex zstd-compresses rollouts older than 7 days in place; without this
+# every Codex session silently drops out of the browser after a week.
+zstandard>=0.22
 
 # Semantic search (optional but recommended). Pulls in torch (~2 GB).
 # Skip with `./install.sh --lite`; search then falls back to keyword/full-text.

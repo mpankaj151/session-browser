@@ -27,7 +27,8 @@ def _make_copilot() -> SessionSource:
 def _make_codex() -> SessionSource:
     from sources.codex import CodexSource
     cfg = sbconfig.source_config("codex")
-    return CodexSource(cfg.get("sessions_dir", "~/.codex/sessions"))
+    return CodexSource(cfg.get("sessions_dir", "~/.codex/sessions"),
+                       cfg.get("archived_sessions_dir"))
 
 
 _FACTORIES: dict[str, Callable[[], SessionSource]] = {

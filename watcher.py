@@ -50,14 +50,37 @@ def _log(msg: str) -> None:
 
 
 def _build_watch_pairs() -> list[tuple[Path, object]]:
-    """(directory, adapter) pairs for every available source."""
+    """(directory, adapter) pairs for every available source.
+
+    An adapter may own more than one root — codex spreads live and archived
+    rollouts across two sibling trees — so it gets to declare them via an
+    optional watch_roots(). Sources without one keep the single configured dir.
+    """
     pairs = []
     for name, adapter in build_source_registry(only_available=True).items():
+        roots = getattr(adapter, "watch_roots", None)
+        if callable(roots):
+            pairs.extend((Path(d).expanduser(), adapter) for d in roots())
+            continue
         cfg = sbconfig.source_config(name)
         d = cfg.get("projects_dir") or cfg.get("state_dir") or cfg.get("sessions_dir")
         if d:
             pairs.append((Path(d).expanduser(), adapter))
     return pairs
+
+
+def _is_representation_change(path: Path) -> bool:
+    """True when `path` vanished only because the same transcript now exists in
+    the other representation.
+
+    Codex zstd-compresses cold rollouts in place (rollout.jsonl ->
+    rollout.jsonl.zst) and materializes them back to append. Both show up as a
+    delete of a real transcript path; archiving on them hid live sessions from
+    the browser about a week after they were written.
+    """
+    name = str(path)
+    twin = name[:-4] if name.endswith(".zst") else name + ".zst"
+    return Path(twin).exists()
 
 
 def _recently_hooked(session_id: str) -> bool:
@@ -94,7 +117,7 @@ class _Handler(FileSystemEventHandler):
         with self._lock:
             self._timers.pop(path_str, None)  # fired — drop the dead Timer
         path = Path(path_str)
-        if not path.exists() or path.suffix != ".jsonl":
+        if not path.exists():
             return
         # `cr` links sessions into other project dirs as resume conduits; the
         # canonical transcript is the real file (same invariant as discover()).
@@ -131,15 +154,18 @@ class _Handler(FileSystemEventHandler):
             return
         self.on_deleted(event)
         dest = getattr(event, "dest_path", "")
-        if dest and str(dest).endswith(".jsonl"):
+        if dest and self.adapter.session_id_for_path(Path(dest)) is not None:
             self._schedule(dest)
 
     def on_deleted(self, event):
-        if event.is_directory or not str(event.src_path).endswith(".jsonl"):
+        if event.is_directory:
             return
         path = Path(event.src_path)
         sid = self.adapter.session_id_for_path(path)
         if sid is None:
+            return
+        if _is_representation_change(path):
+            _log(f"skip archive (compression/materialization) {sid}")
             return
         try:
             # Archive only when the deleted path IS the canonical transcript. A
