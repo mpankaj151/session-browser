@@ -42,7 +42,7 @@ def classify(text: str, limit: int = 3) -> list[str]:
 def main() -> None:
     conn = indexer.connect()
     rows = conn.execute(
-        "SELECT session_id, first_message, summary, title FROM sessions WHERE archived = 0"
+        f"SELECT session_id, first_message, summary, title FROM sessions WHERE {indexer.VISIBLE}"
     ).fetchall()
     n = 0
     for r in rows:

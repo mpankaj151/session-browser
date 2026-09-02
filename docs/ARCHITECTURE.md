@@ -56,7 +56,24 @@ enrichment (summary, topics, cost, reasoning_path). The upsert updates cheap
 fields (last_activity, turn_count) but `COALESCE(NULLIF(old,''), NULLIF(new,''))`
 preserves everything derived, and treats `''` as absent so a header parsed
 before the first user turn doesn't pin a field empty. Every upsert also sets
-`archived=0` — a parsed file exists, so the session is alive.
+`archived=0` and clears `archived_reason` — a parsed file exists, so the
+session is alive.
+
+**Archive lifecycle (`archived`, `archived_reason`).** Rows are never deleted.
+`archive()` flips `archived=1` and must say why: `transcript-missing` (the
+canonical file vanished — Claude Code's `cleanupPeriodDays`, a manual `rm`) or
+`not-a-session` (a subagent sidechain / workflow journal that never held a
+conversation). Without the reason the two are indistinguishable, and an
+Archived view built on the flag alone drowns real sessions under sidechain
+noise. Consumers never spell the flag: `indexer.LIVE` (a file exists — for
+enrichment, reasoning extraction, prune), `indexer.VISIBLE` (what the user sees
+and what usage stats count: live + transcript-missing), `indexer.ARCHIVED_VISIBLE`
+(the Archived tab); a test greps the tree to keep it that way. `restore.py`
+brings a transcript-missing session back from `<archive>/raw/` — `refresh-all`
+copies every indexable transcript there before extracting reasoning, which
+makes the reasoning archive a durable transcript vault. Restore uses
+`copyfile`, not `copy2`: the restored file needs a fresh mtime or an age-based
+cleanup would delete it again on its next pass.
 
 **Two-tier live indexing.** The Claude **Stop hook** indexes a session the
 instant it ends (tens of ms) and detaches reasoning extraction. The **watcher**

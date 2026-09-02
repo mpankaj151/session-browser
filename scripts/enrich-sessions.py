@@ -53,9 +53,9 @@ def _select_sessions(conn, session_id: str | None, force: bool) -> list:
     if session_id:
         pred = "" if force else f" AND {STALE_PREDICATE}"
         return conn.execute(
-            "SELECT * FROM sessions WHERE archived = 0 AND session_id = ?" + pred,
+            f"SELECT * FROM sessions WHERE {indexer.LIVE} AND session_id = ?" + pred,
             (session_id,)).fetchall()
-    sel = "SELECT * FROM sessions WHERE archived = 0"
+    sel = f"SELECT * FROM sessions WHERE {indexer.LIVE}"
     if not force:
         sel += f" AND {STALE_PREDICATE}"
     sel += " ORDER BY last_activity DESC"

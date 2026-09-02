@@ -37,7 +37,7 @@ def main() -> None:
 
     conn = indexer.connect()
     rows = conn.execute(
-        "SELECT session_id, title, summary, first_message FROM sessions WHERE archived = 0"
+        f"SELECT session_id, title, summary, first_message FROM sessions WHERE {indexer.VISIBLE}"
     ).fetchall()
     existing = {
         r[0]: (r[1], r[2]) for r in conn.execute(

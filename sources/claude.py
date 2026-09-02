@@ -146,6 +146,22 @@ class ClaudeSource:
                         turns.append(Turn(role="assistant", content=text, tool_calls=tools))
         return ParsedSession(header=header, turns=turns)
 
+    # -- restore -----------------------------------------------------------------
+    def restore_path(self, row) -> Optional[Path]:
+        """Claude Code looks a session up at <projects>/<encoded-cwd>/<id>.jsonl —
+        exactly the row's recorded project_path, which parse_header set from the
+        transcript's real location. Refuse anything outside the projects tree so a
+        corrupted row can never make restore write elsewhere on disk."""
+        project_path = row["project_path"]
+        if not project_path:
+            return None
+        dest = Path(project_path) / f"{row['session_id']}.jsonl"
+        try:
+            dest.resolve().relative_to(self.projects_dir.resolve())
+        except ValueError:
+            return None
+        return dest
+
     # -- identity / resume / availability ----------------------------------------
     def session_id_for_path(self, path: Path) -> Optional[str]:
         # Mirrors discover()'s `*/*.jsonl`: a session transcript is a direct child

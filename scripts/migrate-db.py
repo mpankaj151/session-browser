@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import indexer  # noqa: E402
 import sbconfig  # noqa: E402
 
 BASE_DDL = """
@@ -67,6 +68,10 @@ ADDITIVE_COLUMNS = [
     "cost_usd REAL",
     "enriched_at TIMESTAMP",
     "reasoning_path TEXT",
+    # Why a row is archived=1. The flag alone conflated "transcript aged out"
+    # (a real session the UI should keep showing) with "never was a session".
+    "archived_reason TEXT",
+    "archived_at TIMESTAMP",
 ]
 
 
@@ -79,10 +84,25 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, col_def: str) -
     return True
 
 
+def _backfill_archive_reason(conn: sqlite3.Connection) -> int:
+    """Rows archived before archived_reason existed carry NULL. Classify them
+    once with the shared derived rule; a reason recorded at the source (watcher,
+    prune) is authoritative and never overwritten. Idempotent by construction."""
+    rows = conn.execute(
+        "SELECT session_id, turn_count, first_message FROM sessions "
+        "WHERE archived = 1 AND archived_reason IS NULL"
+    ).fetchall()
+    for sid, turns, first in rows:
+        reason = indexer.infer_archive_reason({"turn_count": turns, "first_message": first})
+        conn.execute("UPDATE sessions SET archived_reason = ? WHERE session_id = ?", (reason, sid))
+    return len(rows)
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(BASE_DDL)
     for col_def in ADDITIVE_COLUMNS:
         _add_column_if_missing(conn, "sessions", col_def)
+    _backfill_archive_reason(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_source "
         "ON sessions(cli_source, last_activity DESC)"
@@ -107,6 +127,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             )
     except Exception as e:  # noqa: BLE001
         print(f"[migrate] sqlite-vec unavailable ({e}); using numpy backend.", file=sys.stderr)
+    # Stamp last: indexer.connect() treats this as "schema is current".
+    conn.execute(f"PRAGMA user_version = {int(indexer.SCHEMA_VERSION)}")
     conn.commit()
 
 

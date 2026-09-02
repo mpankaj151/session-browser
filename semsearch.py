@@ -63,7 +63,7 @@ def search(query: str, limit: int = 20, conn=None) -> list[tuple[str, float]]:
     try:
         rows = conn.execute(
             "SELECT e.session_id, e.embedding FROM session_embeddings e "
-            "JOIN sessions s ON s.session_id = e.session_id WHERE s.archived = 0"
+            f"JOIN sessions s ON s.session_id = e.session_id WHERE {indexer.VISIBLE}"
         ).fetchall()
     finally:
         if own:

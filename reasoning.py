@@ -294,6 +294,37 @@ def archive_raw(transcript_path: Path, header: dict) -> Path:
     return dest
 
 
+_RAW_STEM = re.compile(r"^(?P<sid>.+?)(?:@v(?P<v>\d+))?$")
+
+
+def _raw_copies():
+    """Every raw transcript copy as (session_id, version, path). One walk."""
+    raw = ARCHIVE / "raw"
+    if not raw.is_dir():
+        return
+    for p in raw.glob("*/*/*.jsonl"):
+        m = _RAW_STEM.match(p.stem)
+        yield m.group("sid"), int(m.group("v") or 1), p
+
+
+def archived_raw_index() -> dict[str, Path]:
+    """session_id -> newest raw transcript copy in the archive. A single
+    directory walk, so the UI can label 500 archived rows without 500 walks."""
+    best: dict[str, tuple[int, Path]] = {}
+    for sid, v, p in _raw_copies():
+        if sid not in best or v > best[sid][0]:
+            best[sid] = (v, p)
+    return {sid: p for sid, (_, p) in best.items()}
+
+
+def find_archived_raw(session_id: str) -> Path | None:
+    """Newest raw copy of one session's transcript, or None. This is what makes
+    an aged-out session restorable after Claude Code's cleanup deleted the
+    original: refresh-all copies every indexable transcript here first."""
+    hits = [(v, p) for sid, v, p in _raw_copies() if sid == session_id]
+    return max(hits)[1] if hits else None
+
+
 def write_readable(steps: list[ReasoningStep], header: dict) -> Path:
     dest_dir = _ym_dir(ARCHIVE / "readable", header.get("last_activity", ""))
     sid8 = header.get("session_id", "")[:8]
