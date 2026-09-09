@@ -205,14 +205,20 @@ macOS wires these via launchd automatically; Linux uses systemd/cron (commands i
 | Claude Code | ✅ | ✅ | ✅ visible + flagged | ✅ | ✅ |
 | GitHub Copilot CLI | ✅ | ✅ | ✅ real reasoning text | ✅ | ✅ |
 | Codex CLI | ✅ | ✅ | ✅ visible + flagged | ✅ | ✅ |
+| OpenCode | ✅ | ✅ real per-message USD, any provider | ✅ real reasoning text | ✅ | ✅ |
 
-Adding another (Gemini, OpenCode, Aider, Ollama, …) is one file — see
+OpenCode keeps its sessions in one SQLite database; the adapter projects each
+root session (sub-agents embedded) to a JSONL file under
+`~/.session-browser/opencode-mirror/`, which doubles as a backup — OpenCode
+hard-deletes on `session delete` and purges large tool outputs after 7 days.
+
+Adding another (Gemini, Aider, Ollama, …) is one file — see
 [docs/ADDING-A-CLI.md](docs/ADDING-A-CLI.md).
 
 ## Roadmap
 
 - Decision-trail → PR description export
-- Gemini CLI, OpenCode, Aider adapters
+- Gemini CLI, Aider adapters
 - Budget alerts on notional spend
 - Homebrew / pipx packaging
 

@@ -163,7 +163,7 @@ if [ "$NO_LAUNCHD" -eq 0 ]; then
   # binaries actually live (npm globals, volta, etc.) — enrichment shells out to
   # `claude`, and a PATH miss silently disables it.
   JOB_PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$HOME_DIR/.local/bin"
-  for c in claude copilot codex; do
+  for c in claude copilot codex opencode; do
     B="$(command -v "$c" 2>/dev/null || true)"
     if [ -n "$B" ]; then D="$(dirname "$B")"; case ":$JOB_PATH:" in *":$D:"*) ;; *) JOB_PATH="$JOB_PATH:$D";; esac; fi
   done

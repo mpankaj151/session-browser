@@ -86,6 +86,7 @@ const SOURCE_COLORS = {
   claude: 'bg-orange-500/15 text-orange-600 dark:text-orange-300 border-orange-500/30',
   copilot: 'bg-sky-500/15 text-sky-600 dark:text-sky-300 border-sky-500/30',
   codex: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border-emerald-500/30',
+  opencode: 'bg-violet-500/15 text-violet-600 dark:text-violet-300 border-violet-500/30',
 };
 // state: 'live' (Sessions tab) | 'archived' (Archived tab — transcript aged out)
 let STATE = { source: 'all', state: 'live', sessions: [], kbIndex: -1 };
@@ -284,7 +285,7 @@ function exportContext(id){
   toast('Downloading context file…');
 }
 
-const BRIDGE_TARGETS = ['claude','copilot','codex'];
+const BRIDGE_TARGETS = ['claude','copilot','codex','opencode'];
 function toggleBridge(id, source){
   const menu = document.getElementById('brmenu-'+id);
   if(menu.innerHTML){ menu.innerHTML=''; return; }   // toggle off
@@ -407,7 +408,7 @@ async function loadMeta(){
 }
 
 // ---- Usage dashboard --------------------------------------------------------
-const SRC_HEX = { claude:'#f97316', copilot:'#0ea5e9', codex:'#10b981' };
+const SRC_HEX = { claude:'#f97316', copilot:'#0ea5e9', codex:'#10b981', opencode:'#8b5cf6' };
 function money(v){ return (v>=100? v.toFixed(0) : v.toFixed(2)); }
 function tokTip(n){ return (n||0).toLocaleString()+' tokens'; }
 

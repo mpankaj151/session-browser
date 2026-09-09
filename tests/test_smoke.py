@@ -331,8 +331,11 @@ def test_adapters():
     from sources.registry import build_source_registry
     from sources.claude import ClaudeSource
     from sources.copilot import CopilotSource
+    from sources.opencode import OpenCodeSource
     reg = build_source_registry()
-    assert "claude" in reg and "copilot" in reg
+    assert "claude" in reg and "copilot" in reg and "opencode" in reg, list(reg)
+    assert isinstance(reg["opencode"], OpenCodeSource)
+    assert reg["opencode"].session_id_for_path(Path(f"/m/{_OC_ROOT}.jsonl")) == _OC_ROOT
     assert ClaudeSource().session_id_for_path(Path("/p/abc-1.jsonl")) == "abc-1"
     assert CopilotSource().session_id_for_path(Path("/s/sid9/events.jsonl")) == "sid9"
     assert CopilotSource().session_id_for_path(Path("/s/sid9/other.jsonl")) is None
@@ -1228,6 +1231,650 @@ def test_restore_cli_plans_on_unmigrated_registry():
         assert out.returncode == 0, out.stderr
         assert "legacy" in out.stdout and "1 archived session" in out.stdout, out.stdout
     print("  ok  restore-session.py --all plans on a not-yet-migrated registry")
+
+
+# --- opencode adapter: SQLite -> per-root-session JSONL mirror ----------------
+# OpenCode (>= v1.2.0) keeps every session in one SQLite DB (WAL):
+# session / message / part rows with JSON `data` blobs. The adapter projects
+# each ROOT session (children embedded) into <mirror>/<ses_id>.jsonl so every
+# downstream consumer keeps its one-file-per-session assumption. Shapes below
+# follow packages/schema/src/v1/session.ts and the live 1.18.15 DB.
+_OC_ROOT = "ses_fd7037a16ffeRyoMOVVyFqv3xY"
+_OC_CHILD = "ses_fd7037a16ffdAbCdEfGhIjKlMn"
+_OC_T0 = 1_785_542_400_000          # 2026-08-01T00:00:00.000Z, epoch ms
+_OC_MODEL = ("opencode", "minimax-m2.5-free")
+
+
+def _oc_schema(conn) -> None:
+    conn.executescript("""
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE project(id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT, name TEXT,
+        time_created INTEGER, time_updated INTEGER);
+    CREATE TABLE session(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+        slug TEXT NOT NULL, directory TEXT NOT NULL, path TEXT, title TEXT NOT NULL,
+        version TEXT NOT NULL, share_url TEXT, summary_additions INTEGER, summary_deletions INTEGER,
+        summary_files INTEGER, summary_diffs TEXT, revert TEXT, permission TEXT, metadata TEXT,
+        agent TEXT, model TEXT, cost REAL NOT NULL DEFAULT 0,
+        tokens_input INTEGER NOT NULL DEFAULT 0, tokens_output INTEGER NOT NULL DEFAULT 0,
+        tokens_reasoning INTEGER NOT NULL DEFAULT 0, tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+        tokens_cache_write INTEGER NOT NULL DEFAULT 0, time_created INTEGER NOT NULL,
+        time_updated INTEGER, time_compacting INTEGER, time_archived INTEGER, workspace_id TEXT);
+    CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+        time_updated INTEGER, data TEXT NOT NULL);
+    CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+        time_created INTEGER NOT NULL, time_updated INTEGER, data TEXT NOT NULL);
+    CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, data TEXT);
+    CREATE TABLE migration(id TEXT PRIMARY KEY, time_completed INTEGER);   -- the NAME lives in `id`
+    INSERT INTO migration VALUES ('20260622202450_simplify_session_input', 1786909685967);
+    """)
+
+
+def _oc_seed(conn, *, root=_OC_ROOT, child=_OC_CHILD,
+             title="New session - 2026-08-01T10:00:00.000Z", version="1.18.15") -> dict:
+    """A root session (2 real user turns, a compaction pair, an aborted assistant
+    message, a part-less message) plus one child spawned by the task tool."""
+    T = _OC_T0
+    prov, mdl = _OC_MODEL
+    conn.execute("INSERT INTO project VALUES ('proj-hash', '/Users/x/proj', 'git', 'proj', ?, ?)", (T, T))
+    conn.execute("INSERT INTO session (id, project_id, parent_id, slug, directory, path, title, version, "
+                 "time_created, time_updated) VALUES (?, 'proj-hash', NULL, 'kind-canyon', '/Users/x/proj', "
+                 "'Users/x/proj', ?, ?, ?, ?)", (root, title, version, T, T + 60_000))
+    conn.execute("INSERT INTO session (id, project_id, parent_id, slug, directory, path, title, version, "
+                 "time_created, time_updated) VALUES (?, 'proj-hash', ?, 'tiny-fox', '/Users/x/proj', "
+                 "'Users/x/proj', 'Chunk 1 - scan (@explore subagent)', ?, ?, ?)",
+                 (child, root, version, T + 3000, T + 4000))
+
+    def msg(sid, mid, t, data):
+        conn.execute("INSERT INTO message VALUES (?, ?, ?, ?, ?)", (mid, sid, t, t, json.dumps(data)))
+
+    def part(sid, mid, pid, t, data):
+        conn.execute("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)", (pid, mid, sid, t, t, json.dumps(data)))
+
+    def assistant(parent, t, cost, inp, out, reasoning=0, cr=0, cw=0, **extra):
+        return {"parentID": parent, "role": "assistant", "mode": "build", "agent": "build",
+                "path": {"cwd": "/Users/x/proj", "root": "/Users/x/proj"}, "cost": cost,
+                "tokens": {"total": inp + out + reasoning, "input": inp, "output": out,
+                           "reasoning": reasoning, "cache": {"read": cr, "write": cw}},
+                "modelID": mdl, "providerID": prov,
+                "time": {"created": t, "completed": t + 3000}, "finish": "stop", **extra}
+    user = {"role": "user", "agent": "build", "model": {"providerID": prov, "modelID": mdl}}
+
+    msg(root, "msg_u1", T + 1000, {**user, "time": {"created": T + 1000}})
+    part(root, "msg_u1", "prt_01", T + 1000, {"type": "text", "text": "why is opencode missing?"})
+    part(root, "msg_u1", "prt_02", T + 1001, {"type": "text", "text": "hidden", "synthetic": True})
+    msg(root, "msg_a1", T + 2000, assistant("msg_u1", T + 2000, 0.0125, 1000, 200, 100, 50, 10))
+    part(root, "msg_a1", "prt_03", T + 2000, {"type": "step-start"})
+    part(root, "msg_a1", "prt_04", T + 2001, {"type": "reasoning", "text": "check the db",
+                                             "time": {"start": T + 2001, "end": T + 2002},
+                                             "metadata": {"anthropic": {"signature": "abc"}}})
+    part(root, "msg_a1", "prt_05", T + 2003, {"type": "text", "text": "the storage moved",
+                                             "time": {"start": T + 2003, "end": T + 2004}})
+    part(root, "msg_a1", "prt_06", T + 2005, {"type": "tool", "tool": "bash", "callID": "call_1",
+                                             "state": {"status": "completed", "input": {"command": "ls"},
+                                                       "output": "a b", "title": "ls", "metadata": {},
+                                                       "time": {"start": T + 2005, "end": T + 2006}}})
+    part(root, "msg_a1", "prt_07", T + 2007, {"type": "subtask", "prompt": "scan the repo",
+                                             "description": "scan", "agent": "explore"})
+    part(root, "msg_a1", "prt_08", T + 2008, {"type": "step-finish", "reason": "stop", "cost": 0.0125,
+                                             "tokens": {"total": 1300, "input": 1000, "output": 200,
+                                                        "reasoning": 100, "cache": {"read": 50, "write": 10}}})
+    # compaction pair: a synthetic user message carrying a compaction part and
+    # the assistant summary — real spend, but not conversation turns
+    msg(root, "msg_uc", T + 5500, {**user, "time": {"created": T + 5500}})
+    part(root, "msg_uc", "prt_09", T + 5500, {"type": "compaction", "auto": True})
+    msg(root, "msg_a2", T + 6000, assistant("msg_uc", T + 6000, 0.001, 100, 20, summary=True))
+    part(root, "msg_a2", "prt_10", T + 6000, {"type": "text", "text": "Summary of the conversation so far"})
+    msg(root, "msg_u2", T + 7000, {**user, "time": {"created": T + 7000}})
+    part(root, "msg_u2", "prt_11", T + 7000, {"type": "text", "text": "fix it"})
+    # aborted turn: assistant with an error and no parts (old rows look like this)
+    msg(root, "msg_a3", T + 8000, {**assistant("msg_u2", T + 8000, 0.0, 0, 0),
+                                   "error": {"name": "MessageAbortedError", "data": {}}})
+    # child session (task tool)
+    msg(child, "msg_c1", T + 3000, {**user, "time": {"created": T + 3000}})
+    part(child, "msg_c1", "prt_12", T + 3000, {"type": "text", "text": "scan the repo"})
+    msg(child, "msg_c2", T + 4000, assistant("msg_c1", T + 4000, 0.005, 400, 80))
+    part(child, "msg_c2", "prt_13", T + 4000, {"type": "text", "text": "found 3 files"})
+    conn.commit()
+    return {"root": root, "child": child}
+
+
+def _oc_source(tmp: Path, seed=True):
+    """OpenCodeSource over a seeded temp DB at <tmp>/data/opencode.db."""
+    from sources.opencode import OpenCodeSource
+    data = tmp / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(data / "opencode.db"))
+    _oc_schema(conn)
+    if seed:
+        _oc_seed(conn)
+    conn.close()
+    return OpenCodeSource(data_dir=data, mirror_dir=tmp / "mirror")
+
+
+def test_opencode_sync_projects_root_sessions_to_mirror():
+    """One JSONL per ROOT session; the child is embedded, never a file of its
+    own; line 1 carries the export-shaped info, the children, and the stats
+    every consumer reads (turns, first message, per-model spend rolled up
+    across the tree). The stem MUST equal the session id — prune-sessions
+    archives every row whose session_id_for_path disagrees with the header."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        files = list(src.discover())
+        assert [f.name for f in files] == [f"{_OC_ROOT}.jsonl"], files
+        mirror = files[0]
+        assert mirror.parent == src.mirror_dir
+        lines = mirror.read_text().splitlines()
+        head = json.loads(lines[0])
+        assert head["type"] == "session" and head["schema"] == 1
+        assert head["info"]["id"] == _OC_ROOT and head["info"]["projectID"] == "proj-hash"
+        assert head["info"]["directory"] == "/Users/x/proj"
+        assert head["info"]["time"] == {"created": _OC_T0, "updated": _OC_T0 + 60_000}
+        assert [c["id"] for c in head["children"]] == [_OC_CHILD]
+        assert head["children"][0]["parentID"] == _OC_ROOT
+        st = head["stats"]
+        assert st["turn_count"] == 2 and st["first_message"] == "why is opencode missing?", st
+        assert st["title"] is None, st                       # placeholder title
+        assert st["model_used"] == "opencode/minimax-m2.5-free"
+        assert st["models"] == {"opencode/minimax-m2.5-free": {
+            "input": 1500, "output": 300, "reasoning": 100, "cache_read": 50, "cache_write": 10,
+            "cost": 0.0185}}, st["models"]
+        assert abs(st["cost_usd"] - 0.0185) < 1e-9
+        assert st["message_count"] == 8 and st["child_count"] == 1
+        assert st["start_time"] == _OC_T0 and st["last_activity"] == _OC_T0 + 60_000
+        # message lines: root first (chronological), then the child's
+        msgs = [json.loads(l) for l in lines[1:]]
+        assert all(m["type"] == "message" for m in msgs)
+        assert [m["info"]["id"] for m in msgs] == \
+            ["msg_u1", "msg_a1", "msg_uc", "msg_a2", "msg_u2", "msg_a3", "msg_c1", "msg_c2"]
+        assert msgs[0]["session"] == _OC_ROOT and msgs[-1]["session"] == _OC_CHILD
+        assert msgs[0]["info"]["sessionID"] == _OC_ROOT and msgs[0]["parts"][0]["messageID"] == "msg_u1"
+        assert msgs[1]["parts"][3]["tool"] == "bash"      # parts in time order, export-shaped
+        assert (src.mirror_dir / ".manifest.json").exists()
+    print("  ok  opencode sync: one JSONL per root, child embedded, stats rolled up, stem == id")
+
+
+def test_opencode_parse_header_reads_line_one_only():
+    """The header lives on line 1 so parse_header stays cheap on multi-MB
+    sessions; fields map from Session.Info + stats; a placeholder title is no
+    title; times go through to_iso_utc so cross-source ordering holds."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        path = next(iter(src.discover()))
+        h = src.parse_header(path)
+        assert h is not None
+        assert h.session_id == _OC_ROOT and h.cli_source == "opencode"
+        assert h.project_path == str(src.mirror_dir)
+        assert h.cwd == "/Users/x/proj" and h.folder_name == "proj"
+        assert h.start_time == "2026-08-01T00:00:00.000Z", h.start_time
+        assert h.last_activity == to_iso_utc(_OC_T0 + 60_000)
+        assert h.first_message == "why is opencode missing?" and h.turn_count == 2
+        assert h.title is None, h.title
+        assert h.model_used == "opencode/minimax-m2.5-free" and h.cli_version == "1.18.15"
+        first = path.read_text().splitlines()[0]
+        path.write_text(first + "\n")            # only line 1 left
+        assert src.parse_header(path) == h
+        path.write_text("not json\n")
+        assert src.parse_header(path) is None
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td), seed=False)
+        conn = sqlite3.connect(str(src.db_path))
+        _oc_seed(conn, title="Refactor the retry loop")
+        conn.close()
+        h = src.parse_header(next(iter(src.discover())))
+        assert h.title == "Refactor the retry loop"
+    print("  ok  opencode parse_header: line 1 only; fields, times, placeholder title")
+
+
+def test_opencode_session_id_for_path_variants():
+    """Only <mirror>/ses_<26 chars>.jsonl is a session: never the manifest, a
+    half-written .tmp, the DB's WAL, or an archive copy's @vN name."""
+    from sources.opencode import OpenCodeSource
+    src = OpenCodeSource(data_dir="/nonexistent/data", mirror_dir="/nonexistent/mirror")
+    m = Path("/nonexistent/mirror")
+    assert src.session_id_for_path(m / f"{_OC_ROOT}.jsonl") == _OC_ROOT
+    for bad in (".manifest.json", f"{_OC_ROOT}.jsonl.tmp", "opencode.db-wal", "opencode.db",
+                f"{_OC_ROOT}@v2.jsonl", "ses_short.jsonl", "notes.jsonl", f"{_OC_ROOT}.json"):
+        assert src.session_id_for_path(m / bad) is None, bad
+    print("  ok  opencode session_id_for_path: ses_<26>.jsonl only")
+
+
+def _oc_add_child_message(db: Path, cost=0.002, inp=10, out=5, mid="msg_c3") -> None:
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO message VALUES (?, ?, ?, ?, ?)", (mid, _OC_CHILD, _OC_T0 + 9000, _OC_T0 + 9000,
+                 json.dumps({"parentID": "msg_c1", "role": "assistant", "cost": cost,
+                             "tokens": {"input": inp, "output": out, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                             "modelID": _OC_MODEL[1], "providerID": _OC_MODEL[0],
+                             "time": {"created": _OC_T0 + 9000}})))
+    conn.commit()
+    conn.close()
+
+
+def test_opencode_manifest_skips_unchanged_and_rewrites_updated():
+    """Rewrites are driven by a fingerprint spanning the whole tree (a child
+    can update after its root; old rows have NULL time_updated). A lost or
+    corrupt manifest costs one full resync, nothing more."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        assert src.sync().written == [_OC_ROOT]
+        path = src.mirror_dir / f"{_OC_ROOT}.jsonl"
+        mtime = path.stat().st_mtime_ns
+        r = src.sync()
+        assert r.written == [] and r.skipped == 1 and path.stat().st_mtime_ns == mtime, r
+        _oc_add_child_message(src.db_path)
+        assert src.sync().written == [_OC_ROOT]
+        head = json.loads(path.read_text().splitlines()[0])
+        assert head["stats"]["message_count"] == 9 and abs(head["stats"]["cost_usd"] - 0.0205) < 1e-9
+        body = path.read_text().splitlines()[1:]
+        (src.mirror_dir / ".manifest.json").write_text("{corrupt")
+        assert src.sync().written == [_OC_ROOT]
+        assert path.read_text().splitlines()[1:] == body
+        assert src.sync().written == [] and src.sync(force=True).written == [_OC_ROOT]
+    print("  ok  opencode manifest: skip unchanged, child change rewrites root, corrupt -> resync")
+
+
+def _oc_wipe(db: Path) -> None:
+    conn = sqlite3.connect(str(db))
+    conn.executescript("DELETE FROM part; DELETE FROM message; DELETE FROM session;")
+    conn.close()
+
+
+def test_opencode_deleted_session_archives_raw_then_unlinks():
+    """`opencode session delete` cascades. The mirror file is the last copy, so
+    sync hands it to the archiver BEFORE unlinking (default: reasoning.archive_raw
+    into the versioned raw vault), keeps it if archiving fails, and removes
+    nothing at all when the DB cannot be read. The unlink is what makes the
+    watcher archive the row as transcript-missing -> Archived tab -> Restore."""
+    old = reasoning.ARCHIVE
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # explicit archiver: called with the live file and its header, first
+            src = _oc_source(root / "a")
+            src.sync()
+            path = src.mirror_dir / f"{_OC_ROOT}.jsonl"
+            _oc_wipe(src.db_path)
+            calls = []
+            r = src.sync(on_delete=lambda p, h: calls.append((p, h["session_id"], p.exists())))
+            assert r.removed == [_OC_ROOT] and not path.exists(), r
+            assert calls == [(path, _OC_ROOT, True)], calls
+            assert _OC_ROOT not in src._load_manifest()
+            # default archiver = the raw vault (month from last_activity: 2026/08)
+            reasoning.ARCHIVE = root / "archive"
+            src = _oc_source(root / "b")
+            src.sync()
+            _oc_wipe(src.db_path)
+            r = src.sync()
+            assert r.removed == [_OC_ROOT], r
+            copy = reasoning.find_archived_raw(_OC_ROOT)
+            assert copy is not None and copy.parent == root / "archive" / "raw" / "2026" / "08", copy
+            assert json.loads(copy.read_text().splitlines()[0])["info"]["id"] == _OC_ROOT
+            # an archiver that fails keeps the file — never destroy the last copy
+            src = _oc_source(root / "c")
+            src.sync()
+            path = src.mirror_dir / f"{_OC_ROOT}.jsonl"
+            _oc_wipe(src.db_path)
+
+            def boom(p, h):
+                raise OSError("disk full")
+            r = src.sync(on_delete=boom)
+            assert path.exists() and r.removed == [] and any("disk full" in w for w in r.warnings), r
+            # unreadable DB: nothing is removed
+            src = _oc_source(root / "d")
+            src.sync()
+            path = src.mirror_dir / f"{_OC_ROOT}.jsonl"
+            src.db_path.unlink()
+            r = src.sync(on_delete=boom)
+            assert r.db_missing and path.exists() and r.removed == []
+    finally:
+        reasoning.ARCHIVE = old
+    print("  ok  opencode deletion: archive_raw first, then unlink; failures keep the file")
+
+
+def test_watcher_delete_archives_opencode_row():
+    """The mirror file vanishing (sync unlinked it) goes through the watcher's
+    ordinary delete path: the row is archived as transcript-missing."""
+    import watcher
+    conn = _temp_db()
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    orig_connect, orig_log = indexer.connect, watcher._log
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = _oc_source(Path(td))
+            path = next(iter(src.discover()))
+            indexer.upsert(src.parse_header(path), conn=conn)
+            conn.commit()
+            path.unlink()
+            indexer.connect = lambda *a, **k: orig_connect(db_path)
+            watcher._log = lambda msg: None
+            ev = type("Ev", (), {"is_directory": False, "src_path": str(path)})()
+            watcher._Handler(src).on_deleted(ev)
+        row = conn.execute("SELECT archived, archived_reason FROM sessions WHERE session_id=?",
+                           (_OC_ROOT,)).fetchone()
+        assert row["archived"] == 1 and row["archived_reason"] == indexer.TRANSCRIPT_MISSING, dict(row)
+    finally:
+        indexer.connect, watcher._log = orig_connect, orig_log
+        conn.close()
+    print("  ok  watcher: deleted opencode mirror file -> row archived transcript-missing")
+
+
+def test_opencode_parse_full_turn_order_and_skips_noise():
+    """Root turns only, in order: synthetic text, the compaction pair, the
+    part-less aborted message and the child's own turns are not turns. Tool
+    calls carry {name, input} (build-fts indexes `input`); the child shows up
+    as the `subtask` call that spawned it."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        parsed = src.parse_full(next(iter(src.discover())))
+        assert parsed is not None and parsed.header.session_id == _OC_ROOT
+        got = [(t.role, t.content, t.tool_calls) for t in parsed.turns]
+        assert got == [
+            ("user", "why is opencode missing?", []),
+            ("assistant", "the storage moved", [{"name": "bash", "input": "command=ls"},
+                                                {"name": "subtask", "input": "agent=explore: scan the repo"}]),
+            ("user", "fix it", []),
+        ], got
+    print("  ok  opencode parse_full: root turns in order; compaction/synthetic/child/aborted skipped")
+
+
+def test_opencode_unknown_part_types_tolerated():
+    """OpenCode adds part types over time; an unknown one must neither crash
+    nor be dropped from the mirror (the mirror is the lossless backup)."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        conn = sqlite3.connect(str(src.db_path))
+        conn.execute("INSERT INTO part VALUES ('prt_99', 'msg_a1', ?, ?, ?, ?)",
+                     (_OC_ROOT, _OC_T0 + 2009, _OC_T0 + 2009, json.dumps({"type": "hologram", "beam": 1})))
+        conn.commit()
+        conn.close()
+        path = next(iter(src.discover()))
+        parsed = src.parse_full(path)
+        assert [t.content for t in parsed.turns] == ["why is opencode missing?", "the storage moved", "fix it"]
+        a1 = next(json.loads(l) for l in path.read_text().splitlines()[1:] if json.loads(l)["info"]["id"] == "msg_a1")
+        assert {"type": "hologram", "beam": 1, "id": "prt_99", "messageID": "msg_a1", "sessionID": _OC_ROOT} in a1["parts"]
+    print("  ok  opencode unknown part types: tolerated and kept verbatim")
+
+
+def test_opencode_unrecognised_part_schema_is_not_silent():
+    """Messages exist but no part type is one we know: index with 0 turns and
+    warn, rather than return None and vanish (how the codex dialect switch
+    went unnoticed for weeks)."""
+    import io
+    from contextlib import redirect_stderr
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td), seed=False)
+        conn = sqlite3.connect(str(src.db_path))
+        T = _OC_T0
+        conn.execute("INSERT INTO project VALUES ('p', '/x', 'git', 'x', ?, ?)", (T, T))
+        conn.execute("INSERT INTO session (id, project_id, slug, directory, title, version, time_created) "
+                     "VALUES (?, 'p', 'odd-slug', '/x', 'Something real', '9.0.0', ?)", (_OC_ROOT, T))
+        for i, role in enumerate(("user", "assistant")):
+            conn.execute("INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+                         (f"msg_{i}", _OC_ROOT, T + i, T + i, json.dumps({"role": role, "time": {"created": T + i}})))
+            conn.execute("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
+                         (f"prt_{i}", f"msg_{i}", _OC_ROOT, T + i, T + i, json.dumps({"type": "blob", "v": i})))
+        conn.commit()
+        conn.close()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            files = list(src.discover())
+            h = src.parse_header(files[0])
+        assert h is not None and h.turn_count == 0 and h.title == "Something real", h
+        assert "part type" in err.getvalue(), err.getvalue()
+    print("  ok  opencode unrecognised part schema: indexed with 0 turns + warning, not dropped")
+
+
+def test_opencode_parse_full_on_raw_archive_copy():
+    """build-fts.index_archived and Restore read the raw-archive copy, named
+    <sid>@vN.jsonl in a different directory: the session id must come from
+    line 1, and nothing may depend on the DB, manifest or mirror_dir."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = _oc_source(root)
+        live = next(iter(src.discover()))
+        want = [(t.role, t.content, t.tool_calls) for t in src.parse_full(live).turns]
+        raw = root / "archive" / "raw" / "2026" / "08"
+        raw.mkdir(parents=True)
+        copy = raw / f"{_OC_ROOT}@v2.jsonl"
+        copy.write_bytes(live.read_bytes())
+        # the DB and mirror are gone: the copy must still parse on its own
+        src.db_path.unlink()
+        live.unlink()
+        h = src.parse_header(copy)
+        assert h is not None and h.session_id == _OC_ROOT and h.turn_count == 2, h
+        assert [(t.role, t.content, t.tool_calls) for t in src.parse_full(copy).turns] == want
+    print("  ok  opencode parse_full on a raw-archive copy: id from line 1, no DB needed")
+
+
+def test_opencode_v2_tables_not_silently_empty():
+    """`message` empty while `session_message` has rows = OpenCode moved to its
+    v2 store: warn by name, keep serving the existing mirror, never pretend the
+    user has no sessions. A missing column is projected around and warned."""
+    import io
+    from contextlib import redirect_stderr
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        assert len(list(src.discover())) == 1
+        conn = sqlite3.connect(str(src.db_path))
+        conn.executescript("DELETE FROM part; DELETE FROM message; "
+                           "INSERT INTO session_message VALUES ('sm1', 'ses_x', 'user', 1, '{}');")
+        conn.close()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            r = src.sync(force=True)
+        assert any("session_message" in w for w in r.warnings) and "session_message" in err.getvalue(), r
+        assert r.written == [] and r.removed == []
+        assert len(list(src.mirror_dir.glob("ses_*.jsonl"))) == 1     # still served
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td), seed=False)
+        conn = sqlite3.connect(str(src.db_path))
+        conn.executescript("ALTER TABLE session DROP COLUMN directory;")
+        conn.execute("INSERT INTO project VALUES ('p', '/x', 'git', 'x', 1, 1)")
+        conn.execute("INSERT INTO session (id, project_id, slug, title, version, time_created) "
+                     "VALUES (?, 'p', 's', 'T', '1.0', ?)", (_OC_ROOT, _OC_T0))
+        conn.execute("INSERT INTO message VALUES ('m1', ?, ?, ?, ?)",
+                     (_OC_ROOT, _OC_T0, _OC_T0, json.dumps({"role": "user", "time": {"created": _OC_T0}})))
+        conn.execute("INSERT INTO part VALUES ('p1', 'm1', ?, ?, ?, ?)",
+                     (_OC_ROOT, _OC_T0, _OC_T0, json.dumps({"type": "text", "text": "hello"})))
+        conn.commit()
+        conn.close()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            files = list(src.discover())
+        assert "directory" in err.getvalue(), err.getvalue()
+        h = src.parse_header(files[0])
+        assert h is not None and h.cwd == "" and h.folder_name == "" and h.turn_count == 1, h
+    print("  ok  opencode schema drift: v2 store and missing columns warn, never silent")
+
+
+def test_opencode_available_without_binary_on_path():
+    """Availability means 'there is something to read', never 'the binary is on
+    PATH' — the watcher runs under a PATH where the binary may be absent, and
+    a mirror keeps serving after OpenCode is uninstalled. And the indexing path
+    must never spawn the binary (it rewrote the WAL when merely asked for a path)."""
+    import os
+    import subprocess
+    from sources.opencode import OpenCodeSource
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = str(root / "empty")
+        try:
+            assert OpenCodeSource(data_dir=root / "none", mirror_dir=root / "m").is_available() is False
+            src = _oc_source(root)
+            assert src.is_available() is True                # DB exists
+            assert src.resume_command("ses_abc") == "opencode --session ses_abc"
+            files = list(src.discover())
+            src.db_path.unlink()
+            assert OpenCodeSource(data_dir=root / "data", mirror_dir=root / "mirror").is_available() is True  # mirror only
+        finally:
+            os.environ["PATH"] = old_path
+        orig_run, orig_popen = subprocess.run, subprocess.Popen
+
+        def forbidden(*a, **k):
+            raise AssertionError("sync/discover must never spawn a subprocess")
+        subprocess.run = subprocess.Popen = forbidden
+        try:
+            src = _oc_source(root / "again")
+            assert len(list(src.discover())) == 1
+            _oc_wipe(src.db_path)
+            src.sync(on_delete=lambda p, h: None)
+        finally:
+            subprocess.run, subprocess.Popen = orig_run, orig_popen
+    print("  ok  opencode is_available without the binary; indexing never shells out")
+
+
+def test_opencode_cost_extractor_returns_authoritative_cost():
+    """OpenCode stores per-message USD (from its models.dev catalogue) for
+    every provider — GLM, Qwen, MiniMax, Kimi are unpriceable by pricing.json.
+    The extractor returns that cost as authoritative (3-tuple) and process()
+    writes it without an 'unknown model' warning. Reasoning tokens fold into
+    output, the copilot precedent."""
+    import io
+    from contextlib import redirect_stderr
+    cc = _load_script("compute-costs")
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        path = next(iter(src.discover()))
+        totals, per_model, cost = cc._usage_opencode(path)
+        assert dict(totals) == {"input": 1500, "output": 400, "cache_read": 50, "cache_write": 10}, totals
+        assert {k: dict(v) for k, v in per_model.items()} == {
+            "opencode/minimax-m2.5-free": {"input": 1500, "output": 400, "cache_read": 50, "cache_write": 10}}
+        assert abs(cost - 0.0185) < 1e-9
+        conn = _temp_db()
+        try:
+            indexer.upsert(src.parse_header(path), conn=conn)
+            err = io.StringIO()
+            with redirect_stderr(err):
+                out = cc.process(path, src, conn)
+            assert out and abs(out["cost"] - 0.0185) < 1e-9, out
+            assert "unknown model" not in err.getvalue(), err.getvalue()
+            row = conn.execute("SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+                               "model_used, models_used, cost_usd FROM sessions WHERE session_id=?",
+                               (_OC_ROOT,)).fetchone()
+            assert tuple(row)[:4] == (1500, 400, 50, 10), tuple(row)
+            assert row["model_used"] == "opencode/minimax-m2.5-free"
+            assert json.loads(row["models_used"]) == ["opencode/minimax-m2.5-free"]
+            assert abs(row["cost_usd"] - 0.0185) < 1e-9
+        finally:
+            conn.close()
+    print("  ok  compute-costs: opencode extractor is authoritative (3-tuple), no pricing warning")
+
+
+def test_cost_process_accepts_two_tuple_extractors():
+    """The three existing extractors return (totals, per_model) and are priced
+    via pricing.json; that contract must survive the 3-tuple extension."""
+    cc = _load_script("compute-costs")
+
+    class Fake:
+        name = "fake"
+
+        def parse_header(self, path):
+            return _header("fk-1", cli_source="fake", model_used=None)
+    toks = {"input": 1_000_000, "output": 100_000, "cache_read": 0, "cache_write": 0}
+    cc._EXTRACTORS["fake"] = lambda path: (dict(toks), {"claude-sonnet-5": dict(toks)})
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header("fk-1", cli_source="fake"), conn=conn)
+        out = cc.process(Path("/nowhere"), Fake(), conn)
+        expected = costs.cost_usd("claude-sonnet-5", toks, costs.load_pricing())
+        assert expected > 0 and abs(out["cost"] - round(expected, 4)) < 1e-6, (out, expected)
+        assert conn.execute("SELECT model_used FROM sessions WHERE session_id='fk-1'").fetchone()[0] == "claude-sonnet-5"
+    finally:
+        cc._EXTRACTORS.pop("fake", None)
+        conn.close()
+    print("  ok  compute-costs: 2-tuple extractors still priced via pricing.json")
+
+
+def test_opencode_reasoning_extract_real_text():
+    """Unlike Claude, OpenCode persists reasoning text. One step per root
+    assistant message that said or did something: reasoning, response, exact
+    actions; the compaction summary and the part-less aborted turn are skipped."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        steps = reasoning.extract_opencode(next(iter(src.discover())))
+        assert [s.turn_index for s in steps] == [1], steps
+        s = steps[0]
+        assert s.thinking == "check the db" and s.decision == "the storage moved"
+        assert s.actions == [{"tool": "bash", "input": "command=ls"},
+                             {"tool": "subtask", "input": "agent=explore: scan the repo"}], s.actions
+        assert s.signature_present is True
+        assert s.timestamp == to_iso_utc(_OC_T0 + 2000)
+    print("  ok  reasoning.extract_opencode: real reasoning text + actions per assistant turn")
+
+
+def test_render_markdown_note_is_source_aware():
+    """The no-thinking note explained Claude Code's signature-only storage for
+    EVERY source; for other CLIs it must not claim to be Claude Code."""
+    step = reasoning.ReasoningStep(turn_index=1, thinking="", decision="did x", signature_present=True)
+    md = reasoning.render_markdown([step], {"cli_source": "opencode", "session_id": "ses_x", "title": "t"})
+    assert "Claude Code" not in md and "opencode" in md, md[:400]
+    md = reasoning.render_markdown([step], {"cli_source": "claude", "session_id": "s", "title": "t"})
+    assert "Claude Code stores extended-thinking" in md
+    print("  ok  render_markdown: no-thinking note names the actual source")
+
+
+def test_opencode_sync_inlines_spilled_tool_output():
+    """Tool outputs over 2000 lines / 50 KB are spilled to <data>/tool-output/
+    tool_<id> and purged after 7 days; the part keeps a truncated preview plus
+    state.metadata.outputPath. While the blob exists, the mirror inlines it —
+    the mirror is the backup, and the blob will not be there next week."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = _oc_source(root, seed=False)
+        conn = sqlite3.connect(str(src.db_path))
+        _oc_seed(conn)
+        spill_dir = src.data_dir / "tool-output"
+        spill_dir.mkdir()
+        blob = spill_dir / "tool_00c2dd9e40012bvNNrwXYZ"
+        blob.write_text("line\n" * 5000)
+        gone = spill_dir / "tool_gone"
+        for pid, path_ in (("prt_s1", str(blob)), ("prt_s2", str(gone))):
+            conn.execute("INSERT INTO part VALUES (?, 'msg_a1', ?, ?, ?, ?)",
+                         (pid, _OC_ROOT, _OC_T0 + 2100, _OC_T0 + 2100, json.dumps({
+                             "type": "tool", "tool": "bash", "callID": pid,
+                             "state": {"status": "completed", "input": {"command": "cat big"},
+                                       "output": f"...output truncated...\n\nFull output saved to: {path_}\n\nline",
+                                       "title": "cat big", "time": {"start": 1, "end": 2},
+                                       "metadata": {"truncated": True, "outputPath": path_}}})))
+        conn.commit()
+        conn.close()
+        path = next(iter(src.discover()))
+        a1 = next(json.loads(l) for l in path.read_text().splitlines()[1:] if json.loads(l)["info"]["id"] == "msg_a1")
+        by_id = {pd["id"]: pd for pd in a1["parts"]}
+        assert by_id["prt_s1"]["state"]["output"] == "line\n" * 5000
+        assert by_id["prt_s1"]["state"]["metadata"]["inlined"] is True
+        assert by_id["prt_s2"]["state"]["output"].startswith("...output truncated")   # blob gone: untouched
+        assert "inlined" not in by_id["prt_s2"]["state"]["metadata"]
+    print("  ok  opencode sync inlines spilled tool output while the blob still exists")
+
+
+def test_opencode_sync_survives_unexpected_migration_table_shape():
+    """The migration-version probe is informational. On the real 1.18.15 DB the
+    `migration` table has no `name` column and the probe raised — taking the
+    whole backfill (every source) down with it. Any shape must be tolerated,
+    and no sqlite error inside sync() may escape discover()."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        conn = sqlite3.connect(str(src.db_path))
+        conn.executescript("DROP TABLE migration; CREATE TABLE migration(id INTEGER PRIMARY KEY, "
+                           "hash TEXT, created_at INTEGER); INSERT INTO migration VALUES (14, 'abc', 1);")
+        conn.close()
+        r = src.sync()
+        assert r.written == [_OC_ROOT] and not r.db_missing, r
+        head = json.loads((src.mirror_dir / f"{_OC_ROOT}.jsonl").read_text().splitlines()[0])
+        assert "migration" in head["source"]
+        conn = sqlite3.connect(str(src.db_path))
+        conn.executescript("DROP TABLE migration;")
+        conn.close()
+        assert src.sync(force=True).written == [_OC_ROOT]
+        # a broken part row (NULL data) must not abort the whole projection either
+        conn = sqlite3.connect(str(src.db_path))
+        conn.execute("INSERT INTO part VALUES ('prt_bad', 'msg_u2', ?, ?, ?, 'not json')", (_OC_ROOT, _OC_T0, _OC_T0))
+        conn.commit()
+        conn.close()
+        assert src.sync(force=True).written == [_OC_ROOT]
+        assert len(list(src.discover())) == 1
+    print("  ok  opencode sync tolerates odd migration tables and bad part rows")
 
 
 if __name__ == "__main__":

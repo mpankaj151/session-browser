@@ -12,9 +12,10 @@ flowchart TD
       C[~/.claude/projects/*.jsonl]
       P[~/.copilot/session-state/*/events.jsonl]
       X[~/.codex/sessions/**/rollout-*.jsonl]
+      O[~/.local/share/opencode/opencode.db<br/>→ opencode-mirror/ses_*.jsonl]
     end
 
-    C & P & X --> AD[sources/*.py adapters<br/>SessionSource protocol]
+    C & P & X & O --> AD[sources/*.py adapters<br/>SessionSource protocol]
 
     subgraph Indexing
       HOOK[session-hook.py<br/>Claude Stop hook] --> IDX
@@ -50,6 +51,19 @@ flowchart TD
 `session_id_for_path` (identity without reading — used on delete),
 `resume_command`, `is_available`. The indexer, DB, UI, watcher, and MCP server
 never mention a specific CLI — adding one is a new file + one registry line.
+
+**DB-backed sources: the mirror pattern (`sources/opencode.py`).** Every
+consumer — the watcher's delete handler, `archive_raw`, restore, FTS, the cost
+and reasoning extractors — assumes one plain-text file per session at the path
+`discover()` yields. OpenCode keeps everything in one SQLite DB, so its adapter
+*projects* the DB (opened read-only; the binary is never invoked on this path
+because even `opencode db path` rewrote the WAL) into one JSONL per root
+session: line 1 is the export-shaped `Session.Info` + children + the stats every
+consumer reads, then one line per message with its parts. Children roll their
+cost into the root. A manifest of per-tree fingerprints limits rewrites to
+changed sessions; a session gone from the DB is archived to the raw vault
+before its mirror file is unlinked, so the ordinary delete path archives the
+row as transcript-missing and Restore can bring it back.
 
 **COALESCE upsert (`indexer.py`).** Re-indexing a session must never clobber
 enrichment (summary, topics, cost, reasoning_path). The upsert updates cheap
@@ -114,11 +128,12 @@ billed.
 | Registry (sessions, artifacts, embeddings, FTS) | `~/.session-browser/registry.db` (WAL) |
 | Enrichment facets / bridge primers | `~/.session-browser/{facets,bridges}/` |
 | Raw transcripts + readable reasoning trails | `~/claude-reasoning-archive/{raw,readable}/YYYY/MM/` |
+| OpenCode mirror (one JSONL per root session; also the backup) | `~/.session-browser/opencode-mirror/` |
 
 ## Module map
 
 ```
-sources/{base,claude,copilot,codex,registry}.py   adapters + protocol
+sources/{base,claude,copilot,codex,opencode,registry}.py   adapters + protocol
 indexer.py                                         upsert / archive
 watcher.py + scripts/session-hook.py               two-tier live indexing
 reasoning.py + scripts/extract-reasoning.py        decision trails

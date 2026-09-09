@@ -8,7 +8,7 @@ Step-by-step install for a fresh machine, plus a troubleshooting matrix.
 |------|-------|-------|
 | Python 3.11+ | `brew install python@3.12` | `sudo apt install python3 python3-venv` |
 | git | preinstalled / `brew install git` | `sudo apt install git` |
-| A supported CLI | [Claude Code](https://claude.com/claude-code) and/or [Copilot CLI](https://github.com/github/copilot-cli) / [Codex](https://github.com/openai/codex) | same |
+| A supported CLI | [Claude Code](https://claude.com/claude-code) and/or [Copilot CLI](https://github.com/github/copilot-cli) / [Codex](https://github.com/openai/codex) / [OpenCode](https://opencode.ai) | same |
 
 You need at least one supported CLI **with existing session history** for the
 browser to have anything to show. No history yet? Run `sb demo` after install to

@@ -1,7 +1,7 @@
 ---
 name: work-journal
 description: Generate work summaries from the session-browser registry — across
-  Claude Code, Codex CLI, and Copilot CLI. Use when the user asks "what did I do
+  Claude Code, Codex CLI, Copilot CLI, and OpenCode. Use when the user asks "what did I do
   today/yesterday/last week/last month/last quarter", requests a weekly-summary,
   monthly-summary, review-summary, performance review, self-assessment,
   accomplishments report, brag doc, stand-up status, or a timeline of their

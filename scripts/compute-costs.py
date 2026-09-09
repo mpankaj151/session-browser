@@ -136,7 +136,40 @@ def _usage_codex(path: Path) -> tuple[dict, dict]:
     return totals, per_model
 
 
-_EXTRACTORS = {"claude": _usage_claude, "copilot": _usage_copilot, "codex": _usage_codex}
+def _usage_opencode(path: Path) -> tuple[dict, dict, float]:
+    """OpenCode stores per-message USD and tokens for EVERY provider (priced from
+    its models.dev catalogue), and the adapter rolls them up per provider/model
+    on line 1 of the mirror file. That cost is authoritative — GLM, Qwen, Kimi,
+    MiniMax are not in pricing.json and never will be — so this returns a
+    3-tuple; process() skips its own pricing when the third element is present.
+    Reasoning tokens fold into output (the copilot precedent)."""
+    totals = defaultdict(int)
+    per_model = defaultdict(lambda: defaultdict(int))
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            head = json.loads(fh.readline())
+    except (OSError, json.JSONDecodeError):
+        return totals, per_model, 0.0
+    models = (head.get("stats") or {}).get("models") if isinstance(head, dict) else None
+    cost = 0.0
+    for model, tk in (models or {}).items():
+        mapped = {
+            "input": int(tk.get("input") or 0),
+            "output": int(tk.get("output") or 0) + int(tk.get("reasoning") or 0),
+            "cache_read": int(tk.get("cache_read") or 0),
+            "cache_write": int(tk.get("cache_write") or 0),
+        }
+        for k, v in mapped.items():
+            totals[k] += v
+            per_model[model][k] += v
+        cost += float(tk.get("cost") or 0)
+    return totals, per_model, cost
+
+
+# An extractor returns (totals, per_model) — priced here via pricing.json — or
+# (totals, per_model, cost_usd) when the source already knows the true spend.
+_EXTRACTORS = {"claude": _usage_claude, "copilot": _usage_copilot, "codex": _usage_codex,
+               "opencode": _usage_opencode}
 
 
 def process(path: Path, adapter, conn) -> dict | None:
@@ -146,16 +179,21 @@ def process(path: Path, adapter, conn) -> dict | None:
     extractor = _EXTRACTORS.get(adapter.name)
     if extractor is None:
         return None
-    totals, per_model = extractor(path)
+    res = extractor(path)
+    totals, per_model = res[0], res[1]
+    authoritative = res[2] if len(res) > 2 else None
     if not per_model:
         return None
-    pricing = costs.load_pricing()
-    total_cost = 0.0
-    for model, toks in per_model.items():
-        if costs.tier_for_model(model, pricing) is None and any(toks.values()):
-            print(f"  ? unknown model '{model}' ({header.session_id[:8]}) — cost counted as $0; "
-                  f"add an alias for it in pricing.json", file=sys.stderr)
-        total_cost += costs.cost_usd(model, toks, pricing)
+    if authoritative is not None:
+        total_cost = float(authoritative)
+    else:
+        pricing = costs.load_pricing()
+        total_cost = 0.0
+        for model, toks in per_model.items():
+            if costs.tier_for_model(model, pricing) is None and any(toks.values()):
+                print(f"  ? unknown model '{model}' ({header.session_id[:8]}) — cost counted as $0; "
+                      f"add an alias for it in pricing.json", file=sys.stderr)
+            total_cost += costs.cost_usd(model, toks, pricing)
     # dominant model = most output tokens
     dominant = max(per_model, key=lambda m: per_model[m]["output"], default=header.model_used)
     models_used = json.dumps(sorted(per_model.keys()))
