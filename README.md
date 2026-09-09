@@ -94,8 +94,9 @@ Also available in the terminal: `sb stats` (today / 7d / 30d / all).
 ### AI summaries & topics (uses your own quota)
 
 The one-line summaries, topic tags, and session-type/outcome labels on the cards
-are written by an LLM through your **own** CLI (`claude --print` / `copilot`) —
-no API key, but it spends your plan's quota. So it's split by cost:
+are written by an LLM through your **own** CLI (`claude --print`, `copilot`, or
+`opencode run` — pick per machine with `[enrichment].provider`) — no API key, but
+it spends your plan's quota. So it's split by cost:
 
 - **Your existing history is NOT enriched at install** (that could be hundreds of
   sessions). Summarize it once with `sb refresh --enrich`, or opt in up front

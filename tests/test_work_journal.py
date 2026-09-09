@@ -178,6 +178,158 @@ def test_claude_headless_pins_enrichment_model():
     print("  ok  claude-headless pins claude-sonnet-5 (override + escape hatch)")
 
 
+def test_opencode_headless_command_pins_model():
+    """OpenCode as the enrichment backend (the team harness). The command must
+    pin provider/model, tag the run so it is recognisable and so OpenCode skips
+    its own title-generation call, run plugin-free, and NEVER auto-approve
+    permissions or share — a summariser has no business using tools."""
+    from enrichment.opencode_headless import OpenCodeHeadless
+    cmd = OpenCodeHeadless({}).command()
+    assert cmd == ["opencode", "run", "--pure", "--format", "json",
+                   "--model", "anthropic/claude-sonnet-5",
+                   "--title", "session-browser-enrichment"], cmd
+    assert OpenCodeHeadless({"model": ""}).command() == \
+        ["opencode", "run", "--pure", "--format", "json", "--title", "session-browser-enrichment"]
+    cmd = OpenCodeHeadless({"model": "opencode/claude-sonnet-5", "agent": "sb-summarizer",
+                            "variant": "minimal"}).command()
+    assert cmd[cmd.index("--model") + 1] == "opencode/claude-sonnet-5"
+    assert cmd[cmd.index("--agent") + 1] == "sb-summarizer"
+    assert cmd[cmd.index("--variant") + 1] == "minimal"
+    for forbidden in ("--auto", "--share", "--attach", "--continue", "--session"):
+        assert forbidden not in cmd, forbidden
+    print("  ok  opencode-headless pins provider/model, tags the run, never --auto/--share")
+
+
+def test_opencode_headless_env_isolates_and_denies():
+    """The run must leave no session rows behind (OPENCODE_DB=:memory: — the
+    only isolation lever that keeps auth.json; XDG_DATA_HOME would move the
+    credentials too), must deny every tool even if --agent falls back to the
+    all-tools default, and must carry the hook-suppression flag."""
+    import os
+    from enrichment.opencode_headless import OpenCodeHeadless
+    old = os.environ.pop("XDG_DATA_HOME", None)
+    try:
+        env = OpenCodeHeadless({}).env()
+        assert env["OPENCODE_DB"] == ":memory:", env.get("OPENCODE_DB")
+        assert json.loads(env["OPENCODE_PERMISSION"]) == {"*": "deny"}
+        assert env["SESSION_BROWSER_SUPPRESS_HOOK"] == "1"
+        assert env.get("OPENCODE_DISABLE_AUTOUPDATE") == "1"
+        assert "XDG_DATA_HOME" not in env
+        assert env["PATH"] == os.environ["PATH"]      # inherits the caller's environment
+    finally:
+        if old is not None:
+            os.environ["XDG_DATA_HOME"] = old
+    print("  ok  opencode-headless env: :memory: DB, deny-all permissions, hook suppressed")
+
+
+def test_opencode_headless_parses_ndjson_stream():
+    """`--format json` is an NDJSON event stream: the facet is the `text`
+    events' part.text (possibly fenced, possibly split), spend is in the
+    `step_finish` events, and an `error` event or a non-zero exit is a failure
+    that names its cause. _meta.model must be the SUMMARISER's model, not the
+    enriched session's (the claude provider records the wrong one)."""
+    import subprocess as sp
+    from enrichment.opencode_headless import OpenCodeHeadless
+
+    def ev(type_, **d):
+        return json.dumps({"type": type_, "timestamp": 1, "sessionID": "ses_x", **d})
+    facet_json = json.dumps({"brief_summary": "Fixed the retry loop.", "goal_categories": ["python"],
+                             "session_type": "bugfix", "outcome": "success"})
+    stream = "\n".join([
+        ev("step_start", part={"type": "step-start"}),
+        ev("text", part={"type": "text", "text": "```json\n" + facet_json[:20]}),
+        ev("text", part={"type": "text", "text": facet_json[20:] + "\n```"}),
+        ev("step_finish", part={"type": "step-finish", "reason": "stop", "cost": 0.0123,
+                                "tokens": {"total": 1500, "input": 1200, "output": 300, "reasoning": 0,
+                                           "cache": {"read": 100, "write": 0}}}),
+        ev("step_finish", part={"type": "step-finish", "reason": "stop", "cost": 0.0007,
+                                "tokens": {"total": 60, "input": 50, "output": 10, "reasoning": 0,
+                                           "cache": {"read": 0, "write": 0}}}),
+    ]) + "\n"
+    calls = []
+
+    def runner(cmd, **kw):
+        calls.append((cmd, kw))
+        return sp.CompletedProcess(cmd, 0, stdout=stream, stderr="> build · anthropic/claude-sonnet-5\n")
+    prov = OpenCodeHeadless({})
+    prov._run = runner
+    turns = [SimpleNamespace(role="user", content="fix the retry loop"),
+             SimpleNamespace(role="assistant", content="done")]
+    facet = prov.summarize(turns, "opencode", "claude-opus-5", "/x")
+    assert facet["brief_summary"] == "Fixed the retry loop.", facet
+    assert facet["goal_categories"] == {"python": 1}
+    assert facet["_meta"]["provider"] == "opencode-headless"
+    assert facet["_meta"]["model"] == "anthropic/claude-sonnet-5", facet["_meta"]
+    assert abs(facet["_meta"]["enrich_cost_usd"] - 0.013) < 1e-9, facet["_meta"]
+    assert facet["_meta"]["enrich_tokens"] == {"input": 1250, "output": 310}, facet["_meta"]
+    cmd, kw = calls[0]
+    assert cmd == prov.command()
+    assert "fix the retry loop" in kw["input"]              # prompt on stdin, not argv
+    assert kw["env"]["OPENCODE_DB"] == ":memory:" and kw["timeout"] == 300
+
+    prov._run = lambda cmd, **kw: sp.CompletedProcess(
+        cmd, 1, stdout=ev("error", error={"name": "ProviderAuthError",
+                                           "data": {"message": "no credential for anthropic"}}) + "\n",
+        stderr="Error: no credential\n")
+    try:
+        prov.summarize(turns, "opencode")
+        raise AssertionError("error event must raise")
+    except RuntimeError as e:
+        assert "ProviderAuthError" in str(e) and "no credential for anthropic" in str(e), e
+
+    prov._run = lambda cmd, **kw: sp.CompletedProcess(cmd, 1, stdout="", stderr="boom: PATH\n")
+    try:
+        prov.summarize(turns, "opencode")
+        raise AssertionError("non-zero exit must raise")
+    except RuntimeError as e:
+        assert "exited 1" in str(e) and "boom" in str(e), e
+
+    prov._run = lambda cmd, **kw: sp.CompletedProcess(cmd, 0, stdout=ev("step_start", part={}) + "\n", stderr="")
+    try:
+        prov.summarize(turns, "opencode")
+        raise AssertionError("no text at all must raise")
+    except RuntimeError as e:
+        assert "no text" in str(e), e
+    # An unreachable provider is not a fast failure: OpenCode retries connection
+    # errors with growing backoff, so the only thing that ends the run is our
+    # timeout. It must read as a provider failure with the likely cause, not as
+    # a bare TimeoutExpired traceback in the nightly log.
+    def slow(cmd, **kw):
+        raise sp.TimeoutExpired(cmd, kw["timeout"])
+    prov._run = slow
+    try:
+        prov.summarize(turns, "opencode")
+        raise AssertionError("timeout must raise RuntimeError")
+    except RuntimeError as e:
+        assert "timed out" in str(e) and "300" in str(e) and "unreachable" in str(e), e
+    print("  ok  opencode-headless: NDJSON -> facet, summariser model in _meta, spend, failures named")
+
+
+def test_get_provider_selects_opencode_and_warns_on_unknown():
+    """[enrichment].provider = "opencode-headless" must resolve to the OpenCode
+    provider with its own sub-config; a typo used to fall through SILENTLY to
+    the null provider (every nightly run produced empty facets with no clue)."""
+    import io
+    from contextlib import redirect_stderr
+    from enrichment.opencode_headless import OpenCodeHeadless
+    from enrichment.null_provider import NullProvider
+    from enrichment.provider import get_provider
+    cfg = {"enrichment": {"provider": "opencode-headless",
+                          "opencode_headless": {"model": "opencode/claude-sonnet-5"}}}
+    prov = get_provider(cfg)
+    assert isinstance(prov, OpenCodeHeadless) and prov.model == "opencode/claude-sonnet-5"
+    err = io.StringIO()
+    with redirect_stderr(err):
+        prov = get_provider({"enrichment": {"provider": "opencode-hedless"}})
+    assert isinstance(prov, NullProvider)
+    assert "opencode-hedless" in err.getvalue() and "null" in err.getvalue().lower(), err.getvalue()
+    err = io.StringIO()
+    with redirect_stderr(err):
+        assert isinstance(get_provider({"enrichment": {"provider": "none"}}), NullProvider)
+    assert err.getvalue() == ""          # an explicit "none" is not a typo
+    print("  ok  get_provider: opencode-headless resolves; unknown names warn instead of silently nulling")
+
+
 def test_find_transcript_uses_adapter_mapping():
     """Codex names files rollout-<ts>-<uuid>.jsonl — a stem match never hits
     them, which silently left every codex session unenriched. The adapter's

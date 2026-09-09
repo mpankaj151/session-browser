@@ -78,6 +78,28 @@ for name,a in build_source_registry().items():
     print(f"  {mark} {name}: {'available' if avail else 'binary/dir missing'}")
 PYEOF
 
+echo "[enrichment]"
+"$PY" - "$REPO" <<'PYEOF'
+import shutil, sys; sys.path.insert(0, sys.argv[1])
+import sbconfig
+cfg = sbconfig.CONFIG.get("enrichment", {})
+name = cfg.get("provider", "none")
+sub = cfg.get(name.replace("-", "_"), {}) if isinstance(name, str) else {}
+binary = sub.get("binary", {"claude-headless": "claude", "copilot-headless": "copilot",
+                            "opencode-headless": "opencode"}.get(name, ""))
+model = sub.get("model", "anthropic/claude-sonnet-5" if name == "opencode-headless"
+                else "claude-sonnet-5" if name == "claude-headless" else "")
+if name in ("none", "null"):
+    print("  \033[33m∼\033[0m provider: none (no LLM summaries)")
+elif name not in ("claude-headless", "copilot-headless", "opencode-headless"):
+    print(f"  \033[31m✗\033[0m provider: {name!r} is not a known provider — summaries will be empty")
+else:
+    have = shutil.which(binary) is not None
+    mark = "\033[32m✓\033[0m" if have else "\033[31m✗\033[0m"
+    print(f"  {mark} provider: {name}  model: {model or '(CLI default)'}  binary: {binary} "
+          f"{'found' if have else 'NOT on PATH'}")
+PYEOF
+
 echo "[hook]"
 SETTINGS="$HOME/.claude/settings.json"
 if grep -q "session-hook.py" "$SETTINGS" 2>/dev/null; then ok "Stop hook registered"; else

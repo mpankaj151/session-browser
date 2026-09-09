@@ -58,7 +58,7 @@ Install flags:
 | Flag | Effect |
 |---|---|
 | `--lite` | Skip the ~2 GB semantic-search ML stack; search falls back to keyword + full-text |
-| `--enrich` | Also LLM-journal your **existing** history during install (spends your plan's quota; the hooks + nightly job cover *new* sessions regardless). Later: `sb refresh --enrich`. Enrichment runs on `claude-sonnet-5` by default — change or clear it via `[enrichment.claude_headless] model` in `config.toml` |
+| `--enrich` | Also LLM-journal your **existing** history during install (spends your plan's quota; the hooks + nightly job cover *new* sessions regardless). Later: `sb refresh --enrich`. Enrichment runs on `claude-sonnet-5` by default — change or clear it via `[enrichment.claude_headless] model` in `config.toml`, or switch the backend to OpenCode with `[enrichment] provider = "opencode-headless"` (model `anthropic/claude-sonnet-5`; needs `opencode auth login`) |
 | `--no-hook` | Don't register the Claude hooks or link the skills |
 | `--no-launchd` | Don't install macOS launchd jobs |
 | `--no-backfill` | Don't index existing sessions now |
@@ -148,7 +148,8 @@ The reasoning archive at `~/claude-reasoning-archive` is always left intact.
 | Port 7655 busy | `sb stop`, or change `[ui].port` in `config.toml`. |
 | Stop hook not firing | Open Claude Code's `/hooks` once to reload settings, or restart it. `sb doctor` shows whether it's registered. |
 | Semantic search empty / errors | `--lite` install (no model) → it falls back to keyword/full-text automatically. To enable: `pip install sentence-transformers` then `sb refresh`. |
-| Enrichment summaries never appear | The nightly job needs `claude`/`copilot` on PATH. On Intel Macs check `sb doctor` → sources; re-run `./install.sh` so the launchd PATH picks up your binary. |
+| Enrichment summaries never appear | The nightly job needs `claude`/`copilot`/`opencode` on PATH. On Intel Macs check `sb doctor` → sources; re-run `./install.sh` so the launchd PATH picks up your binary. `sb doctor` → `[enrichment]` shows the configured provider + model; a typo'd provider name is reported in `refresh.err.log`. |
+| OpenCode enrichment fails with a provider/auth error | `opencode-headless` needs a credential for the configured provider: `opencode auth login` (or the provider's API-key env var), then confirm with `opencode models anthropic \| grep claude-sonnet-5`. A machine without one should stay on `claude-headless`. |
 | Semantic search crashes after changing `[embeddings].model` | Run `sb refresh` (or `scripts/embed-sessions.py --force`) to re-embed at the new dimension. |
 | Something else — where are the logs? | `~/.session-browser/logs/`: `watcher.log` (live indexing), `refresh.log` + `refresh.err` (nightly pipeline), `ui.log` (`sb ui`). |
 | Everything broke after moving the repo | The launchd jobs, Stop hook, and `cr`/`sb` functions bake in absolute paths. Re-run `./install.sh && ./bin/install-cr.sh` from the new location — both repoint stale entries automatically — then restart the UI (`sb stop; sb ui`) and confirm with `sb doctor`. |
