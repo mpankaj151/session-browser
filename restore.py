@@ -73,6 +73,11 @@ def restore_session(session_id: str, conn: sqlite3.Connection | None = None,
         if src is None:
             return RestoreResult(session_id, "no-raw-copy",
                                  detail=f"no raw copy under {reasoning.ARCHIVE / 'raw'}")
+        # A compressed raw copy (Codex cold rollout) stays compressed: the
+        # adapter reads .jsonl.zst, and zstd bytes under a .jsonl name would be
+        # unreadable — the very corruption archive_raw now avoids.
+        if src.name.endswith(".zst") and not dest.name.endswith(".zst"):
+            dest = dest.with_name(dest.name + ".zst")
         dest.parent.mkdir(parents=True, exist_ok=True)
         # copyfile, not copy2: the restored file must carry a FRESH mtime, or an
         # age-based cleanup would delete it again on its next pass. The archive

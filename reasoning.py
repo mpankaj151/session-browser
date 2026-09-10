@@ -43,6 +43,18 @@ class ReasoningStep:
     timestamp: Optional[str] = None
 
 
+class _Closing:
+    """Run an already-entered context manager's __exit__ when the block ends."""
+    def __init__(self, cm):
+        self._cm = cm
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self._cm.__exit__(*exc)
+
+
 # --- extraction ---------------------------------------------------------------
 def extract(transcript_path: Path | str) -> list[ReasoningStep]:
     path = Path(transcript_path)
@@ -143,16 +155,19 @@ def extract_codex(rollout_path: Path | str) -> list[ReasoningStep]:
     their text is encrypted (encrypted_content only) — like Claude's empty thinking,
     the plaintext isn't recoverable. So we reconstruct the visible agent messages
     plus the exact tool-call sequence, flagging turns that had encrypted reasoning."""
+    from sources.codex import _item_text, open_rollout   # the adapter owns rollout I/O + item shapes
     path = Path(rollout_path)
     steps: list[ReasoningStep] = []
     turn = 0
     pending_actions: list[dict] = []
     saw_reasoning = False
     try:
-        fh = open(path, "r", encoding="utf-8", errors="replace")
-    except OSError:
+        cm = open_rollout(path)
+        fh = cm.__enter__()
+    except (OSError, ImportError):
         return steps
-    with fh:
+    # `cm` must outlive the loop: it owns the (possibly zstd) file handles.
+    with cm if False else _Closing(cm):
         for line in fh:
             if '"payload"' not in line:
                 continue
@@ -180,6 +195,40 @@ def extract_codex(rollout_path: Path | str) -> list[ReasoningStep]:
                 ))
                 pending_actions = []
                 saw_reasoning = False
+            elif pt == "item_completed" and isinstance(p.get("item"), dict):
+                # Paginated dialect (the current Codex format): every TurnItem
+                # arrives wrapped in item_completed. Same trail, other spelling —
+                # without this branch every recent Codex session had no trail.
+                item = p["item"]
+                it = str(item.get("type", "")).lower()
+                if it == "reasoning":
+                    saw_reasoning = True
+                elif it == "commandexecution":
+                    pending_actions.append({"tool": "shell",
+                                            "input": _summarize_input_str(item.get("command"))})
+                elif it == "filechange":
+                    pending_actions.append({"tool": "apply_patch",
+                                            "input": _summarize_input_str(item.get("changes") or item.get("path"))})
+                elif it in ("mcptoolcall", "functioncall", "customtoolcall"):
+                    name = item.get("tool") or item.get("name") or ""
+                    if item.get("server"):
+                        name = f"{item['server']}/{name}"
+                    pending_actions.append({"tool": name,
+                                            "input": _summarize_input_str(item.get("arguments") or item.get("input"))})
+                elif it == "websearch":
+                    pending_actions.append({"tool": "web_search",
+                                            "input": _summarize_input_str(item.get("query"))})
+                elif it == "agentmessage":
+                    text = _item_text(item)
+                    if text:
+                        turn += 1
+                        steps.append(ReasoningStep(
+                            turn_index=turn, thinking="", decision=text,
+                            actions=pending_actions, signature_present=saw_reasoning,
+                            timestamp=rec.get("timestamp"),
+                        ))
+                        pending_actions = []
+                        saw_reasoning = False
     # trailing actions with no closing message
     if pending_actions:
         turn += 1
@@ -336,18 +385,30 @@ def _ym_dir(base: Path, last_activity: str) -> Path:
     return d
 
 
+# Raw copies keep the source's representation: Codex zstd-compresses cold
+# rollouts in place, and a byte copy named .jsonl would be a zstd frame every
+# reader parses as text. The codex adapter reads either suffix transparently.
+_ZST = ".zst"
+
+
+def _raw_suffix(src: Path) -> str:
+    return ".jsonl" + _ZST if src.name.endswith(_ZST) else ".jsonl"
+
+
 def archive_raw(transcript_path: Path, header: dict) -> Path:
     """Copy the raw transcript into the archive, versioning on content change."""
     src = Path(transcript_path)
     dest_dir = _ym_dir(ARCHIVE / "raw", header.get("last_activity", ""))
-    dest = dest_dir / f"{header.get('session_id', src.stem)}.jsonl"
+    sid = header.get("session_id") or src.name.split(".")[0]
+    suffix = _raw_suffix(src)
+    dest = dest_dir / f"{sid}{suffix}"
     if dest.exists():
         if dest.stat().st_size == src.stat().st_size:
             return dest  # unchanged — idempotent
         v = 2
-        while (dest_dir / f"{dest.stem}@v{v}.jsonl").exists():
+        while (dest_dir / f"{sid}@v{v}{suffix}").exists():
             v += 1
-        dest = dest_dir / f"{dest.stem}@v{v}.jsonl"
+        dest = dest_dir / f"{sid}@v{v}{suffix}"
     shutil.copy2(src, dest)
     return dest
 
@@ -356,22 +417,31 @@ _RAW_STEM = re.compile(r"^(?P<sid>.+?)(?:@v(?P<v>\d+))?$")
 
 
 def _raw_copies():
-    """Every raw transcript copy as (session_id, version, path). One walk."""
+    """Every raw transcript copy as (session_id, mtime, path). One walk. The
+    @vN counter restarts per YYYY/MM directory, so ordering is by the copy's
+    mtime (copy2 preserves the source's) — a September @v3 must not outrank
+    October's first copy."""
     raw = ARCHIVE / "raw"
     if not raw.is_dir():
         return
-    for p in raw.glob("*/*/*.jsonl"):
-        m = _RAW_STEM.match(p.stem)
-        yield m.group("sid"), int(m.group("v") or 1), p
+    for pattern in ("*/*/*.jsonl", f"*/*/*.jsonl{_ZST}"):
+        for p in raw.glob(pattern):
+            base = p.name[:-len(".jsonl" + _ZST)] if p.name.endswith(_ZST) else p.stem
+            m = _RAW_STEM.match(base)
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            yield m.group("sid"), mtime, p
 
 
 def archived_raw_index() -> dict[str, Path]:
     """session_id -> newest raw transcript copy in the archive. A single
     directory walk, so the UI can label 500 archived rows without 500 walks."""
-    best: dict[str, tuple[int, Path]] = {}
-    for sid, v, p in _raw_copies():
-        if sid not in best or v > best[sid][0]:
-            best[sid] = (v, p)
+    best: dict[str, tuple[float, Path]] = {}
+    for sid, mtime, p in _raw_copies():
+        if sid not in best or (mtime, str(p)) > (best[sid][0], str(best[sid][1])):
+            best[sid] = (mtime, p)
     return {sid: p for sid, (_, p) in best.items()}
 
 
@@ -379,19 +449,23 @@ def find_archived_raw(session_id: str) -> Path | None:
     """Newest raw copy of one session's transcript, or None. This is what makes
     an aged-out session restorable after Claude Code's cleanup deleted the
     original: refresh-all copies every indexable transcript here first."""
-    hits = [(v, p) for sid, v, p in _raw_copies() if sid == session_id]
-    return max(hits)[1] if hits else None
+    hits = [(mtime, str(p), p) for sid, mtime, p in _raw_copies() if sid == session_id]
+    return max(hits)[2] if hits else None
 
 
 def write_readable(steps: list[ReasoningStep], header: dict) -> Path:
     dest_dir = _ym_dir(ARCHIVE / "readable", header.get("last_activity", ""))
-    sid8 = header.get("session_id", "")[:8]
-    fname = f"{sid8}-{_slug(header.get('title') or header.get('first_message',''))}.md"
+    sid = header.get("session_id", "")
+    fname = f"{sid}-{_slug(header.get('title') or header.get('first_message',''))}.md"
     dest = dest_dir / fname
     # A later title (from enrichment) or a month rollover changes the path; remove
-    # the session's previous renders so the archive holds exactly one trail per session.
-    if sid8:
-        for old in (ARCHIVE / "readable").glob(f"*/*/{sid8}-*.md"):
+    # the session's previous renders so the archive holds exactly one trail per
+    # session. Keyed on the FULL id: an 8-char prefix collides for OpenCode
+    # (`ses_` + a ms clock) and Codex (UUIDv7) ids and deleted other sessions'
+    # trails. Legacy prefix-named files are retired by persist(), which knows
+    # the path each row recorded.
+    if sid:
+        for old in (ARCHIVE / "readable").glob(f"*/*/{sid}-*.md"):
             if old != dest:
                 old.unlink(missing_ok=True)
     dest.write_text(render_markdown(steps, header), encoding="utf-8")
@@ -405,6 +479,17 @@ def persist(session_id: str, steps: list[ReasoningStep], readable_path: Path,
     own = conn is None
     conn = conn or indexer.connect()
     try:
+        # Retire the previous render this row pointed at (a legacy prefix name,
+        # or last month's directory) — exactly that file, never a prefix sweep.
+        prev = conn.execute("SELECT reasoning_path FROM sessions WHERE session_id = ?",
+                            (session_id,)).fetchone()
+        prev_path = Path(prev[0]) if prev and prev[0] else None
+        if prev_path and prev_path != Path(readable_path):
+            try:
+                prev_path.resolve().relative_to((ARCHIVE / "readable").resolve())
+                prev_path.unlink(missing_ok=True)
+            except (ValueError, OSError):
+                pass
         conn.execute(
             "UPDATE sessions SET reasoning_path = ? WHERE session_id = ?",
             (str(readable_path), session_id),

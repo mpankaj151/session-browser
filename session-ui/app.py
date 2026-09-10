@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import sys
 from pathlib import Path
 
@@ -49,10 +50,18 @@ def _check_host():
 
 
 # --- helpers ------------------------------------------------------------------
+def _restore_supported() -> set[str]:
+    """Sources whose adapter can put a raw copy back (restore_path)."""
+    return {name for name, a in SOURCES.items() if callable(getattr(a, "restore_path", None))}
+
+
 def _row_to_dict(row, raw_index: dict | None = None) -> dict:
     """raw_index: reasoning.archived_raw_index(), computed once per request by
     the callers that list archived rows — it labels which of them still have
-    a raw transcript copy to restore from."""
+    a raw transcript copy to restore from. `restorable` means exactly what
+    restore.plan() means (raw copy AND an adapter that can place it), so the
+    UI never advertises a Restore the server would refuse; `restore_blocker`
+    says why not."""
     d = dict(row)
     # topics / models_used are JSON-encoded text columns.
     for key in ("topics", "models_used"):
@@ -65,8 +74,11 @@ def _row_to_dict(row, raw_index: dict | None = None) -> dict:
             d[key] = []
     d["is_active"] = _is_active(d.get("last_activity"))
     d["has_reasoning"] = bool(d.get("reasoning_path"))
-    d["restorable"] = bool(d.get("archived")) and raw_index is not None \
-        and d["session_id"] in raw_index
+    has_raw = raw_index is not None and d["session_id"] in raw_index
+    supported = d.get("cli_source") in _restore_supported()
+    d["restorable"] = bool(d.get("archived")) and has_raw and supported
+    d["restore_blocker"] = (None if not d.get("archived") or d["restorable"]
+                            else "unsupported" if not supported else "no-raw-copy")
     d["cost"] = {
         "usd": d.get("cost_usd"),
         "input": d.get("input_tokens"), "output": d.get("output_tokens"),
@@ -156,7 +168,10 @@ def api_sessions():
         except ValueError:      # must not leave a placeholder without its param
             days_i = None
         if days_i is not None:
-            where.append("last_activity >= datetime('now', ?)")
+            # Same spelling as the column (to_iso_utc: 'YYYY-MM-DDTHH:MM:SS.mmmZ');
+            # datetime()'s 'YYYY-MM-DD HH:MM:SS' sorts BELOW every row of the
+            # cutoff day ('T' > ' '), which leaked up to 24 extra hours.
+            where.append("last_activity >= strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now', ?)")
             params.append(f"-{days_i} days")
     if sem_ids is not None:
         if not sem_ids:
@@ -235,14 +250,19 @@ def api_resume(sid: str):
         return jsonify({"error": "transcript missing — restore the session first",
                         "archived_reason": row["archived_reason"]}), 409
     src = SOURCES.get(row["cli_source"])
-    raw = src.resume_command(sid) if src else f"# unknown source {row['cli_source']}"
+    if src is None:
+        # Disabled in config (or a source this build doesn't know): `cr` would
+        # only report "not found" after a round trip to the terminal.
+        return jsonify({"error": f"no adapter for source '{row['cli_source']}' — enable "
+                                 f"[sources.{row['cli_source']}] in config.toml"}), 409
+    raw = src.resume_command(sid)
     cwd = row["cwd"] or ""
     # Primary: the `cr` shell shortcut (installed via bin/install-cr.sh). Paste it in
     # the directory where you want to continue — it ports the session's memory there
     # and resumes. command_full is the direct script call if `cr` isn't installed.
     wrapper = _REPO / "bin" / "resume-here.sh"
     command = f"cr {shlex.quote(sid)}"
-    command_full = f'{shlex.quote(str(wrapper))} {shlex.quote(sid)} {row["cli_source"]}'
+    command_full = f'{shlex.quote(str(wrapper))} {shlex.quote(sid)} {shlex.quote(row["cli_source"])}'
     return jsonify({"command": command, "command_full": command_full,
                     "raw_command": raw, "origin_cwd": cwd, "cli_source": row["cli_source"]})
 
@@ -282,8 +302,9 @@ def _build_context(conn, sid: str) -> tuple[str, str] | None:
 
     cost = d.get("cost", {})
     tot = sum(int(cost.get(k) or 0) for k in ("input", "output", "cache_read", "cache_write"))
-    src = SOURCES.get(d["cli_source"])
-    resume = f"cr {sid}"
+    # /resume refuses archived rows; the primer must not hand out `cr` for them.
+    resume = (f"restore it first (transcript aged out{' on ' + d['archived_at'][:10] if d.get('archived_at') else ''})"
+              if d.get("archived") else f"`cr {sid}`")
 
     L = [
         f"# Context primer — {d.get('title') or (d.get('first_message') or '')[:60]}",
@@ -292,7 +313,7 @@ def _build_context(conn, sid: str) -> tuple[str, str] | None:
         f"- **Project:** {d.get('folder_name')}  ·  **cwd:** `{d.get('cwd') or ''}`",
         f"- **Activity:** {d.get('start_time','')} → {d.get('last_activity','')}  ·  {d.get('turn_count',0)} turns",
         f"- **Usage:** {tot:,} tokens" + (f"  ·  ≈${cost['usd']:.2f} (API list-price equiv)" if cost.get('usd') is not None else ""),
-        f"- **Resume this session:** `{resume}`",
+        f"- **Resume this session:** {resume}",
         "",
         "## Goal",
         (d.get("first_message") or "(not recorded)").strip(),
@@ -312,19 +333,23 @@ def _build_context(conn, sid: str) -> tuple[str, str] | None:
         for content, turn in reasoning:
             L.append(f"- _turn {turn}:_ {content[:400].strip()}")
     # An adapter's restore_path() doubles as "where this row's transcript
-    # lives"; the old two-branch guess remains for sources without it.
+    # lives". The primer is pasted into another agent as its opening prompt,
+    # so a pointer is only printed when the file actually exists — a guessed
+    # path sends the receiving agent hunting for a file that is not there.
     locate = getattr(SOURCES.get(d["cli_source"]), "restore_path", None)
-    located = locate(r) if callable(locate) else None
-    transcript = str(located) if located else (
-        f"{d.get('project_path')}/events.jsonl" if d["cli_source"] == "copilot"
-        else f"{d.get('project_path')}/{sid}.jsonl")
-    L += [
-        "",
-        "## Pointers",
-        f"- Transcript: `{transcript}`",
-    ]
-    if d.get("reasoning_path"):
-        L.append(f"- Full decision trail: `{d['reasoning_path']}`")
+    try:
+        located = locate(r) if callable(locate) else None
+    except Exception:  # noqa: BLE001 — a bad row must not break the primer
+        located = None
+    if located is None and d.get("project_path"):
+        located = Path(d["project_path"]) / f"{sid}.jsonl"
+    pointers = []
+    if located is not None and not d.get("archived") and Path(located).exists():
+        pointers.append(f"- Transcript: `{located}`")
+    if d.get("reasoning_path") and Path(d["reasoning_path"]).exists():
+        pointers.append(f"- Full decision trail: `{d['reasoning_path']}`")
+    if pointers:
+        L += ["", "## Pointers"] + pointers
     L += [
         "",
         "---",
@@ -359,10 +384,37 @@ _BRIDGE_CMD = {
     # opening prompt, in the original project dir. No CLI can resume another's
     # session, so this transfers the full context instead.
     "claude":  'cd {cwd} && claude "$(cat {file})"',
-    "copilot": 'cd {cwd} && copilot -p "$(cat {file})"',
+    # -i, not -p: -p is Copilot's NON-interactive one-shot (the flag headless
+    # enrichment uses); a handoff must open a session the user can continue.
+    "copilot": 'cd {cwd} && copilot -i "$(cat {file})"',
     "codex":   'cd {cwd} && codex "$(cat {file})"',
     "opencode": 'cd {cwd} && opencode --prompt "$(cat {file})"',
 }
+
+
+def _installed(source: str) -> bool:
+    """Is that CLI runnable from this process? The adapter's has_binary() when
+    the source is enabled, else the configured binary name on PATH."""
+    adapter = SOURCES.get(source)
+    hb = getattr(adapter, "has_binary", None)
+    if callable(hb):
+        return bool(hb())
+    binary = sbconfig.source_config(source).get("binary", source)
+    return shutil.which(binary) is not None
+
+
+@app.get("/api/sources")
+def api_sources():
+    """Every CLI this build knows: enabled (adapter loaded), installed (binary
+    on PATH — resume/bridge will work), has_data (transcripts to index). The
+    SPA uses it to offer only bridge targets that exist on this machine."""
+    names = list(dict.fromkeys([*SOURCES, *_BRIDGE_CMD]))
+    out = {}
+    for name in names:
+        adapter = SOURCES.get(name)
+        out[name] = {"enabled": adapter is not None, "installed": _installed(name),
+                     "has_data": bool(adapter.is_available()) if adapter is not None else False}
+    return jsonify(out)
 
 
 def _build_bridge(conn, sid: str, target: str) -> dict | None:
@@ -409,6 +461,10 @@ def api_bridge(sid: str):
     target = (request.args.get("target") or "").lower()
     if target not in _BRIDGE_CMD:
         return jsonify({"error": f"target must be one of {list(_BRIDGE_CMD)}"}), 400
+    if not _installed(target):
+        # Refuse BEFORE writing a primer: the command we would hand back dies
+        # with "command not found" once pasted into a terminal.
+        return jsonify({"error": f"{target} is not installed on this machine (binary not on PATH)"}), 409
     conn = indexer.connect()
     try:
         built = _build_bridge(conn, sid, target)
@@ -488,32 +544,32 @@ def api_stats_timeseries():
         # per-day: session count, tokens, cost — last 365 days
         per_day = [dict(r) for r in conn.execute(
             "SELECT substr(last_activity,1,10) AS day, COUNT(*) AS sessions, "
-            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)),0) AS tokens, "
             "COALESCE(SUM(cost_usd),0) AS cost "
             f"FROM sessions WHERE {indexer.VISIBLE} AND last_activity!='' "
             "GROUP BY day ORDER BY day"
         ).fetchall()]
         by_model = [dict(r) for r in conn.execute(
             "SELECT COALESCE(model_used,'unknown') AS model, COUNT(*) AS sessions, "
-            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)),0) AS tokens, "
             f"COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE {indexer.VISIBLE} "
             "GROUP BY model ORDER BY cost DESC LIMIT 20"
         ).fetchall()]
         by_project = [dict(r) for r in conn.execute(
             "SELECT COALESCE(NULLIF(folder_name,''),'—') AS project, COUNT(*) AS sessions, "
-            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)),0) AS tokens, "
             f"COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE {indexer.VISIBLE} "
             "GROUP BY project ORDER BY cost DESC LIMIT 15"
         ).fetchall()]
         by_source = [dict(r) for r in conn.execute(
             "SELECT cli_source AS source, COUNT(*) AS sessions, "
-            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)),0) AS tokens, "
             f"COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE {indexer.VISIBLE} "
             "GROUP BY source ORDER BY cost DESC"
         ).fetchall()]
         totals = dict(conn.execute(
             "SELECT COUNT(*) AS sessions, "
-            "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
+            "COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)),0) AS tokens, "
             f"COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE {indexer.VISIBLE}"
         ).fetchone())
         # this-calendar-month cost (the headline "≈$X of API-equivalent" number)
@@ -541,8 +597,8 @@ def api_stats():
         enriched = conn.execute(
             f"SELECT COUNT(*) FROM sessions WHERE {pred} AND summary IS NOT NULL"
         ).fetchone()[0]
-        folders = conn.execute(
-            f"SELECT COUNT(DISTINCT folder_name) FROM sessions WHERE {pred}"
+        folders = conn.execute(   # same rule as /api/sessions/folders: '' is not a folder
+            f"SELECT COUNT(DISTINCT folder_name) FROM sessions WHERE {pred} AND folder_name <> ''"
         ).fetchone()[0]
         by_source = {
             r[0]: r[1] for r in conn.execute(

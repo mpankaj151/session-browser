@@ -107,11 +107,21 @@ class _RootScheduler:
         self._log = log or _log
 
     def poll(self) -> list[Path]:
+        import errno
         newly: list[Path] = []
         for directory, adapter in list(self.pending):
             if not directory.is_dir():
                 continue
-            self.observer.schedule(_Handler(adapter), str(directory), recursive=True)
+            try:
+                self.observer.schedule(_Handler(adapter), str(directory), recursive=True)
+            except OSError as e:
+                # Linux: one inotify watch per directory; past
+                # fs.inotify.max_user_watches watchdog raises ENOSPC. Keep the
+                # root pending and retry rather than take the daemon down.
+                hint = (" — raise the limit: sudo sysctl fs.inotify.max_user_watches=524288"
+                        if e.errno == errno.ENOSPC else "")
+                self._log(f"cannot watch [{adapter.name}] {directory}: {e}{hint}; retrying in {ROOT_POLL_S}s")
+                continue
             self.pending.remove((directory, adapter))
             self.scheduled.append((directory, adapter))
             newly.append(directory)
@@ -229,19 +239,21 @@ class _Handler(FileSystemEventHandler):
             # different project dir — archiving on it would hide a live session.
             conn = indexer.connect()
             try:
-                row = conn.execute(
-                    "SELECT project_path FROM sessions WHERE session_id = ?", (sid,)
-                ).fetchone()
+                row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (sid,)).fetchone()
                 canonical_dir = row["project_path"] if row else None
             finally:
                 conn.close()
             if canonical_dir is not None and Path(canonical_dir) != path.parent:
                 _log(f"skip archive (non-canonical copy deleted) {sid}")
                 return
-            # Proven above: the path that vanished IS the canonical transcript,
-            # so this is a real session aged out — keep it visible as such.
-            indexer.archive(sid, indexer.TRANSCRIPT_MISSING)
-            _log(f"archive [{self.adapter.name}] {sid} ({indexer.TRANSCRIPT_MISSING})")
+            # Proven above: the path that vanished IS the canonical transcript.
+            # The same rule prune-sessions applies decides whether it was a
+            # real session (kept visible, restorable) or sidechain noise — the
+            # two paths used to disagree, so WHICH process saw the deletion
+            # decided whether a session stayed browsable.
+            reason = indexer.infer_archive_reason(row) if row is not None else indexer.TRANSCRIPT_MISSING
+            indexer.archive(sid, reason)
+            _log(f"archive [{self.adapter.name}] {sid} ({reason})")
         except Exception as e:  # noqa: BLE001
             _log(f"archive error {sid}: {e}")
 

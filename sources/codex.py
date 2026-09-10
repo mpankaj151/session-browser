@@ -85,11 +85,13 @@ def _payload(rec: dict) -> tuple[str, dict]:
 
 
 @contextlib.contextmanager
-def _open_rollout(path: Path):
+def open_rollout(path: Path):
     """Line reader for a rollout, plain `.jsonl` or zstd `.jsonl.zst`.
 
     Mirrors codex_rollout::open_rollout_line_reader: callers should not need to
-    know which representation is currently on disk.
+    know which representation is currently on disk. Public because every
+    consumer of a rollout (reasoning, costs, full-text) must go through it —
+    a plain open() reads a zstd frame as garbage and silently yields nothing.
     """
     if path.name.endswith(_ZST):
         import zstandard  # imported lazily: only compressed rollouts need it
@@ -224,7 +226,7 @@ class CodexSource:
         events = 0        # records that are not the session_meta preamble
         recognised = 0    # ...of those, ones this adapter knows
         try:
-            with _open_rollout(path) as fh:
+            with open_rollout(path) as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
@@ -300,7 +302,7 @@ class CodexSource:
             return None
         turns: list[Turn] = []
         try:
-            with _open_rollout(path) as fh:
+            with open_rollout(path) as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
@@ -320,6 +322,55 @@ class CodexSource:
     def resume_command(self, session_id: str) -> str:
         return f"codex resume {shlex.quote(session_id)}"
 
+    # -- restore / locate --------------------------------------------------------
+    def _contained(self, path: Path) -> bool:
+        for root in (self.sessions_dir, self.archived_dir):
+            try:
+                path.resolve().relative_to(root.resolve())
+                return True
+            except (ValueError, OSError):
+                continue
+        return False
+
+    def restore_path(self, row) -> Optional[Path]:
+        """Where this row's rollout lives — or, for restore, must be written.
+
+        Codex names files rollout-<19-char ts>-<id>.jsonl inside a date dir
+        and may zstd-compress or `codex archive` them; the row records the dir
+        (project_path) but not the name. Look the file up (row dir first, then
+        both trees), else synthesise the canonical name from start_time so a
+        restored copy is exactly what discover()/session_id_for_path expect.
+        Refuses anything outside the codex trees, like ClaudeSource."""
+        sid = row["session_id"]
+        project_path = row["project_path"] or ""
+        day = Path(os.path.expanduser(project_path)) if project_path else None
+        if day is not None and not self._contained(day):
+            return None
+        patterns = (f"{_PREFIX}*{sid}{_JSONL}", f"{_PREFIX}*{sid}{_JSONL}{_ZST}")
+        found: list[Path] = []
+        if day is not None and day.is_dir():
+            for pat in patterns:
+                found += sorted(day.glob(pat))
+        if not found:
+            for root in (self.sessions_dir, self.archived_dir):
+                if root.exists():
+                    for pat in patterns:
+                        found += sorted(root.glob(f"*/*/*/{pat}"))
+        for candidate in found:
+            if self.session_id_for_path(candidate) == sid:
+                return candidate
+        try:
+            start = row["start_time"]
+        except (KeyError, IndexError):
+            start = ""
+        stamp = (start or "")[:19].replace(":", "-")
+        if len(stamp) != _TS_LEN:
+            from datetime import datetime, timezone
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+        if day is None:
+            day = self.sessions_dir / stamp[0:4] / stamp[5:7] / stamp[8:10]
+        return day / f"{_PREFIX}{stamp}-{sid}{_JSONL}"
+
     def has_binary(self) -> bool:
         """Whether `codex` is runnable from here — a UI hint for resume, only."""
         return shutil.which("codex") is not None
@@ -333,3 +384,6 @@ class CodexSource:
         no log line at all.
         """
         return self.sessions_dir.exists() or self.archived_dir.exists()
+
+
+_open_rollout = open_rollout  # backwards-compatible alias

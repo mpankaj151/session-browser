@@ -138,7 +138,8 @@ class Laptop:
 
     def raw_copies(self) -> list[Path]:
         root = self.home / "claude-reasoning-archive" / "raw"
-        return sorted(root.rglob(f"{self.sid}*.jsonl")) if root.exists() else []
+        # cold Codex copies keep their .jsonl.zst representation
+        return sorted(root.rglob(f"{self.sid}*.jsonl*")) if root.exists() else []
 
     def stub_calls(self) -> list[str]:
         return self.stub_log.read_text().splitlines() if self.stub_log.exists() else []
