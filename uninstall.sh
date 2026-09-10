@@ -13,6 +13,12 @@ if [ "$(uname)" = "Darwin" ]; then
     P="$AGENTS/com.sessionbrowser.$job.plist"
     [ -f "$P" ] && launchctl unload "$P" 2>/dev/null; rm -f "$P"
   done
+elif command -v systemctl >/dev/null 2>&1; then
+  echo "==> removing systemd --user units"
+  UNITS="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  systemctl --user disable --now session-browser-watcher.service session-browser-refresh.timer 2>/dev/null || true
+  rm -f "$UNITS/session-browser-watcher.service" "$UNITS/session-browser-refresh.service" "$UNITS/session-browser-refresh.timer"
+  systemctl --user daemon-reload 2>/dev/null || true
 fi
 
 echo "==> removing Stop + SessionEnd hooks"

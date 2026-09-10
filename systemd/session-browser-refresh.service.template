@@ -1,0 +1,11 @@
+# Rendered by install.sh from systemd/session-browser-refresh.service.template.
+# Started by session-browser-refresh.timer (nightly at 01:00).
+[Unit]
+Description=Session Browser nightly refresh (costs, reasoning trails, full-text, embeddings, enrichment)
+
+[Service]
+Type=oneshot
+ExecStart="__VENV_PY__" "__REPO__/scripts/refresh-all.py" --enrich
+Environment="PATH=__PATH__"
+StandardOutput=append:__LOG_DIR__/refresh.out.log
+StandardError=append:__LOG_DIR__/refresh.err.log

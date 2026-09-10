@@ -2494,6 +2494,62 @@ def test_install_hook_creates_settings_dir_and_honours_config_dir():
     print("  ok  install.sh hook registration creates the settings dir and honours CLAUDE_CONFIG_DIR")
 
 
+# --- portability: background jobs on Linux (systemd --user) -------------------------
+def test_render_job_templates_for_launchd_and_systemd():
+    """Linux got only a printed hint while macOS got launchd jobs; the watcher
+    and nightly refresh are what make the browser stay current, so Linux needs
+    the equivalent systemd --user units. One renderer serves both: plist output
+    must XML-escape (a repo path with & or < used to abort the install with a
+    malformed plist), systemd output must shell-quote paths with spaces."""
+    import os
+    import shutil
+    import subprocess
+    render = _load_script("render-job")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        repo = tmp / "My Repo & Co"          # spaces and an ampersand on purpose
+        # real (fake) executables so `systemd-analyze verify` below judges the
+        # unit text, not the absence of a venv in this temp repo
+        for rel in (".venv/bin/python", "watcher.py", "scripts/refresh-all.py"):
+            f = repo / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("#!/bin/sh\n")
+            f.chmod(0o755)
+        (tmp / "logs").mkdir()
+        env = {"SB_VENV_PY": str(repo / ".venv/bin/python"), "SB_REPO": str(repo),
+               "SB_LOG_DIR": str(tmp / "logs"), "SB_HOME_DIR": str(tmp), "SB_JOB_PATH": "/usr/bin:/bin"}
+        for job in ("watcher", "refresh"):
+            out = render.render(_REPO / "launchd" / f"{job}.plist.template", env, fmt="plist")
+            assert "__" not in out.replace("__proto__", ""), out
+            assert "My Repo &amp; Co" in out and "&amp;" in out, "plist must XML-escape &"
+        units = {}
+        for name in ("session-browser-watcher.service", "session-browser-refresh.service",
+                     "session-browser-refresh.timer"):
+            out = render.render(_REPO / "systemd" / f"{name}.template", env, fmt="systemd")
+            assert "__" not in out.replace("__proto__", ""), out
+            units[name] = out
+        assert '"' + str(repo / ".venv/bin/python") + '"' in units["session-browser-watcher.service"], \
+            "ExecStart must quote a path containing spaces"
+        assert "watcher.py" in units["session-browser-watcher.service"]
+        assert "refresh-all.py" in units["session-browser-refresh.service"] and "--enrich" in units["session-browser-refresh.service"]
+        assert "OnCalendar=" in units["session-browser-refresh.timer"] and "Persistent=true" in units["session-browser-refresh.timer"]
+        assert "PATH=/usr/bin:/bin" in units["session-browser-watcher.service"]
+        # CLI entry point: render to a destination file
+        dest = tmp / "out" / "w.service"
+        r = subprocess.run([sys.executable, str(_REPO / "scripts" / "render-job.py"),
+                            str(_REPO / "systemd" / "session-browser-watcher.service.template"),
+                            str(dest), "--format", "systemd"], env={**os.environ, **env},
+                           capture_output=True, text=True)
+        assert r.returncode == 0 and dest.read_text() == units["session-browser-watcher.service"], r.stderr
+        if shutil.which("systemd-analyze"):
+            for name, text in units.items():
+                (tmp / "out" / name).write_text(text)
+                v = subprocess.run(["systemd-analyze", "--user", "verify", str(tmp / "out" / name)],
+                                   capture_output=True, text=True)
+                assert v.returncode == 0, v.stderr
+    print("  ok  render-job: launchd plists XML-escaped, systemd units quoted and complete")
+
+
 if __name__ == "__main__":
     print("Session Browser smoke + regression tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

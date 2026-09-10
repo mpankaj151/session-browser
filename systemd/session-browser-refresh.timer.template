@@ -1,0 +1,12 @@
+# Rendered by install.sh from systemd/session-browser-refresh.timer.template.
+[Unit]
+Description=Run the Session Browser nightly refresh at 01:00
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+# Catch up after a laptop was asleep/off at 01:00 (launchd does the same).
+Persistent=true
+Unit=session-browser-refresh.service
+
+[Install]
+WantedBy=timers.target

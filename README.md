@@ -199,7 +199,7 @@ generated from the journal, never by re-reading months of transcripts.
 - **Nightly refresh** (01:00) runs the full pipeline: costs, reasoning, full-text,
   embeddings, LLM journals for anything the hooks missed, daily digests.
 
-macOS wires these via launchd automatically; Linux uses systemd/cron (commands in
+macOS wires these via launchd, Linux via systemd --user units — both installed by `install.sh` (details in
 [docs/SETUP.md](docs/SETUP.md)).
 
 ## Supported CLIs

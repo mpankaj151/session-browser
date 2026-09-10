@@ -50,8 +50,9 @@ source ~/.zshrc
    (backup kept) — Stop indexes instantly; SessionEnd journals the ended
    session — and links the shipped skills (work-journal, snapshot, checkpoint)
    into `~/.claude/skills`.
-6. **macOS:** installs launchd jobs (live watcher + nightly 01:00 refresh).
-   **Linux:** prints the two commands to schedule yourself.
+6. Installs the background jobs: launchd agents on macOS, systemd --user units on
+   Linux (live watcher + nightly 01:00 refresh). Without either, it prints the
+   two commands to schedule yourself.
 
 Install flags:
 
@@ -61,7 +62,7 @@ Install flags:
 | `--enrich` | Also LLM-journal your **existing** history during install (spends your plan's quota; the hooks + nightly job cover *new* sessions regardless). Later: `sb refresh --enrich`. Enrichment runs on `claude-sonnet-5` by default — change or clear it via `[enrichment.claude_headless] model` in `config.toml`, or switch the backend to OpenCode with `[enrichment] provider = "opencode-headless"` (model `anthropic/claude-sonnet-5`; needs `opencode auth login`) |
 | `--no-hook` | Don't register the Claude hooks or link the skills |
 | `--opencode-plugin` | Install the OpenCode plugin (`~/.config/opencode/plugins/session-browser.js`): indexes a session the moment a turn settles, re-syncs on deletion. Optional — the watcher already picks OpenCode changes up within seconds |
-| `--no-launchd` | Don't install macOS launchd jobs |
+| `--no-scheduler` (alias `--no-launchd`) | Don't install the background jobs (launchd on macOS, systemd --user on Linux) |
 | `--no-backfill` | Don't index existing sessions now |
 
 ## 4. Post-install checklist
@@ -77,43 +78,25 @@ sb ui        # http://127.0.0.1:7655
 sb stats     # terminal usage report
 ```
 
-## 5. Linux scheduling (systemd --user)
+## 5. Background jobs on Linux (systemd --user)
 
-macOS gets launchd automatically. On Linux, schedule the two background jobs:
+`install.sh` installs the two background jobs itself: launchd agents on macOS,
+and on Linux — when a `systemctl --user` session is reachable — these units in
+`~/.config/systemd/user/` (rendered from `systemd/*.template` with your repo,
+venv and log paths baked in):
 
-`~/.config/systemd/user/session-browser-watcher.service`:
+| unit | what |
+|---|---|
+| `session-browser-watcher.service` | live indexing (`watcher.py`), restarts on failure |
+| `session-browser-refresh.timer` → `.service` | nightly 01:00 `refresh-all.py --enrich`, catches up after sleep (`Persistent=true`) |
 
-```ini
-[Unit]
-Description=Session Browser live watcher
-[Service]
-ExecStart=%h/session-browser/.venv/bin/python %h/session-browser/watcher.py
-Restart=on-failure
-[Install]
-WantedBy=default.target
-```
+Check them with `sb doctor` or `systemctl --user status session-browser-watcher`.
+User units run while you are logged in; to keep the watcher alive after logout:
+`loginctl enable-linger $USER`. `./uninstall.sh` disables and removes them.
 
-`~/.config/systemd/user/session-browser-refresh.service` + `.timer`:
-
-```ini
-# .service
-[Service]
-Type=oneshot
-ExecStart=%h/session-browser/.venv/bin/python %h/session-browser/scripts/refresh-all.py --enrich
-# .timer
-[Timer]
-OnCalendar=*-*-* 01:00:00
-Persistent=true
-[Install]
-WantedBy=timers.target
-```
-
-```bash
-systemctl --user enable --now session-browser-watcher.service
-systemctl --user enable --now session-browser-refresh.timer
-```
-
-(Or a plain `cron` line for the refresh + `nohup watcher.py &` in your shell rc.)
+Without systemd (or over SSH with no user session bus) the installer prints the
+two commands to schedule yourself — a `cron` line for the refresh plus
+`nohup .venv/bin/python watcher.py &` in your shell rc is enough.
 
 ## 6. Register the MCP server (optional)
 

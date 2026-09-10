@@ -1,0 +1,20 @@
+# Rendered by install.sh from systemd/session-browser-watcher.service.template
+# into ~/.config/systemd/user/. Runs while you are logged in; to keep it running
+# after logout:  loginctl enable-linger $USER
+[Unit]
+Description=Session Browser live watcher (indexes CLI sessions as they change)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart="__VENV_PY__" "__REPO__/watcher.py"
+Environment="PATH=__PATH__"
+# The watcher exits 0 on purpose when another instance holds its lock or no
+# source is enabled — restart only on failure.
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:__LOG_DIR__/watcher.out.log
+StandardError=append:__LOG_DIR__/watcher.err.log
+
+[Install]
+WantedBy=default.target
