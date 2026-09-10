@@ -110,7 +110,7 @@ echo "[hook]"
 SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 if grep -q "session-hook.py" "$SETTINGS" 2>/dev/null; then ok "Claude Stop hook registered"; else
   if command -v claude >/dev/null 2>&1; then
-    printf "  \033[33m∼\033[0m Claude Stop hook NOT registered (live indexing still works via watcher; ./install.sh --no-backfill --no-launchd)\n"
+    printf "  \033[33m∼\033[0m Claude Stop hook NOT registered (live indexing still works via watcher; ./install.sh --no-backfill --no-scheduler)\n"
   else
     printf "  \033[33m∼\033[0m Claude Code not installed here — no Stop hook needed\n"
   fi

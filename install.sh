@@ -133,7 +133,7 @@ try:
     cfg = json.loads(settings.read_text()) if settings.exists() else {}
 except (json.JSONDecodeError, OSError) as e:
     print(f"   ! {settings} is not valid JSON ({e}) — skipping hook registration.")
-    print("     Fix the file, then re-run: ./install.sh --no-backfill --no-launchd")
+    print("     Fix the file, then re-run: ./install.sh --no-backfill --no-scheduler")
     sys.exit(0)
 if not isinstance(cfg, dict):
     print("   ! settings.json is not a JSON object — skipping hook registration"); sys.exit(0)

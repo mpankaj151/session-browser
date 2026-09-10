@@ -129,7 +129,7 @@ The reasoning archive at `~/claude-reasoning-archive` is always left intact.
 | `cr` says `<cli> is not on PATH` | The session exists but that CLI is not installed in this shell (or a daemon PATH). Indexing, search and the Archived/Restore flow never need the binary; only resume and bridge do. |
 | Sessions of a relocated CLI are missing | `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` are followed when the source's path in `config.toml` is left at the default — export them in the shell that runs `sb`/the watcher, or set the path explicitly. |
 | `venv` creation fails | Missing `python3-venv` (Linux): `sudo apt install python3-venv`. |
-| Install aborts on `settings.json` | Your `~/.claude/settings.json` is malformed. The installer now warns and skips the hook — fix the JSON and re-run with `--no-backfill --no-launchd`. |
+| Install aborts on `settings.json` | Your `~/.claude/settings.json` is malformed. The installer now warns and skips the hook — fix the JSON and re-run with `--no-backfill --no-scheduler`. |
 | No sessions shown | No history for enabled sources yet, or backfill was skipped. Run `sb refresh`, or `sb demo` to preview with synthetic data. |
 | Port 7655 busy | `sb stop`, or change `[ui].port` in `config.toml`. |
 | Stop hook not firing | Open Claude Code's `/hooks` once to reload settings, or restart it. `sb doctor` shows whether it's registered. |
