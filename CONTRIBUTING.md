@@ -8,7 +8,7 @@ codebase (SQLite + Flask + vanilla JS + numpy).
 ```bash
 git clone https://github.com/mpankaj151/session-browser.git
 cd session-browser
-./install.sh --no-hook --no-launchd     # dev install; skip the system hooks
+./install.sh --no-hook --no-scheduler  # dev install; skip the hooks and background jobs
 ```
 
 ## Before you open a PR

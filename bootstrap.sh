@@ -5,7 +5,7 @@
 #
 # Env knobs:
 #   SB_HOME=~/somewhere    where to clone (default: ~/session-browser)
-#   SB_INSTALL_ARGS="--lite --no-launchd"   passed through to install.sh
+#   SB_INSTALL_ARGS="--lite --no-scheduler"   passed through to install.sh
 #     (--lite skips the ~2 GB semantic-search ML stack)
 set -euo pipefail
 

@@ -147,9 +147,21 @@ def infer_archive_reason(row) -> str:
     with content was a real session whose transcript is now missing. Derived
     from what the row holds, never from the shape of its id.
     """
-    turns = row["turn_count"] or 0
-    first = (row["first_message"] or "").strip()
-    return NOT_A_SESSION if turns == 0 and not first else TRANSCRIPT_MISSING
+    def get(key):
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return None
+    turns = get("turn_count") or 0
+    first = (get("first_message") or "").strip()
+    if turns or first:
+        return TRANSCRIPT_MISSING
+    # No typed turns, but a slash-command-only session (/init, /model …) still
+    # did real work: tokens, a model, a summary or a rendered trail all prove
+    # a conversation happened. Only a row with none of these is sidechain noise.
+    worked = any(get(k) for k in ("output_tokens", "input_tokens", "cost_usd",
+                                  "model_used", "summary", "reasoning_path"))
+    return TRANSCRIPT_MISSING if worked else NOT_A_SESSION
 
 
 def archive(session_id: str, reason: str, conn: sqlite3.Connection | None = None) -> None:

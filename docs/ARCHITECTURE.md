@@ -19,7 +19,7 @@ flowchart TD
 
     subgraph Indexing
       HOOK[session-hook.py<br/>Claude Stop hook] --> IDX
-      WATCH[watcher.py<br/>launchd daemon] --> IDX
+      WATCH[watcher.py<br/>launchd / systemd daemon] --> IDX
       BACK[backfill.py] --> IDX
       IDX[indexer.py<br/>COALESCE upsert] --> DB[(registry.db)]
     end
@@ -92,7 +92,7 @@ cleanup would delete it again on its next pass.
 **Two-tier live indexing.** The Claude **Stop hook** (and, opt-in, the
 **OpenCode plugin** — `scripts/opencode-hook.py` spawned on `session.idle` /
 `session.deleted`) indexes a session the instant it ends (tens of ms) and
-detaches reasoning extraction. The **watcher** (a launchd daemon,
+detaches reasoning extraction. The **watcher** (a launchd / systemd --user daemon,
 singleton-locked) catches everything else — Copilot, Codex, OpenCode DB writes
 via `sync_trigger()`, and anything a hook missed — via filesystem events, with
 a 30s race-guard (`hookstate.py`, shared by every hook) so the two paths never

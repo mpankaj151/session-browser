@@ -89,7 +89,7 @@ const SOURCE_COLORS = {
   opencode: 'bg-violet-500/15 text-violet-600 dark:text-violet-300 border-violet-500/30',
 };
 // state: 'live' (Sessions tab) | 'archived' (Archived tab — transcript aged out)
-let STATE = { source: 'all', state: 'live', sessions: [], kbIndex: -1 };
+let STATE = { source: 'all', state: 'live', sessions: [], kbIndex: -1, sources: null };
 const ARCHIVED_CLS = 'bg-amber-500/10 text-amber-600 dark:text-amber-300 border-amber-500/30';
 
 const $ = s => document.querySelector(s);
@@ -180,7 +180,7 @@ function renderCard(s, idx){
     ? `<button data-act="resume" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>`
     : s.restorable
       ? `<button data-act="restore" data-sid="${sid}" title="Copy the raw transcript back from the reasoning archive; Resume works again afterwards" class="text-xs px-2.5 py-1 rounded-md bg-amber-600 hover:bg-amber-500 text-white">♻ Restore</button>`
-      : `<button disabled title="Transcript deleted and no raw copy in the reasoning archive — metadata only" class="text-xs px-2.5 py-1 rounded-md bg-slate-300 dark:bg-slate-700 text-slate-500 cursor-not-allowed">▶ Resume</button>`;
+      : `<button disabled title="${s.restore_blocker==='unsupported' ? 'Transcript deleted; a raw copy exists but this source\'s adapter cannot place it back — metadata only' : 'Transcript deleted and no raw copy in the reasoning archive — metadata only'}" class="text-xs px-2.5 py-1 rounded-md bg-slate-300 dark:bg-slate-700 text-slate-500 cursor-not-allowed">▶ Resume</button>`;
   return `<div class="card border border-slate-200 dark:border-slate-800 rounded-xl p-4 bg-white dark:bg-slate-900 hover:border-indigo-400/50 transition" data-idx="${idx}">
     <div class="flex items-start justify-between gap-3">
       <div class="flex items-center gap-2 min-w-0">
@@ -286,13 +286,23 @@ function exportContext(id){
   toast('Downloading context file…');
 }
 
-const BRIDGE_TARGETS = ['claude','copilot','codex','opencode'];
+const BRIDGE_TARGETS = ['claude','copilot','codex','opencode'];   // fallback when /api/sources is unavailable
+function bridgeTargets(source){
+  // Only CLIs installed on THIS machine: a handoff command for an absent one
+  // dies with "command not found" after the user has already switched terminals.
+  const known = STATE.sources
+    ? Object.entries(STATE.sources).filter(([,v]) => v.installed).map(([k]) => k)
+    : BRIDGE_TARGETS;
+  return known.filter(t => t !== source);
+}
 function toggleBridge(id, source){
   const menu = document.getElementById('brmenu-'+id);
   if(menu.innerHTML){ menu.innerHTML=''; return; }   // toggle off
-  const targets = BRIDGE_TARGETS.filter(t => t !== source);
+  const targets = bridgeTargets(source);
   menu.innerHTML = `<span class="text-xs text-slate-400 self-center">→</span>` +
-    targets.map(t => `<button data-act="bridge-to" data-sid="${esc(id)}" data-target="${esc(t)}" class="text-xs px-2 py-1 rounded-md border border-teal-500/40 hover:bg-teal-500/20">${esc(t)}</button>`).join('');
+    (targets.length
+      ? targets.map(t => `<button data-act="bridge-to" data-sid="${esc(id)}" data-target="${esc(t)}" class="text-xs px-2 py-1 rounded-md border border-teal-500/40 hover:bg-teal-500/20">${esc(t)}</button>`).join('')
+      : `<span class="text-xs text-slate-400 self-center">no other CLI installed here</span>`);
 }
 async function doBridge(id, target){
   const menu = document.getElementById('brmenu-'+id);
@@ -386,6 +396,7 @@ async function applyFilters(){
 }
 
 async function loadMeta(){
+  if(!STATE.sources){ try { STATE.sources = await fetchJson('/api/sources'); } catch(e) { STATE.sources = null; } }
   const stats = await fetchJson('/api/stats?state='+STATE.state);
   let line = `${stats.total} ${STATE.state==='archived'?'archived ':''}sessions · ${stats.enriched} enriched · ${stats.folders} folders`;
   $('#tabArchived').textContent = `🗄 Archived${stats.archived ? ' '+stats.archived : ''}`;
@@ -503,7 +514,12 @@ function statTile(big, small, accent){
 }
 function showTab(which){
   const stats = which==='stats';
-  STATE.state = which==='archived' ? 'archived' : 'live';
+  const next = which==='archived' ? 'archived' : 'live';
+  // A tab switch is a change of scope, not a refinement: a source pill picked
+  // on Sessions may not exist among archived rows, and an invisible filter
+  // would show "No archived sessions" under a tab that counts some.
+  if(next !== STATE.state) STATE.source = 'all';
+  STATE.state = next;
   $('#sessionsView').classList.toggle('hidden', stats);
   $('#statsView').classList.toggle('hidden', !stats);
   const on  = 'text-sm px-3 py-1.5 rounded-lg bg-indigo-600 text-white';

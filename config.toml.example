@@ -1,4 +1,9 @@
-# Session Browser configuration. Copy to config.toml and edit.
+# Session Browser configuration — the complete, documented DEFAULTS.
+# Per-machine changes go in config.toml (git-ignored), which is LAYERED over this
+# file: any section or key config.toml omits keeps the value here, so a config
+# written before a source/provider existed still picks it up after `git pull`.
+# To switch a source off, set `enabled = false` in config.toml (deleting its
+# block no longer does that). $SB_CONFIG points a run at another override file.
 # Paths use ~ for the home directory; they are expanded at load time.
 
 [paths]
@@ -20,7 +25,7 @@ show_onboarding  = "auto"
 
 [sources.claude]
 enabled      = true
-projects_dir = "~/.claude/projects"
+projects_dir = "~/.claude/projects"        # at this default, $CLAUDE_CONFIG_DIR/projects is followed
 binary       = "claude"
 
 [sources.copilot]
@@ -30,7 +35,7 @@ binary    = "copilot"
 
 [sources.codex]
 enabled      = true
-sessions_dir = "~/.codex/sessions"
+sessions_dir = "~/.codex/sessions"          # at this default, $CODEX_HOME/sessions is followed
 # `codex archive` MOVES a rollout into this sibling tree. Indexed and watched
 # alongside sessions_dir so archiving in Codex does not erase the work here.
 # Defaults to <sessions_dir>/../archived_sessions when omitted.
@@ -44,7 +49,7 @@ enabled    = true
 # cost rolled up) under mirror_dir — the mirror is what the watcher, archive,
 # restore and search operate on, and it doubles as the backup.
 # DB resolution: $OPENCODE_DB > `db` > <data_dir>/opencode.db > newest opencode-<channel>.db
-data_dir   = "~/.local/share/opencode"     # honours $XDG_DATA_HOME when unset here
+data_dir   = "~/.local/share/opencode"     # at this default, $XDG_DATA_HOME/opencode is followed
 # db       = "~/.local/share/opencode/opencode-beta.db"
 mirror_dir = "~/.session-browser/opencode-mirror"
 reimport_on_restore = true                 # Restore also runs `opencode import`
@@ -55,10 +60,12 @@ binary     = "opencode"
 
 # --- Enrichment --------------------------------------------------------------
 [enrichment]
-# Which CLI does the summarising. Per machine: keep claude-headless where Claude
-# Code is the daily driver; use opencode-headless where OpenCode is the harness
-# (any provider it is authenticated for — Anthropic, OpenAI, gateways).
-provider = "claude-headless"   # claude-headless | copilot-headless | opencode-headless | none
+# Which CLI does the summarising. "auto" = the first of claude, opencode, copilot
+# found on PATH, so a laptop with any one of them enriches out of the box. Pin
+# one per machine when several are installed and you care which quota pays:
+# claude-headless where Claude Code is the daily driver, opencode-headless where
+# OpenCode is the harness (any provider it is authenticated for). "none" = no LLM.
+provider = "auto"   # auto | claude-headless | opencode-headless | copilot-headless | none
 
 [enrichment.claude_headless]
 binary          = "claude"

@@ -27,7 +27,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import sbconfig  # noqa: E402
 
-PROJECTS = Path.home() / ".claude" / "projects"
+# The same tree the claude adapter indexes (honours $CLAUDE_CONFIG_DIR).
+from sources.registry import _make_claude  # noqa: E402
+PROJECTS = _make_claude().projects_dir
 
 
 def _real_copies() -> dict[str, list[Path]]:

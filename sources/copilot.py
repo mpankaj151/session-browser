@@ -147,8 +147,28 @@ class CopilotSource:
     def resume_command(self, session_id: str) -> str:
         return f"copilot --resume={shlex.quote(session_id)}"
 
+    def restore_path(self, row) -> Optional[Path]:
+        """<state_dir>/<sid>/events.jsonl — the row's project_path IS that
+        session dir. Refuses anything outside the state tree."""
+        project_path = row["project_path"] or ""
+        if not project_path:
+            return None
+        sess_dir = Path(os.path.expanduser(project_path))
+        try:
+            rel = sess_dir.resolve().relative_to(self.state_dir.resolve())
+        except (ValueError, OSError):
+            return None
+        if len(rel.parts) != 1 or rel.parts[0] != row["session_id"]:
+            return None
+        return sess_dir / "events.jsonl"
+
+    def has_binary(self) -> bool:
+        """Whether `copilot` is runnable from here — a UI hint for resume/bridge only."""
+        return shutil.which("copilot") is not None
+
     def is_available(self) -> bool:
-        return shutil.which("copilot") is not None and self.state_dir.exists()
+        """Transcripts to read — never gated on the binary (see ClaudeSource)."""
+        return self.state_dir.exists()
 
     # -- helpers --
     @staticmethod
@@ -157,6 +177,9 @@ class CopilotSource:
         if not wf.exists():
             return {}
         try:
-            return yaml.safe_load(wf.read_text()) or {}
-        except (yaml.YAMLError, OSError):
+            # utf-8 with replacement like every other reader: the locale default
+            # raised UnicodeDecodeError (a ValueError) out of parse_header
+            data = yaml.safe_load(wf.read_text(encoding="utf-8", errors="replace"))
+        except (yaml.YAMLError, OSError, ValueError):
             return {}
+        return data if isinstance(data, dict) else {}

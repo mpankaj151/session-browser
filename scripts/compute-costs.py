@@ -96,12 +96,13 @@ def _usage_codex(path: Path) -> tuple[dict, dict]:
     INCLUDES cached; split it so cache_read isn't double-counted. reasoning billed as
     output. Keep the LAST token_count seen (it's the running total). No per-model
     breakdown in the event, so attribute to the session's model."""
+    from sources.codex import open_rollout   # plain or zstd — never a bare open()
     totals = defaultdict(int)
     per_model = defaultdict(lambda: defaultdict(int))
     last = None
     model = ""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open_rollout(path) as fh:
             for line in fh:
                 if '"model"' in line and not model:
                     try:

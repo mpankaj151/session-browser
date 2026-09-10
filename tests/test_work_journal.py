@@ -582,6 +582,72 @@ def test_persist_writes_snapshot_and_journal_idempotently():
     print("  ok  _persist: sessions/snapshot/journal/decisions written once, upserted on redo")
 
 
+def test_get_provider_auto_picks_first_cli_on_path():
+    """[enrichment].provider = "auto" (the fresh-install default) resolves to the
+    first summariser whose binary is on PATH — claude, then opencode, then
+    copilot — so a laptop with only OpenCode or only Copilot enriches without a
+    hand-edited config.toml. Nothing on PATH must yield a provider that reports
+    UNAVAILABLE, never the null provider: null facets would mark every session
+    as enriched and block a real summary once a CLI shows up."""
+    import os
+    from enrichment.claude_headless import ClaudeHeadless
+    from enrichment.copilot_headless import CopilotHeadless
+    from enrichment.opencode_headless import OpenCodeHeadless
+    from enrichment.provider import get_provider, resolve_provider_name
+    cfg = {"enrichment": {"provider": "auto", "opencode_headless": {"model": "x/y"}}}
+    with tempfile.TemporaryDirectory() as td:
+        bins = Path(td)
+
+        def put(name):
+            p = bins / name
+            p.write_text("#!/bin/sh\n")
+            p.chmod(0o755)
+        old = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = str(bins)
+            assert resolve_provider_name(cfg) is None
+            prov = get_provider(cfg)
+            assert prov.is_available() is False and prov.name == "auto", (prov.name, prov.is_available())
+            put("copilot")
+            assert resolve_provider_name(cfg) == "copilot-headless"
+            assert isinstance(get_provider(cfg), CopilotHeadless)
+            put("opencode")
+            prov = get_provider(cfg)
+            assert isinstance(prov, OpenCodeHeadless) and prov.model == "x/y"   # sub-config still applies
+            put("claude")
+            assert isinstance(get_provider(cfg), ClaudeHeadless)
+            # an explicit name is never second-guessed by detection
+            assert isinstance(get_provider({"enrichment": {"provider": "copilot-headless"}}), CopilotHeadless)
+            assert resolve_provider_name({"enrichment": {"provider": "none"}}) == "none"
+        finally:
+            os.environ["PATH"] = old
+    print("  ok  provider=auto resolves claude > opencode > copilot; nothing on PATH is 'unavailable', not null")
+
+
+def test_enrich_driver_skips_cleanly_when_auto_finds_no_cli():
+    """On a laptop with no summariser CLI at all, `refresh-all --enrich` must not
+    report a nightly FAILURE: provider=auto resolving to nothing is a
+    configuration state (exit 0, one clear line). An EXPLICIT provider whose
+    binary is missing stays an error (exit 1) — the user asked for that CLI."""
+    import os
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / "auto.toml").write_text('[enrichment]\nprovider = "auto"\n')
+        (tmp / "explicit.toml").write_text('[enrichment]\nprovider = "claude-headless"\n')
+        env = {**os.environ, "PATH": str(tmp / "nobins"), "HOME": str(tmp), "SB_DB": str(tmp / "r.db")}
+        script = str(_REPO / "scripts" / "enrich-sessions.py")
+        p = subprocess.run([sys.executable, script], env={**env, "SB_CONFIG": str(tmp / "auto.toml")},
+                           capture_output=True, text=True, timeout=60)
+        assert p.returncode == 0, p.stdout + p.stderr
+        assert "no summariser CLI" in p.stdout + p.stderr, p.stdout + p.stderr
+        p = subprocess.run([sys.executable, script], env={**env, "SB_CONFIG": str(tmp / "explicit.toml")},
+                           capture_output=True, text=True, timeout=60)
+        assert p.returncode == 1, p.stdout + p.stderr
+        assert "claude" in p.stdout + p.stderr
+    print("  ok  enrich driver: auto with no CLI exits 0 (skip); explicit missing binary exits 1")
+
+
 if __name__ == "__main__":
     print("Work-journal tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

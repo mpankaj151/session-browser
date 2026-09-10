@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Session Browser installer.
-#   ./install.sh [--no-hook] [--no-launchd] [--no-backfill] [--enrich] [--lite] [--opencode-plugin]
+#   ./install.sh [--no-hook] [--no-scheduler] [--no-backfill] [--enrich] [--lite] [--opencode-plugin]
 # Idempotent. Creates the venv, builds the DB, backfills, optionally registers the
-# Claude Stop hook and (macOS) launchd jobs.
+# Claude Stop hook and the background jobs (launchd on macOS, systemd --user on
+# Linux). --no-launchd is kept as an alias of --no-scheduler.
 #   --lite  skip sentence-transformers/torch (~2 GB download); semantic search
 #           falls back to keyword + full-text.
 set -euo pipefail
@@ -10,10 +11,16 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$REPO/.venv/bin/python"
 HOME_DIR="$HOME"
 LOG_DIR="$HOME/.session-browser/logs"
+# Claude Code relocates its state with CLAUDE_CONFIG_DIR; hooks/skills go there.
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# Claude-specific steps (hook, skills) only make sense where Claude Code is —
+# on an OpenCode/Codex/Copilot-only laptop they would just create ~/.claude.
+HAVE_CLAUDE=0
+if command -v claude >/dev/null 2>&1 || [ -d "$CLAUDE_DIR" ]; then HAVE_CLAUDE=1; fi
 
 NO_HOOK=0; NO_LAUNCHD=0; NO_BACKFILL=0; NO_ENRICH=1; LITE=0; OC_PLUGIN=0   # enrich off by default (uses LLM quota)
 for a in "$@"; do case "$a" in
-  --no-hook) NO_HOOK=1;; --no-launchd) NO_LAUNCHD=1;;
+  --no-hook) NO_HOOK=1;; --no-launchd|--no-scheduler) NO_LAUNCHD=1;;
   --no-backfill) NO_BACKFILL=1;; --enrich) NO_ENRICH=0;; --lite) LITE=1;;
   --opencode-plugin) OC_PLUGIN=1;;
   *) echo "unknown flag: $a"; exit 1;; esac; done
@@ -24,7 +31,13 @@ echo "==> Session Browser install ($REPO)"
 # `python3` be new: stock macOS resolves it to the Xcode CLT build (often 3.9)
 # even when a modern interpreter is installed as python3.12 — hunt for one.
 PYBOOT=""
+# An existing venv that is new enough needs no bootstrap interpreter at all —
+# re-running the installer must not fail just because python3.12 left PATH.
+if [ -x "$PY" ] && "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+  PYBOOT="$PY"
+fi
 for c in python3.13 python3.12 python3.11 python3; do
+  [ -n "$PYBOOT" ] && break
   if command -v "$c" >/dev/null 2>&1 && \
      "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
     PYBOOT="$(command -v "$c")"; break
@@ -64,8 +77,25 @@ semsearch.get_model()
 PYEOF
 fi
 
-# 2. config
-[ -f "$REPO/config.toml" ] || cp "$REPO/config.toml.example" "$REPO/config.toml"
+# 2. config — a minimal OVERRIDE file, not a copy of the example. config.toml is
+#    layered over config.toml.example at load time, so a full copy would freeze
+#    today's defaults and silently miss every source/provider a later git pull
+#    adds (this is exactly how a pre-OpenCode config hid OpenCode).
+if [ ! -f "$REPO/config.toml" ]; then
+  cat > "$REPO/config.toml" <<'EOF'
+# Per-machine overrides for Session Browser (this file is git-ignored).
+# Layered over config.toml.example: anything NOT set here keeps the example's
+# documented default, so sources and providers added by `git pull` just work.
+# Only write the keys you want to change, e.g.
+#
+# [enrichment]
+# provider = "opencode-headless"     # summarise through OpenCode on this machine
+#
+# [sources.codex]
+# enabled = false                    # never index Codex here
+EOF
+  echo "==> wrote config.toml (overrides only; defaults come from config.toml.example)"
+fi
 
 # 3. runtime dirs + schema
 mkdir -p "$LOG_DIR"
@@ -83,13 +113,18 @@ fi
 
 # 6. Stop + SessionEnd hooks (Stop = instant indexing; SessionEnd = indexing +
 #    journal-grade enrichment of the just-ended session)
-if [ "$NO_HOOK" -eq 0 ]; then
+if [ "$NO_HOOK" -eq 0 ] && [ "$HAVE_CLAUDE" -eq 0 ]; then
+  echo "==> Claude Code not detected — skipping its Stop/SessionEnd hook and skills (the watcher indexes everything)"
+fi
+if [ "$NO_HOOK" -eq 0 ] && [ "$HAVE_CLAUDE" -eq 1 ]; then
   echo "==> registering Claude Stop + SessionEnd hooks"
   "$PY" - "$REPO" <<'PYEOF' || echo "   ! hook registration failed — everything else still works (watcher covers indexing)"
-import json, sys, shutil
+import json, os, sys, shutil
 from pathlib import Path
 repo = Path(sys.argv[1])
-settings = Path.home()/".claude"/"settings.json"
+# A brand-new install has no ~/.claude yet; CLAUDE_CONFIG_DIR relocates it.
+settings = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))/"settings.json"
+settings.parent.mkdir(parents=True, exist_ok=True)
 # Back up BEFORE parsing: if the user's file is malformed we must not have
 # touched anything, and they keep a copy either way.
 if settings.exists():
@@ -97,8 +132,8 @@ if settings.exists():
 try:
     cfg = json.loads(settings.read_text()) if settings.exists() else {}
 except (json.JSONDecodeError, OSError) as e:
-    print(f"   ! ~/.claude/settings.json is not valid JSON ({e}) — skipping hook registration.")
-    print("     Fix the file, then re-run: ./install.sh --no-backfill --no-launchd")
+    print(f"   ! {settings} is not valid JSON ({e}) — skipping hook registration.")
+    print("     Fix the file, then re-run: ./install.sh --no-backfill --no-scheduler")
     sys.exit(0)
 if not isinstance(cfg, dict):
     print("   ! settings.json is not a JSON object — skipping hook registration"); sys.exit(0)
@@ -136,22 +171,24 @@ fi
 if [ "$OC_PLUGIN" -eq 1 ]; then
   echo "==> installing the OpenCode plugin"
   "$PY" "$REPO/scripts/install-opencode-plugin.py"
+elif command -v opencode >/dev/null 2>&1; then
+  echo "==> OpenCode detected: add --opencode-plugin for instant indexing (the watcher already covers it within seconds)"
 fi
 
 # 6b. Claude skills — symlink each shipped skill into ~/.claude/skills so the
 #     work-journal / snapshot / checkpoint skills are discoverable. Symlinks (not
 #     copies) so a repo update updates the skills; skill updates ride git pull.
-if [ "$NO_HOOK" -eq 0 ]; then
+if [ "$NO_HOOK" -eq 0 ] && [ "$HAVE_CLAUDE" -eq 1 ]; then
   echo "==> linking Claude skills"
-  mkdir -p "$HOME/.claude/skills"
+  mkdir -p "$CLAUDE_DIR/skills"
   for d in "$REPO"/skills/*/; do
     name="$(basename "$d")"
-    target="$HOME/.claude/skills/$name"
+    target="$CLAUDE_DIR/skills/$name"
     if [ -L "$target" ]; then
       # repoint after a repo move; no-op when already correct
       [ "$(readlink "$target")" = "${d%/}" ] || { ln -sfn "${d%/}" "$target"; echo "   repointed $name"; }
     elif [ -e "$target" ]; then
-      echo "   ! ~/.claude/skills/$name exists and is not ours — leaving it alone"
+      echo "   ! $target exists and is not ours — leaving it alone"
     else
       ln -s "${d%/}" "$target"
       echo "   linked $name"
@@ -159,45 +196,43 @@ if [ "$NO_HOOK" -eq 0 ]; then
   done
 fi
 
-# 7. launchd (macOS only; on Linux schedule watcher.py + refresh-all.py via systemd/cron)
-if [ "$(uname)" != "Darwin" ] && [ "$NO_LAUNCHD" -eq 0 ]; then
-  NO_LAUNCHD=1
-  echo "==> skipping launchd (not macOS). Schedule these yourself:"
-  echo "      watcher (live indexing):  $PY $REPO/watcher.py"
-  echo "      nightly refresh:          $PY $REPO/scripts/refresh-all.py --enrich"
-fi
+# 7. background jobs — launchd (macOS) or systemd --user (Linux). The watcher is
+#    live indexing; refresh is the nightly full pipeline (cost/reasoning/fts/
+#    embed/enrich). Both are what keep the browser current without a hand run.
 if [ "$NO_LAUNCHD" -eq 0 ]; then
-  echo "==> installing launchd jobs"
-  AGENTS="$HOME/Library/LaunchAgents"; mkdir -p "$AGENTS"
-  # launchd PATH: system dirs + Homebrew (both arches) + wherever the user's CLI
-  # binaries actually live (npm globals, volta, etc.) — enrichment shells out to
-  # `claude`, and a PATH miss silently disables it.
+  # Job PATH: system dirs + Homebrew (both arches) + wherever the user's CLI
+  # binaries actually live (npm globals, volta, nvm…) — enrichment shells out
+  # to the CLI, and a PATH miss silently disables it.
   JOB_PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$HOME_DIR/.local/bin"
   for c in claude copilot codex opencode; do
     B="$(command -v "$c" 2>/dev/null || true)"
     if [ -n "$B" ]; then D="$(dirname "$B")"; case ":$JOB_PATH:" in *":$D:"*) ;; *) JOB_PATH="$JOB_PATH:$D";; esac; fi
   done
-  # watcher = live indexing; refresh = nightly full pipeline (cost/reasoning/fts/embed/enrich)
-  # Rendered in Python, not sed: paths containing &, <, > or sed metacharacters
-  # would otherwise produce malformed plist XML and abort the install half-done.
-  for job in watcher refresh; do
-    SB_TEMPLATE="$REPO/launchd/$job.plist.template" \
-    SB_DEST="$AGENTS/com.sessionbrowser.$job.plist" \
-    SB_VENV_PY="$PY" SB_REPO="$REPO" SB_LOG_DIR="$LOG_DIR" \
-    SB_HOME_DIR="$HOME_DIR" SB_JOB_PATH="$JOB_PATH" \
-    "$PY" - <<'PYEOF'
-import os
-from xml.sax.saxutils import escape
-tpl = open(os.environ["SB_TEMPLATE"], encoding="utf-8").read()
-for marker, env in (("__VENV_PY__", "SB_VENV_PY"), ("__REPO__", "SB_REPO"),
-                    ("__LOG_DIR__", "SB_LOG_DIR"), ("__HOME__", "SB_HOME_DIR"),
-                    ("__PATH__", "SB_JOB_PATH")):
-    tpl = tpl.replace(marker, escape(os.environ[env]))
-open(os.environ["SB_DEST"], "w", encoding="utf-8").write(tpl)
-PYEOF
-    launchctl unload "$AGENTS/com.sessionbrowser.$job.plist" 2>/dev/null || true
-    launchctl load "$AGENTS/com.sessionbrowser.$job.plist"
-  done
+  export SB_VENV_PY="$PY" SB_REPO="$REPO" SB_LOG_DIR="$LOG_DIR" SB_HOME_DIR="$HOME_DIR" SB_JOB_PATH="$JOB_PATH"
+  if [ "$(uname)" = "Darwin" ]; then
+    echo "==> installing launchd jobs"
+    AGENTS="$HOME/Library/LaunchAgents"; mkdir -p "$AGENTS"
+    for job in watcher refresh; do
+      "$PY" "$REPO/scripts/render-job.py" "$REPO/launchd/$job.plist.template" \
+        "$AGENTS/com.sessionbrowser.$job.plist" --format plist
+      launchctl unload "$AGENTS/com.sessionbrowser.$job.plist" 2>/dev/null || true
+      launchctl load "$AGENTS/com.sessionbrowser.$job.plist"
+    done
+  elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    echo "==> installing systemd --user units"
+    UNITS="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; mkdir -p "$UNITS"
+    for u in session-browser-watcher.service session-browser-refresh.service session-browser-refresh.timer; do
+      "$PY" "$REPO/scripts/render-job.py" "$REPO/systemd/$u.template" "$UNITS/$u" --format systemd
+    done
+    systemctl --user daemon-reload
+    systemctl --user enable --now session-browser-watcher.service session-browser-refresh.timer \
+      || echo "   ! could not enable the units — check: systemctl --user status session-browser-watcher"
+    echo "   (units run while you are logged in; to keep them after logout: loginctl enable-linger $USER)"
+  else
+    echo "==> no launchd / systemd --user session here. Schedule these yourself (docs/SETUP.md §5):"
+    echo "      watcher (live indexing):  $PY $REPO/watcher.py"
+    echo "      nightly refresh:          $PY $REPO/scripts/refresh-all.py --enrich"
+  fi
 fi
 
 printf '\n\033[1;32m✓ Session Browser installed.\033[0m\n\n'

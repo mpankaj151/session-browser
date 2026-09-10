@@ -22,16 +22,48 @@ def _expand(p: str) -> Path:
     return Path(os.path.expanduser(p)).resolve()
 
 
-def load_config() -> dict[str, Any]:
-    """Load config.toml (or the .example if no real config exists yet)."""
-    cfg_path = _REPO_ROOT / "config.toml"
-    if not cfg_path.exists():
-        cfg_path = _REPO_ROOT / "config.toml.example"
-    with open(cfg_path, "rb") as fh:
+def _deep_merge(base: dict, override: dict) -> dict:
+    """base with override's keys applied; nested tables merge, everything else replaces."""
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _load_toml(path: Path) -> dict[str, Any]:
+    with open(path, "rb") as fh:
         return tomllib.load(fh)
 
 
+def config_path() -> Path:
+    """The per-machine override file: $SB_CONFIG, else <repo>/config.toml."""
+    env = os.environ.get("SB_CONFIG")
+    return Path(os.path.expanduser(env)) if env else _REPO_ROOT / "config.toml"
+
+
+def load_config(path: Path | str | None = None, defaults: Path | str | None = None) -> dict[str, Any]:
+    """config.toml LAYERED over config.toml.example.
+
+    The example is the complete, documented default set; config.toml holds a
+    machine's overrides. Any section or key the override omits inherits the
+    example's value, so a config.toml written before a source or enrichment
+    provider existed keeps working after `git pull` instead of silently
+    dropping the new [sources.<cli>] block. Switch a source off explicitly with
+    `enabled = false` — deleting its block no longer does that.
+    """
+    defaults_path = Path(defaults) if defaults else _REPO_ROOT / "config.toml.example"
+    cfg = _load_toml(defaults_path) if defaults_path.exists() else {}
+    override_path = Path(os.path.expanduser(str(path))) if path else config_path()
+    if override_path.exists():
+        cfg = _deep_merge(cfg, _load_toml(override_path))
+    return cfg
+
+
 CONFIG = load_config()
+CONFIG_PATH = config_path()
 
 REPO_ROOT = _REPO_ROOT
 
@@ -40,7 +72,7 @@ REPO_ROOT = _REPO_ROOT
 # degrade to the documented default, not KeyError every tool at import time.
 _PATHS = CONFIG.get("paths", {})
 _NEW_DB = _expand(_PATHS.get("db", "~/.session-browser/registry.db"))
-_OLD_DB = Path.home() / ".claude" / "session-registry.db"
+_OLD_DB = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")) / "session-registry.db"
 # SB_DB env override wins over everything — used by `sb demo` to point the whole
 # stack at a throwaway seeded database without touching the real registry.
 _ENV_DB = os.environ.get("SB_DB")

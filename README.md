@@ -95,7 +95,7 @@ Also available in the terminal: `sb stats` (today / 7d / 30d / all).
 
 The one-line summaries, topic tags, and session-type/outcome labels on the cards
 are written by an LLM through your **own** CLI (`claude --print`, `copilot`, or
-`opencode run` — pick per machine with `[enrichment].provider`) — no API key, but
+`opencode run` — `[enrichment].provider` is `auto`: whichever is on PATH; pin one per machine) — no API key, but
 it spends your plan's quota. So it's split by cost:
 
 - **Your existing history is NOT enriched at install** (that could be hundreds of
@@ -194,12 +194,12 @@ generated from the journal, never by re-reading months of transcripts.
 - **OpenCode plugin** (opt-in: `./install.sh --opencode-plugin`) does the same
   for OpenCode — indexes a session the moment a turn settles, re-syncs on
   deletion so the row lands in the Archived tab.
-- **Watcher** (launchd daemon) catches Copilot/Codex/OpenCode and anything else
+- **Watcher** (launchd on macOS, systemd --user on Linux) catches Copilot/Codex/OpenCode and anything else
   via filesystem events (for OpenCode: writes to its database).
 - **Nightly refresh** (01:00) runs the full pipeline: costs, reasoning, full-text,
   embeddings, LLM journals for anything the hooks missed, daily digests.
 
-macOS wires these via launchd automatically; Linux uses systemd/cron (commands in
+macOS wires these via launchd, Linux via systemd --user units — both installed by `install.sh` (details in
 [docs/SETUP.md](docs/SETUP.md)).
 
 ## Supported CLIs

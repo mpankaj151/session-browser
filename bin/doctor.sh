@@ -45,10 +45,11 @@ except Exception as ex:
 PYEOF
 
 echo "[resume sync]"
-"$PY" - <<'PYEOF'
-import os, collections
+"$PY" - "$REPO" <<'PYEOF'
+import collections, sys; sys.path.insert(0, sys.argv[1])
 from pathlib import Path
-proj = Path.home()/".claude"/"projects"
+from sources.registry import _make_claude
+proj = _make_claude().projects_dir          # honours $CLAUDE_CONFIG_DIR
 real = collections.defaultdict(list)   # session_id -> [dirs] for REAL files
 links = 0
 if proj.exists():
@@ -73,37 +74,47 @@ echo "[sources]"
 import sys; sys.path.insert(0, sys.argv[1])
 from sources.registry import build_source_registry
 for name,a in build_source_registry().items():
-    avail=a.is_available()
+    avail=a.is_available()          # transcripts on disk (indexing never needs the binary)
+    hb=getattr(a, "has_binary", None)
+    binary="" if hb is None else (" · binary on PATH" if hb() else " · binary NOT on PATH (resume/bridge from this shell will fail)")
     mark="\033[32m✓\033[0m" if avail else "\033[33m∼\033[0m"
-    print(f"  {mark} {name}: {'available' if avail else 'binary/dir missing'}")
+    print(f"  {mark} {name}: {'transcripts found' if avail else 'no transcripts yet (nothing to index)'}{binary}")
 PYEOF
 
 echo "[enrichment]"
 "$PY" - "$REPO" <<'PYEOF'
 import shutil, sys; sys.path.insert(0, sys.argv[1])
 import sbconfig
-cfg = sbconfig.CONFIG.get("enrichment", {})
-name = cfg.get("provider", "none")
-sub = cfg.get(name.replace("-", "_"), {}) if isinstance(name, str) else {}
-binary = sub.get("binary", {"claude-headless": "claude", "copilot-headless": "copilot",
-                            "opencode-headless": "opencode"}.get(name, ""))
-model = sub.get("model", "anthropic/claude-sonnet-5" if name == "opencode-headless"
-                else "claude-sonnet-5" if name == "claude-headless" else "")
-if name in ("none", "null"):
+from enrichment.provider import _PROVIDERS, get_provider, resolve_provider_name
+configured = sbconfig.CONFIG.get("enrichment", {}).get("provider", "auto")
+name = resolve_provider_name(sbconfig.CONFIG)
+label = f"{configured} -> {name}" if configured == "auto" and name else str(configured)
+if name is None:
+    print("  \033[33m∼\033[0m provider: auto found no summariser CLI on PATH (claude / opencode / copilot) — "
+          "enrichment is skipped; install one or set [enrichment].provider")
+elif name == "none":
     print("  \033[33m∼\033[0m provider: none (no LLM summaries)")
-elif name not in ("claude-headless", "copilot-headless", "opencode-headless"):
+elif name not in _PROVIDERS:
     print(f"  \033[31m✗\033[0m provider: {name!r} is not a known provider — summaries will be empty")
 else:
+    prov = get_provider(sbconfig.CONFIG)
+    binary = getattr(prov, "binary", _PROVIDERS[name][2])
+    model = getattr(prov, "model", "")
     have = shutil.which(binary) is not None
     mark = "\033[32m✓\033[0m" if have else "\033[31m✗\033[0m"
-    print(f"  {mark} provider: {name}  model: {model or '(CLI default)'}  binary: {binary} "
+    print(f"  {mark} provider: {label}  model: {model or '(CLI default)'}  binary: {binary} "
           f"{'found' if have else 'NOT on PATH'}")
 PYEOF
 
 echo "[hook]"
-SETTINGS="$HOME/.claude/settings.json"
-if grep -q "session-hook.py" "$SETTINGS" 2>/dev/null; then ok "Stop hook registered"; else
-  printf "  \033[33m∼\033[0m Stop hook NOT registered (live indexing still works via watcher)\n"; fi
+SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+if grep -q "session-hook.py" "$SETTINGS" 2>/dev/null; then ok "Claude Stop hook registered"; else
+  if command -v claude >/dev/null 2>&1; then
+    printf "  \033[33m∼\033[0m Claude Stop hook NOT registered (live indexing still works via watcher; ./install.sh --no-backfill --no-scheduler)\n"
+  else
+    printf "  \033[33m∼\033[0m Claude Code not installed here — no Stop hook needed\n"
+  fi
+fi
 OCP_STATUS="$("$PY" "$REPO/scripts/install-opencode-plugin.py" --status 2>/dev/null || echo "unknown")"
 case "$OCP_STATUS" in
   installed) ok "OpenCode plugin installed";;
@@ -112,17 +123,33 @@ case "$OCP_STATUS" in
 esac
 
 echo "[watcher / ui]"
-# Capture once; grep against a here-string so `grep -q` closing early can't
-# SIGPIPE launchctl and trip pipefail (which would falsely report "not loaded").
-JOBS="$(launchctl list 2>/dev/null || true)"
-if grep -q sessionbrowser.watcher <<< "$JOBS"; then ok "watcher launchd job loaded"; else
-  printf "  \033[33m∼\033[0m watcher launchd job not loaded\n"; fi
-if grep -q sessionbrowser.refresh <<< "$JOBS"; then ok "nightly refresh job loaded"; else
-  printf "  \033[33m∼\033[0m nightly refresh job not loaded (run refresh-all.py manually to update)\n"; fi
+# One line per background job, phrased for the scheduler this OS actually has.
+if [ "$(uname)" = "Darwin" ]; then
+  # Capture once; grep against a here-string so `grep -q` closing early can't
+  # SIGPIPE launchctl and trip pipefail (which would falsely report "not loaded").
+  JOBS="$(launchctl list 2>/dev/null || true)"
+  if grep -q sessionbrowser.watcher <<< "$JOBS"; then ok "watcher launchd job loaded"; else
+    printf "  \033[33m∼\033[0m watcher launchd job not loaded (./install.sh --no-backfill)\n"; fi
+  if grep -q sessionbrowser.refresh <<< "$JOBS"; then ok "nightly refresh job loaded"; else
+    printf "  \033[33m∼\033[0m nightly refresh job not loaded (run refresh-all.py manually to update)\n"; fi
+elif command -v systemctl >/dev/null 2>&1; then
+  if systemctl --user is-active --quiet session-browser-watcher.service 2>/dev/null; then ok "watcher systemd --user unit active"; else
+    printf "  \033[33m∼\033[0m watcher systemd --user unit not active (docs/SETUP.md §5)\n"; fi
+  if systemctl --user is-active --quiet session-browser-refresh.timer 2>/dev/null; then ok "nightly refresh systemd timer active"; else
+    printf "  \033[33m∼\033[0m nightly refresh systemd timer not active (docs/SETUP.md §5; or run refresh-all.py manually)\n"; fi
+else
+  printf "  \033[33m∼\033[0m no launchd/systemd here — run watcher.py and scripts/refresh-all.py yourself (docs/SETUP.md §5)\n"
+fi
+# Is something listening on the UI port? lsof is not a given on Linux.
+port_held() {
+  if command -v lsof >/dev/null 2>&1; then lsof -ti tcp:7655 >/dev/null 2>&1
+  elif command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | grep -q ':7655 '
+  else return 1; fi
+}
 # --max-time: a wedged/suspended process holding the port accepts the TCP
 # connect but never answers — without a deadline this health check hangs forever.
 if curl -s --max-time 3 localhost:7655/health >/dev/null 2>&1; then ok "UI responding on :7655"; else
-  if lsof -ti tcp:7655 >/dev/null 2>&1; then
+  if port_held; then
     printf "  \033[31m✗\033[0m :7655 is held by a process that isn't answering — try: sb stop, then sb ui\n"
   else
     printf "  \033[33m∼\033[0m UI not running (start with: sb ui)\n"

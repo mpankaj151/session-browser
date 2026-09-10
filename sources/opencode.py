@@ -48,6 +48,15 @@ from typing import Iterator, Optional
 
 from .base import ParsedSession, SessionHeader, Turn, to_iso_utc
 
+# Sidecar left beside a restored mirror file until OpenCode holds the session again.
+_RESTORED = ".restored"
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 _XDG = os.environ.get("XDG_DATA_HOME")
 DATA_DIR = (Path(_XDG) if _XDG else Path.home() / ".local" / "share") / "opencode"
 MIRROR_DIR = Path(os.path.expanduser("~/.session-browser/opencode-mirror"))
@@ -488,9 +497,19 @@ class OpenCodeSource:
         session: hand it to the archiver first, unlink only if that succeeded.
         The unlink is what the watcher turns into archived=transcript-missing."""
         from dataclasses import asdict
+        # A restore that could not (yet) re-import leaves <file>.restored beside
+        # the mirror file: OpenCode does not have that session, but the user
+        # deliberately put it back — deleting it here would un-restore it on
+        # the next WAL write. The marker goes once the session is in the DB.
+        for marker in self.mirror_dir.glob("ses_*.jsonl" + _RESTORED):
+            if marker.name[:-len(".jsonl" + _RESTORED)] in live_roots:
+                marker.unlink(missing_ok=True)
         for path in sorted(self.mirror_dir.glob("ses_*.jsonl")):
             sid = path.stem
             if not _SID.match(sid) or sid in live_roots:
+                continue
+            if path.with_name(path.name + _RESTORED).exists():
+                report.skipped += 1
                 continue
             header = self.parse_header(path)
             hdr = asdict(header) if header is not None else {"session_id": sid, "last_activity": ""}
@@ -621,7 +640,13 @@ class OpenCodeSource:
     # -- watcher hooks -------------------------------------------------------------
     def watch_roots(self) -> list[Path]:
         """The mirror (session files → the ordinary handler) and the data dir
-        (DB/WAL writes → sync_trigger)."""
+        (DB/WAL writes → sync_trigger). The mirror is our own directory, so it
+        is created here: a watcher started before the first sync must be able
+        to subscribe to it, or the files that sync writes go unseen."""
+        try:
+            self.mirror_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         return [self.mirror_dir, self.data_dir]
 
     def sync_trigger(self, path: Path) -> bool:
@@ -648,6 +673,19 @@ class OpenCodeSource:
         session to the directory it runs in, so it runs in the session's own
         directory ($HOME when that is gone). Idempotent upstream, but sessions
         still present are skipped. None = disabled by config."""
+        # Mark first: until OpenCode holds the session again, sync() must not
+        # treat this mirror file as "deleted in OpenCode" (see _remove_deleted).
+        marker = path.with_name(path.name + _RESTORED)
+        try:
+            marker.write_text(_now_iso(), encoding="utf-8")
+        except OSError:
+            pass
+        ok, detail = self._reimport(path)
+        if ok is True:
+            marker.unlink(missing_ok=True)
+        return ok, detail
+
+    def _reimport(self, path: Path) -> tuple[bool | None, str]:
         if not self.reimport_on_restore:
             return None, "re-import into OpenCode disabled ([sources.opencode] reimport_on_restore = false)"
         docs = to_export_docs(path)
@@ -657,20 +695,27 @@ class OpenCodeSource:
         todo = [d for d in docs if d["info"]["id"] not in existing]
         if not todo:
             return True, "already present in OpenCode — nothing to re-import"
-        directory = Path(docs[0]["info"].get("directory") or "")
-        cwd = directory if directory.is_dir() else Path.home()
-        note = "" if cwd == directory else f" (original directory {directory} is gone; imported from {cwd})"
-        import tempfile
+        # Path("") is Path(".") and "." is a directory: an empty recorded
+        # directory used to re-home the session into the UI's own cwd, silently.
+        raw_dir = docs[0]["info"].get("directory") or ""
+        directory = Path(raw_dir) if raw_dir else None
+        cwd = directory if directory is not None and directory.is_dir() else Path.home()
+        note = ("" if directory is not None and cwd == directory else
+                f" (original directory {raw_dir or '(none recorded)'} is gone; imported from {cwd})")
+        # Export docs live under the mirror, not a temp dir: a failure message
+        # that says "run: opencode import <file>" must name a file that exists.
+        export_dir = self.mirror_dir / ".reimport"
+        export_dir.mkdir(parents=True, exist_ok=True)
         done = 0
-        with tempfile.TemporaryDirectory() as td:
-            for doc in todo:
-                f = Path(td) / f"{doc['info']['id']}.json"
-                f.write_text(json.dumps(doc), encoding="utf-8")
-                ok, detail = self._run_import(f, cwd)
-                if not ok:
-                    return False, (f"opencode import failed for {doc['info']['id']} "
-                                   f"({done} of {len(todo)} imported): {detail}")
-                done += 1
+        for doc in todo:
+            f = export_dir / f"{doc['info']['id']}.json"
+            f.write_text(json.dumps(doc), encoding="utf-8")
+            ok, detail = self._run_import(f, cwd)
+            if not ok:
+                return False, (f"opencode import failed for {doc['info']['id']} "
+                               f"({done} of {len(todo)} imported): {detail}")
+            f.unlink(missing_ok=True)
+            done += 1
         return True, f"re-imported {done} session(s) into OpenCode{note}"
 
     def _run_import(self, file: Path, cwd: Path) -> tuple[bool, str]:

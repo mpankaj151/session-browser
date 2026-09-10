@@ -52,15 +52,22 @@ def _log(msg: str) -> None:
     print(line, end="")
 
 
+# How often the watcher re-checks for source directories that did not exist
+# when it started (a CLI installed or first run after us).
+ROOT_POLL_S = 30
+
+
 def _build_watch_pairs() -> list[tuple[Path, object]]:
-    """(directory, adapter) pairs for every available source.
+    """(directory, adapter) pairs for every ENABLED source — existing or not.
 
     An adapter may own more than one root — codex spreads live and archived
     rollouts across two sibling trees — so it gets to declare them via an
     optional watch_roots(). Sources without one keep the single configured dir.
+    Existence is not checked here: _RootScheduler subscribes each root the
+    moment it appears, so a CLI first run after the watcher started is covered.
     """
     pairs = []
-    for name, adapter in build_source_registry(only_available=True).items():
+    for name, adapter in build_source_registry().items():
         roots = getattr(adapter, "watch_roots", None)
         if callable(roots):
             pairs.extend((Path(d).expanduser(), adapter) for d in roots())
@@ -84,6 +91,42 @@ def _is_representation_change(path: Path) -> bool:
     name = str(path)
     twin = name[:-4] if name.endswith(".zst") else name + ".zst"
     return Path(twin).exists()
+
+
+class _RootScheduler:
+    """Subscribes each (root, adapter) pair once its directory exists and keeps
+    retrying the rest. Missing roots used to be skipped for the life of the
+    process, and a watcher that found none exited 0 — which launchd (KeepAlive
+    on failure only) never restarts, so a laptop that installed Session Browser
+    before its first CLI session watched nothing until the next login."""
+
+    def __init__(self, observer, pairs, log=None):
+        self.observer = observer
+        self.pending = list(pairs)
+        self.scheduled: list[tuple[Path, object]] = []
+        self._log = log or _log
+
+    def poll(self) -> list[Path]:
+        import errno
+        newly: list[Path] = []
+        for directory, adapter in list(self.pending):
+            if not directory.is_dir():
+                continue
+            try:
+                self.observer.schedule(_Handler(adapter), str(directory), recursive=True)
+            except OSError as e:
+                # Linux: one inotify watch per directory; past
+                # fs.inotify.max_user_watches watchdog raises ENOSPC. Keep the
+                # root pending and retry rather than take the daemon down.
+                hint = (" — raise the limit: sudo sysctl fs.inotify.max_user_watches=524288"
+                        if e.errno == errno.ENOSPC else "")
+                self._log(f"cannot watch [{adapter.name}] {directory}: {e}{hint}; retrying in {ROOT_POLL_S}s")
+                continue
+            self.pending.remove((directory, adapter))
+            self.scheduled.append((directory, adapter))
+            newly.append(directory)
+            self._log(f"watching [{adapter.name}] {directory}")
+        return newly
 
 
 class _Handler(FileSystemEventHandler):
@@ -196,19 +239,21 @@ class _Handler(FileSystemEventHandler):
             # different project dir — archiving on it would hide a live session.
             conn = indexer.connect()
             try:
-                row = conn.execute(
-                    "SELECT project_path FROM sessions WHERE session_id = ?", (sid,)
-                ).fetchone()
+                row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (sid,)).fetchone()
                 canonical_dir = row["project_path"] if row else None
             finally:
                 conn.close()
             if canonical_dir is not None and Path(canonical_dir) != path.parent:
                 _log(f"skip archive (non-canonical copy deleted) {sid}")
                 return
-            # Proven above: the path that vanished IS the canonical transcript,
-            # so this is a real session aged out — keep it visible as such.
-            indexer.archive(sid, indexer.TRANSCRIPT_MISSING)
-            _log(f"archive [{self.adapter.name}] {sid} ({indexer.TRANSCRIPT_MISSING})")
+            # Proven above: the path that vanished IS the canonical transcript.
+            # The same rule prune-sessions applies decides whether it was a
+            # real session (kept visible, restorable) or sidechain noise — the
+            # two paths used to disagree, so WHICH process saw the deletion
+            # decided whether a session stayed browsable.
+            reason = indexer.infer_archive_reason(row) if row is not None else indexer.TRANSCRIPT_MISSING
+            indexer.archive(sid, reason)
+            _log(f"archive [{self.adapter.name}] {sid} ({reason})")
         except Exception as e:  # noqa: BLE001
             _log(f"archive error {sid}: {e}")
 
@@ -239,17 +284,22 @@ def main() -> None:
         return
     pairs = _build_watch_pairs()
     if not pairs:
-        _log("no available sources to watch; exiting")
+        _log("no sources enabled in config; exiting")
         return
     observer = Observer()
-    for directory, adapter in pairs:
-        if directory.exists():
-            observer.schedule(_Handler(adapter), str(directory), recursive=True)
-            _log(f"watching [{adapter.name}] {directory}")
+    roots = _RootScheduler(observer, pairs)
+    roots.poll()
+    if not roots.scheduled:
+        _log(f"no source directory exists yet ({len(roots.pending)} pending) — "
+             f"waiting for the first one to appear, re-checking every {ROOT_POLL_S}s")
     observer.start()
     try:
+        tick = 0
         while True:
             time.sleep(1)
+            tick += 1
+            if roots.pending and tick % ROOT_POLL_S == 0:
+                roots.poll()
     except KeyboardInterrupt:
         observer.stop()
     observer.join()

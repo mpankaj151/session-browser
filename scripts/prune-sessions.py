@@ -73,10 +73,8 @@ def main() -> None:
 
     conn = indexer.connect()
     try:
-        rows = conn.execute(
-            "SELECT session_id, cli_source, folder_name, turn_count, last_activity, "
-            f"first_message FROM sessions WHERE {indexer.LIVE}"
-        ).fetchall()
+        # Whole rows: infer_archive_reason weighs tokens/model/summary/trail too.
+        rows = conn.execute(f"SELECT * FROM sessions WHERE {indexer.LIVE}").fetchall()
 
         # Only prune rows belonging to a source we can actually see right now; a
         # disabled/unavailable CLI must never have its history archived wholesale.
