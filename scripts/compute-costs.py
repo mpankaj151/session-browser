@@ -106,10 +106,14 @@ def _usage_codex(path: Path) -> tuple[dict, dict]:
             for line in fh:
                 if '"model"' in line and not model:
                     try:
-                        p = json.loads(line).get("payload", {})
-                        if isinstance(p, dict) and p.get("type") == "turn_context":
+                        rec = json.loads(line)
+                        p = rec.get("payload", {}) if isinstance(rec, dict) else {}
+                        # Current rollouts write turn_context as the RECORD type
+                        # (payload = {model, cwd, ...}); older ones nest it as
+                        # payload.type. The adapter accepts both — so must this.
+                        if isinstance(p, dict) and "turn_context" in (rec.get("type"), p.get("type")):
                             model = p.get("model", "") or ""
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, AttributeError):
                         pass
                 if "token_count" not in line:
                     continue
@@ -133,7 +137,9 @@ def _usage_codex(path: Path) -> tuple[dict, dict]:
     }
     for k, v in mapped.items():
         totals[k] += v
-        per_model[model or "gpt-5"][k] += v
+        # No turn_context at all: leave the key empty so process() prices it via
+        # the adapter's model_used or reports it unknown — never a silent guess.
+        per_model[model][k] += v
     return totals, per_model
 
 
@@ -183,6 +189,9 @@ def process(path: Path, adapter, conn) -> dict | None:
     res = extractor(path)
     totals, per_model = res[0], res[1]
     authoritative = res[2] if len(res) > 2 else None
+    # An extractor that found tokens but no model name leaves the key empty;
+    # the adapter's model_used is the authority (never a silent tier guess).
+    per_model = {(m or header.model_used or ""): t for m, t in per_model.items()}
     if not per_model:
         return None
     if authoritative is not None:

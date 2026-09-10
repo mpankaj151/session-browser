@@ -3102,6 +3102,35 @@ def test_pricing_matches_published_claude_list_prices():
     print("  ok  pricing.json matches the published Claude + OpenAI list prices")
 
 
+# --- Codex cost extractor reads the model from a top-level turn_context ------
+def test_codex_cost_extractor_reads_model_from_top_level_turn_context():
+    """Real rollouts write turn_context as the RECORD type ({"type":
+    "turn_context", "payload": {"model": "gpt-5.5", ...}}); the adapter reads it
+    there, so rows say gpt-5.5, but the cost extractor only looked for
+    payload.type == "turn_context", never saw a model, and silently billed every
+    Codex session at its "gpt-5" fallback tier. Both spellings must resolve."""
+    cc = _load_script("compute-costs")
+    usage = {"type": "token_count", "info": {"total_token_usage": {
+        "input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 250,
+        "reasoning_output_tokens": 0}}}
+    meta = {"timestamp": "2026-08-01T10:00:00Z", "type": "session_meta",
+            "payload": {"id": _CX_ID, "timestamp": "2026-08-01T10:00:00Z", "cwd": "/x",
+                        "cli_version": "0.150.1", "model_provider": "openai"}}
+    top_level = [meta,
+                 {"timestamp": "2026-08-01T10:00:01Z", "type": "turn_context",
+                  "payload": {"cwd": "/x", "model": "gpt-5.5", "approval_policy": "never"}},
+                 _cx_line(3, usage)]
+    in_payload = [meta, _cx_line(2, {"type": "turn_context", "model": "gpt-5.5"}), _cx_line(3, usage)]
+    with tempfile.TemporaryDirectory() as td:
+        for label, recs in (("top-level", top_level), ("payload.type", in_payload)):
+            p = Path(td) / f"{label}.jsonl"
+            p.write_text("".join(json.dumps(r) + "\n" for r in recs))
+            totals, per_model = cc._usage_codex(p)
+            assert totals["input"] == 600 and totals["cache_read"] == 400, totals
+            assert list(per_model) == ["gpt-5.5"], (label, dict(per_model))
+    print("  ok  codex cost extractor attributes tokens to the rollout's real model (both dialects)")
+
+
 if __name__ == "__main__":
     print("Session Browser smoke + regression tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
