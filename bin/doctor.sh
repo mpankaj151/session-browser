@@ -82,6 +82,12 @@ echo "[hook]"
 SETTINGS="$HOME/.claude/settings.json"
 if grep -q "session-hook.py" "$SETTINGS" 2>/dev/null; then ok "Stop hook registered"; else
   printf "  \033[33m∼\033[0m Stop hook NOT registered (live indexing still works via watcher)\n"; fi
+OCP_STATUS="$("$PY" "$REPO/scripts/install-opencode-plugin.py" --status 2>/dev/null || echo "unknown")"
+case "$OCP_STATUS" in
+  installed) ok "OpenCode plugin installed";;
+  stale*) printf "  \033[31m✗\033[0m OpenCode plugin %s\n" "$OCP_STATUS";;
+  *) printf "  \033[33m∼\033[0m OpenCode plugin not installed (./install.sh --opencode-plugin; the watcher covers OpenCode within seconds)\n";;
+esac
 
 echo "[watcher / ui]"
 # Capture once; grep against a here-string so `grep -q` closing early can't

@@ -190,8 +190,11 @@ generated from the journal, never by re-reading months of transcripts.
   (always exits 0 — it can never block your session).
 - **SessionEnd hook** additionally journals the ended session (detached; a
   re-fire with no new activity costs nothing).
-- **Watcher** (launchd daemon) catches Copilot/Codex and anything else via
-  filesystem events.
+- **OpenCode plugin** (opt-in: `./install.sh --opencode-plugin`) does the same
+  for OpenCode — indexes a session the moment a turn settles, re-syncs on
+  deletion so the row lands in the Archived tab.
+- **Watcher** (launchd daemon) catches Copilot/Codex/OpenCode and anything else
+  via filesystem events (for OpenCode: writes to its database).
 - **Nightly refresh** (01:00) runs the full pipeline: costs, reasoning, full-text,
   embeddings, LLM journals for anything the hooks missed, daily digests.
 

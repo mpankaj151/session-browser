@@ -2144,6 +2144,88 @@ def test_watcher_delete_event_for_existing_file_is_a_replace():
     print("  ok  watcher: delete event on a still-existing path is a replace, not a deletion")
 
 
+# --- phase C: OpenCode plugin hook --------------------------------------------
+def test_opencode_hook_resolves_child_to_root_and_syncs_only_it():
+    """session.idle fires for child sessions too; the hook resolves the ROOT
+    (read-only parent_id walk), re-projects only that root, indexes it, marks
+    the race-guard so the watcher skips the same file, and returns the root.
+    --deleted re-syncs so the mirror file goes and the row gets archived."""
+    import hookstate
+    import sbconfig
+    hook = _load_script("opencode-hook")
+    old_state, old_archive = sbconfig.HOOK_STATE, reasoning.ARCHIVE
+    conn = _temp_db()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sbconfig.HOOK_STATE = root / "hook-state.json"
+            reasoning.ARCHIVE = root / "archive"
+            src = _oc_source(root)
+            assert hook.run("ses_doesnotexist000000000000", adapter=src, conn=conn, spawn=False) is None
+            assert not src.mirror_dir.exists()
+            out = hook.run(_OC_CHILD, adapter=src, conn=conn, spawn=False)
+            assert out == _OC_ROOT, out
+            assert [p.name for p in src.mirror_dir.glob("ses_*.jsonl")] == [f"{_OC_ROOT}.jsonl"]
+            row = conn.execute("SELECT turn_count, archived FROM sessions WHERE session_id=?", (_OC_ROOT,)).fetchone()
+            assert row is not None and row["turn_count"] == 2 and row["archived"] == 0
+            assert hookstate.recently(_OC_ROOT) and not hookstate.recently(_OC_CHILD)
+            _oc_wipe(src.db_path)
+            assert hook.run(_OC_ROOT, adapter=src, conn=conn, deleted=True, spawn=False) is None
+            assert not (src.mirror_dir / f"{_OC_ROOT}.jsonl").exists()
+            assert reasoning.find_archived_raw(_OC_ROOT) is not None       # archived before unlink
+    finally:
+        sbconfig.HOOK_STATE, reasoning.ARCHIVE = old_state, old_archive
+        conn.close()
+    print("  ok  opencode-hook: child -> root, sync only it, upsert, race-guard; --deleted re-syncs")
+
+
+def test_opencode_hook_always_exits_zero():
+    """Same contract as the Claude Stop hook: whatever happens (bad id, no DB,
+    broken config), the process exits 0 — it must never surface as an error
+    inside OpenCode."""
+    import os
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        env = {**os.environ, "SB_DB": str(Path(td) / "reg.db"), "XDG_DATA_HOME": str(Path(td) / "nodata"),
+               "HOME": td}
+        for argv in (["garbage"], [], ["ses_x", "--deleted"], ["--nonsense"]):
+            p = subprocess.run([sys.executable, str(_REPO / "scripts" / "opencode-hook.py"), *argv],
+                               capture_output=True, text=True, env=env, timeout=60)
+            assert p.returncode == 0, (argv, p.stderr[-300:])
+    print("  ok  opencode-hook exits 0 on every failure path")
+
+
+def test_opencode_plugin_template_renders_and_installs():
+    """The plugin is rendered from a template with the venv python and hook
+    paths baked in, installed to <config>/opencode/plugins/session-browser.js
+    (auto-loaded for every project, no opencode.json edit), removable, and
+    reported stale when the repo moved."""
+    import shutil
+    import subprocess
+    inst = _load_script("install-opencode-plugin")
+    js = inst.render(repo=_REPO, python=Path(sys.executable))
+    assert "__" not in js.replace("__proto__", ""), "unrendered placeholder"
+    assert "session.idle" in js and "session.deleted" in js and "--deleted" in js
+    assert str(_REPO / "scripts" / "opencode-hook.py") in js and str(sys.executable) in js
+    assert "unref()" in js and "try" in js
+    if shutil.which("node"):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "p.mjs"
+            f.write_text(js)
+            assert subprocess.run(["node", "--check", str(f)], capture_output=True).returncode == 0
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "opencode"
+        assert inst.status(config_dir=cfg) == "not installed"
+        dest = inst.install(config_dir=cfg, repo=_REPO, python=Path(sys.executable))
+        assert dest == cfg / "plugins" / "session-browser.js" and dest.read_text() == js
+        assert inst.status(config_dir=cfg, repo=_REPO, python=Path(sys.executable)) == "installed"
+        assert inst.status(config_dir=cfg, repo=Path("/moved/elsewhere"), python=Path(sys.executable)).startswith("stale")
+        assert inst.install(config_dir=cfg, repo=_REPO, python=Path(sys.executable)) == dest   # idempotent
+        assert inst.uninstall(config_dir=cfg) is True and not dest.exists()
+        assert inst.uninstall(config_dir=cfg) is False
+    print("  ok  opencode plugin: renders, node-checks, installs/uninstalls, stale detection")
+
+
 if __name__ == "__main__":
     print("Session Browser smoke + regression tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

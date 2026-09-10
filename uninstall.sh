@@ -49,6 +49,10 @@ for d in "$REPO"/skills/*/; do
   fi
 done
 
+echo "==> removing the OpenCode plugin (if installed)"
+OCP="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/session-browser.js"
+if [ -f "$OCP" ]; then rm -f "$OCP" && echo "   removed $OCP"; fi
+
 echo "==> removing cr/sb shell functions"
 for RC in "$HOME/.zshrc" "$HOME/.bashrc"; do
   [ -f "$RC" ] || continue
