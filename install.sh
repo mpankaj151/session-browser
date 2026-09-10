@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Session Browser installer.
-#   ./install.sh [--no-hook] [--no-launchd] [--no-backfill] [--enrich] [--lite]
+#   ./install.sh [--no-hook] [--no-launchd] [--no-backfill] [--enrich] [--lite] [--opencode-plugin]
 # Idempotent. Creates the venv, builds the DB, backfills, optionally registers the
 # Claude Stop hook and (macOS) launchd jobs.
 #   --lite  skip sentence-transformers/torch (~2 GB download); semantic search
@@ -11,10 +11,11 @@ PY="$REPO/.venv/bin/python"
 HOME_DIR="$HOME"
 LOG_DIR="$HOME/.session-browser/logs"
 
-NO_HOOK=0; NO_LAUNCHD=0; NO_BACKFILL=0; NO_ENRICH=1; LITE=0   # enrich off by default (uses LLM quota)
+NO_HOOK=0; NO_LAUNCHD=0; NO_BACKFILL=0; NO_ENRICH=1; LITE=0; OC_PLUGIN=0   # enrich off by default (uses LLM quota)
 for a in "$@"; do case "$a" in
   --no-hook) NO_HOOK=1;; --no-launchd) NO_LAUNCHD=1;;
   --no-backfill) NO_BACKFILL=1;; --enrich) NO_ENRICH=0;; --lite) LITE=1;;
+  --opencode-plugin) OC_PLUGIN=1;;
   *) echo "unknown flag: $a"; exit 1;; esac; done
 
 echo "==> Session Browser install ($REPO)"
@@ -126,6 +127,15 @@ else:
     settings.write_text(json.dumps(cfg, indent=2))
     print(f"   hook(s) registered for {', '.join(changed)} (backup: settings.json.sb-backup)")
 PYEOF
+fi
+
+# 6a'. OpenCode plugin (opt-in) — the Stop-hook equivalent: index a session the
+#      moment a turn settles, re-sync on deletion. Auto-loaded from
+#      ~/.config/opencode/plugins/; the watcher already covers OpenCode within
+#      seconds, so this is for the instant-index feel.
+if [ "$OC_PLUGIN" -eq 1 ]; then
+  echo "==> installing the OpenCode plugin"
+  "$PY" "$REPO/scripts/install-opencode-plugin.py"
 fi
 
 # 6b. Claude skills — symlink each shipped skill into ~/.claude/skills so the

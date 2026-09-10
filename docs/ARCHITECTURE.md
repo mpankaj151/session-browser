@@ -89,12 +89,15 @@ makes the reasoning archive a durable transcript vault. Restore uses
 `copyfile`, not `copy2`: the restored file needs a fresh mtime or an age-based
 cleanup would delete it again on its next pass.
 
-**Two-tier live indexing.** The Claude **Stop hook** indexes a session the
-instant it ends (tens of ms) and detaches reasoning extraction. The **watcher**
-(a launchd daemon, singleton-locked) catches everything else — Copilot, Codex,
-and anything the hook missed — via filesystem events, with a 30s race-guard so
-the two paths never double-process. The hook is contractually exit-0 so a broken
-config can never block Claude Code's session end.
+**Two-tier live indexing.** The Claude **Stop hook** (and, opt-in, the
+**OpenCode plugin** — `scripts/opencode-hook.py` spawned on `session.idle` /
+`session.deleted`) indexes a session the instant it ends (tens of ms) and
+detaches reasoning extraction. The **watcher** (a launchd daemon,
+singleton-locked) catches everything else — Copilot, Codex, OpenCode DB writes
+via `sync_trigger()`, and anything a hook missed — via filesystem events, with
+a 30s race-guard (`hookstate.py`, shared by every hook) so the two paths never
+double-process. Hooks are contractually exit-0 so a broken config can never
+block a CLI's session end.
 
 **Timestamps.** `to_iso_utc()` normalizes every source to one canonical,
 lexicographically-sortable UTC form, so mixed Claude/Copilot/Codex lists order

@@ -1,0 +1,43 @@
+// Session Browser — OpenCode plugin. Rendered by `./install.sh --opencode-plugin`
+// into ~/.config/opencode/plugins/session-browser.js (auto-loaded for every
+// project; no opencode.json entry needed). The OpenCode equivalent of the
+// Claude Stop hook: index a session the moment a turn settles, re-sync on
+// deletion so the row lands in the Archived tab.
+//
+// OpenCode void-s the event hook (never awaited) and does not catch its
+// rejections, so everything here is try/catch-ed and nothing is awaited. The
+// hook process is detached (unref) and always exits 0. session.idle fires per
+// turn and per child session, so spawns are debounced per session id.
+const PY = "__VENV_PY__";
+const HOOK = "__HOOK__";
+const pending = new Map();
+
+function spawn(args) {
+  try {
+    const proc = Bun.spawn([PY, HOOK, ...args], {
+      stdin: "ignore", stdout: "ignore", stderr: "ignore",
+      env: { ...process.env, OPENCODE_DISABLE_AUTOUPDATE: "1" },
+    });
+    proc.unref();
+  } catch (_) {}
+}
+
+function schedule(id, args, delayMs) {
+  try {
+    clearTimeout(pending.get(id));
+    pending.set(id, setTimeout(() => { pending.delete(id); spawn(args); }, delayMs));
+  } catch (_) {}
+}
+
+export const SessionBrowser = async () => ({
+  event: async ({ event }) => {
+    try {
+      const p = event && event.properties ? event.properties : {};
+      if (event.type === "session.idle" && p.sessionID) {
+        schedule(p.sessionID, [p.sessionID], 1500);
+      } else if (event.type === "session.deleted" && p.info && p.info.id) {
+        schedule(p.info.id, [p.info.id, "--deleted"], 200);
+      }
+    } catch (_) {}
+  },
+});
