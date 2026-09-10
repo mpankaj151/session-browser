@@ -1277,8 +1277,11 @@ def _oc_seed(conn, *, root=_OC_ROOT, child=_OC_CHILD,
     prov, mdl = _OC_MODEL
     conn.execute("INSERT INTO project VALUES ('proj-hash', '/Users/x/proj', 'git', 'proj', ?, ?)", (T, T))
     conn.execute("INSERT INTO session (id, project_id, parent_id, slug, directory, path, title, version, "
-                 "time_created, time_updated) VALUES (?, 'proj-hash', NULL, 'kind-canyon', '/Users/x/proj', "
-                 "'Users/x/proj', ?, ?, ?, ?)", (root, title, version, T, T + 60_000))
+                 "time_created, time_updated, permission, model) VALUES (?, 'proj-hash', NULL, 'kind-canyon', "
+                 "'/Users/x/proj', 'Users/x/proj', ?, ?, ?, ?, ?, ?)",
+                 (root, title, version, T, T + 60_000,
+                  json.dumps([{"permission": "question", "action": "deny", "pattern": "*"}]),
+                  json.dumps({"id": mdl, "providerID": prov})))
     conn.execute("INSERT INTO session (id, project_id, parent_id, slug, directory, path, title, version, "
                  "time_created, time_updated) VALUES (?, 'proj-hash', ?, 'tiny-fox', '/Users/x/proj', "
                  "'Users/x/proj', 'Chunk 1 - scan (@explore subagent)', ?, ?, ?)",
@@ -1875,6 +1878,270 @@ def test_opencode_sync_survives_unexpected_migration_table_shape():
         assert src.sync(force=True).written == [_OC_ROOT]
         assert len(list(src.discover())) == 1
     print("  ok  opencode sync tolerates odd migration tables and bad part rows")
+
+
+# --- phase B: live watch, restore/re-import, DB snapshots -------------------
+def test_watcher_sync_trigger_resyncs_mirror():
+    """The watcher cannot watch DB rows. A write to opencode.db / its WAL is a
+    change trigger: the adapter re-syncs and the resulting mirror create/modify/
+    delete events flow through the ordinary handler. log/ and tool-output/
+    churn constantly and must be ignored."""
+    import time as _time
+    import watcher
+    old_log, old_deb = watcher._log, watcher.SYNC_DEBOUNCE_S
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = _oc_source(Path(td))
+            assert src.watch_roots() == [src.mirror_dir, src.data_dir]
+            for yes in ("opencode.db", "opencode.db-wal", "opencode-beta.db-wal"):
+                assert src.sync_trigger(src.data_dir / yes) is True, yes
+            for no in ("opencode.db-shm", "log/2026.log", "tool-output/tool_x", "auth.json"):
+                assert src.sync_trigger(src.data_dir / no) is False, no
+            assert src.sync_trigger(src.mirror_dir / f"{_OC_ROOT}.jsonl") is False
+            wal = src.data_dir / "opencode.db-wal"
+            wal.write_bytes(b"")
+            watcher._log = lambda msg: None
+            watcher.SYNC_DEBOUNCE_S = 0.05
+            h = watcher._Handler(src)
+            assert not src.mirror_dir.exists()
+            h._process(str(wal))                       # trigger, not a session
+            _time.sleep(0.4)
+            assert (src.mirror_dir / f"{_OC_ROOT}.jsonl").exists()
+    finally:
+        watcher._log, watcher.SYNC_DEBOUNCE_S = old_log, old_deb
+    print("  ok  watcher: a DB/WAL write re-syncs the mirror (debounced); log/ ignored")
+
+
+def test_hookstate_mark_and_recently():
+    """One module for the 30 s hook race-guard, shared by the Claude Stop hook,
+    the OpenCode hook and the watcher: mark() prunes stale entries and writes
+    atomically; recently() is False for unknown, stale or corrupt state."""
+    import hookstate
+    from datetime import datetime, timedelta, timezone
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "hook-state.json"
+        assert hookstate.recently("ses_a", path=state) is False       # no file yet
+        hookstate.mark("ses_a", path=state)
+        assert hookstate.recently("ses_a", path=state) is True
+        assert hookstate.recently("other", path=state) is False
+        stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        state.write_text(json.dumps({"old": stale, "ses_a": datetime.now(timezone.utc).isoformat()}))
+        assert hookstate.recently("old", path=state) is False
+        hookstate.mark("ses_b", path=state)
+        kept = json.loads(state.read_text())
+        assert "old" not in kept and {"ses_a", "ses_b"} <= set(kept)
+        state.write_text("{corrupt")
+        assert hookstate.recently("ses_a", path=state) is False
+        hookstate.mark("ses_c", path=state)
+        assert hookstate.recently("ses_c", path=state) is True
+    print("  ok  hookstate: mark/recently with TTL pruning, corrupt-tolerant")
+
+
+def test_watcher_race_guard_is_source_agnostic():
+    """The Stop-hook race guard was `adapter.name == "claude" and ...`; the
+    OpenCode hook needs the same guard, so it keys on the shared hook state
+    alone (uuid and ses_ ids never collide)."""
+    import hookstate
+    import watcher
+    conn = _temp_db()
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    orig_connect, orig_log, orig_recently = indexer.connect, watcher._log, hookstate.recently
+    logs = []
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = _oc_source(Path(td))
+            path = next(iter(src.discover()))
+            indexer.connect = lambda *a, **k: orig_connect(db_path)
+            watcher._log = logs.append
+            hookstate.recently = lambda sid, **k: sid == _OC_ROOT
+            watcher._Handler(src)._process(str(path))
+            assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0, "upsert must be skipped"
+            assert any("race-guard" in m for m in logs), logs
+            hookstate.recently = lambda sid, **k: False
+            watcher._Handler(src)._process(str(path))
+            assert conn.execute("SELECT COUNT(*) FROM sessions WHERE session_id=?", (_OC_ROOT,)).fetchone()[0] == 1
+    finally:
+        indexer.connect, watcher._log, hookstate.recently = orig_connect, orig_log, orig_recently
+        conn.close()
+    print("  ok  watcher race-guard applies to every adapter via hookstate")
+
+
+def test_opencode_export_docs_roundtrip_shape():
+    """Restore re-imports through `opencode import`, which decodes the export
+    shape {info: Session.Info, messages: [{info, parts}]} with Effect Schema —
+    required keys present, ids re-attached, root doc first, then each child."""
+    from sources.opencode import to_export_docs
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        docs = to_export_docs(next(iter(src.discover())))
+        assert [d["info"]["id"] for d in docs] == [_OC_ROOT, _OC_CHILD]
+        root = docs[0]
+        assert set(root) == {"info", "messages"}
+        for k in ("id", "slug", "projectID", "directory", "path", "title", "version", "time"):
+            assert k in root["info"], k
+        assert [m["info"]["id"] for m in root["messages"]] == \
+            ["msg_u1", "msg_a1", "msg_uc", "msg_a2", "msg_u2", "msg_a3"]
+        m = root["messages"][1]
+        assert m["info"]["sessionID"] == _OC_ROOT and m["info"]["role"] == "assistant"
+        assert m["parts"][3]["tool"] == "bash" and m["parts"][3]["messageID"] == "msg_a1" \
+            and m["parts"][3]["sessionID"] == _OC_ROOT
+        assert docs[1]["info"]["parentID"] == _OC_ROOT
+        assert [m["info"]["id"] for m in docs[1]["messages"]] == ["msg_c1", "msg_c2"]
+        # JSON columns keep their real shape — `permission` is a LIST (PermissionRuleset);
+        # `opencode import` rejected a mirror where it had been coerced to {}
+        assert root["info"]["permission"] == [{"permission": "question", "action": "deny", "pattern": "*"}], root["info"]
+        assert root["info"]["model"] == {"id": _OC_MODEL[1], "providerID": _OC_MODEL[0]}
+        assert "revert" not in root["info"] and "metadata" not in root["info"]      # unset stays absent
+    print("  ok  to_export_docs: {info, messages[{info, parts}]} per session, root first")
+
+
+def test_opencode_restore_reimports_via_hook():
+    """Restore = the raw copy back into the mirror (row live again, browsable)
+    PLUS `opencode import` of root then children, run with cwd = the session's
+    directory because import re-homes a session to wherever it runs. A failing
+    import never un-restores the row; it is reported. Sessions still present
+    in the DB are skipped (import is idempotent, but why spend it)."""
+    import restore
+    old_archive = reasoning.ARCHIVE
+    conn = _temp_db()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root / "archive"
+            src = _oc_source(root)
+            proj = root / "proj"
+            proj.mkdir()
+            c = sqlite3.connect(str(src.db_path))
+            c.execute("UPDATE session SET directory = ?", (str(proj),))
+            c.commit()
+            c.close()
+            live = next(iter(src.discover()))
+            indexer.upsert(src.parse_header(live), conn=conn)
+            raw = root / "archive" / "raw" / "2026" / "08"
+            raw.mkdir(parents=True)
+            (raw / f"{_OC_ROOT}@v2.jsonl").write_bytes(live.read_bytes())
+            _oc_wipe(src.db_path)                          # `opencode session delete`
+            live.unlink()
+            indexer.archive(_OC_ROOT, indexer.TRANSCRIPT_MISSING, conn=conn)
+            calls = []
+
+            def fake_import(file, cwd):
+                calls.append((json.loads(Path(file).read_text())["info"]["id"], cwd))
+                return True, ""
+            src._run_import = fake_import
+            res = restore.restore_session(_OC_ROOT, conn=conn, registry={"opencode": src})
+            assert res.status == "restored" and res.path == src.mirror_dir / f"{_OC_ROOT}.jsonl", res
+            assert res.path.exists() and res.reimported is True, res
+            assert [c[0] for c in calls] == [_OC_ROOT, _OC_CHILD], calls
+            assert all(c[1] == proj for c in calls), calls
+            assert conn.execute("SELECT archived FROM sessions WHERE session_id=?", (_OC_ROOT,)).fetchone()[0] == 0
+            # failing import: still restored in the browser, failure reported
+            live.unlink()
+            indexer.archive(_OC_ROOT, indexer.TRANSCRIPT_MISSING, conn=conn)
+            src._run_import = lambda file, cwd: (False, "opencode import: schema decode failed")
+            res = restore.restore_session(_OC_ROOT, conn=conn, registry={"opencode": src})
+            assert res.status == "restored" and res.reimported is False, res
+            assert "schema decode failed" in res.detail, res.detail
+            # disabled per config: no import attempted, reported as not applicable
+            live.unlink()
+            indexer.archive(_OC_ROOT, indexer.TRANSCRIPT_MISSING, conn=conn)
+            src.reimport_on_restore = False
+            src._run_import = lambda file, cwd: (_ for _ in ()).throw(AssertionError("must not import"))
+            res = restore.restore_session(_OC_ROOT, conn=conn, registry={"opencode": src})
+            assert res.status == "restored" and res.reimported is None, res
+            assert restore.RestoreResult("x", "restored").reimported is None
+    finally:
+        reasoning.ARCHIVE = old_archive
+        conn.close()
+    print("  ok  restore(opencode): mirror back + `opencode import` root then children, cwd=directory")
+
+
+def test_backup_opencode_snapshot_and_rotation():
+    """Weekly whole-DB copies via VACUUM INTO (consistent even mid-write, WAL
+    included), rotated to `keep`, due only after `days`; a copy is a complete,
+    openable database."""
+    from datetime import datetime, timezone
+    bk = _load_script("backup-opencode")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = _oc_source(root)
+        out = root / "snapshots"
+        day = lambda d: datetime(2026, 9, d, 12, 0, tzinfo=timezone.utc)  # noqa: E731
+        assert bk.is_due(out, days=7, now=day(1)) is True                 # nothing yet
+        p1 = bk.snapshot(src.db_path, out, keep=2, now=day(1))
+        assert bk.is_due(out, days=7, now=day(2)) is False and bk.is_due(out, days=7, now=day(9)) is True
+        p2 = bk.snapshot(src.db_path, out, keep=2, now=day(8))
+        p3 = bk.snapshot(src.db_path, out, keep=2, now=day(15))
+        files = sorted(out.glob("opencode-*.db"))
+        assert files == [p2, p3] and not p1.exists(), files
+        c = sqlite3.connect(f"file:{p3}?mode=ro", uri=True)
+        assert c.execute("SELECT COUNT(*) FROM session").fetchone()[0] == 2
+        assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        c.close()
+    print("  ok  backup-opencode: VACUUM INTO snapshots, rotation, due-after-N-days")
+
+
+def test_opencode_run_import_verifies_the_session_landed():
+    """`opencode import` printed "Error: Unexpected error / Expected
+    PermissionRuleset" and still EXITED 0 during verification. Success is the
+    session being in OpenCode's DB afterwards; a clean exit is not enough, and
+    an "Error:" on stderr is a failure whose text is the detail."""
+    import subprocess as sp
+    from sources.opencode import to_export_docs
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = _oc_source(root)
+        doc = root / "doc.json"
+        doc.write_text(json.dumps(to_export_docs(next(iter(src.discover())))[0]))
+        src.has_binary = lambda: True
+        orig = sp.run
+        stderr = ""
+        sp.run = lambda *a, **k: sp.CompletedProcess(a[0], 0, stdout="", stderr=stderr)
+        try:
+            ok, detail = src._run_import(doc, root)
+            assert ok is True, detail                       # exit 0, clean, session present
+            stderr = "Error: Unexpected error\nExpected PermissionRuleset, got {}\n  at [\"permission\"]\n"
+            ok, detail = src._run_import(doc, root)
+            assert ok is False and "PermissionRuleset" in detail, detail
+            stderr = ""
+            _oc_wipe(src.db_path)
+            ok, detail = src._run_import(doc, root)
+            assert ok is False and "did not appear" in detail, detail   # exit 0, but nothing landed
+        finally:
+            sp.run = orig
+    print("  ok  _run_import: success = session present afterwards, not exit 0")
+
+
+def test_watcher_delete_event_for_existing_file_is_a_replace():
+    """The OpenCode mirror is rewritten atomically (tmp + os.replace). macOS
+    FSEvents reports the overwritten inode as a deletion of the target path,
+    and during verification the watcher archived a live session on exactly that
+    event. A path that still exists was replaced, not deleted."""
+    import watcher
+    conn = _temp_db()
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    orig_connect, orig_log = indexer.connect, watcher._log
+    logs = []
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = _oc_source(Path(td))
+            path = next(iter(src.discover()))
+            indexer.upsert(src.parse_header(path), conn=conn)
+            conn.commit()
+            indexer.connect = lambda *a, **k: orig_connect(db_path)
+            watcher._log = logs.append
+            ev = type("Ev", (), {"is_directory": False, "src_path": str(path)})()
+            watcher._Handler(src).on_deleted(ev)          # file still there
+            row = conn.execute("SELECT archived FROM sessions WHERE session_id=?", (_OC_ROOT,)).fetchone()
+            assert row["archived"] == 0, "a replaced file must not archive the row"
+            assert any("replaced" in m for m in logs), logs
+            path.unlink()
+            watcher._Handler(src).on_deleted(ev)          # now it really is gone
+            assert conn.execute("SELECT archived FROM sessions WHERE session_id=?", (_OC_ROOT,)).fetchone()[0] == 1
+    finally:
+        indexer.connect, watcher._log = orig_connect, orig_log
+        conn.close()
+    print("  ok  watcher: delete event on a still-existing path is a replace, not a deletion")
 
 
 if __name__ == "__main__":

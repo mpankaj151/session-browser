@@ -262,7 +262,7 @@ def api_restore(sid: str):
     else:
         code = 409
     return jsonify({"status": res.status, "path": str(res.path) if res.path else None,
-                    "detail": res.detail}), code
+                    "detail": res.detail, "reimported": res.reimported}), code
 
 
 def _build_context(conn, sid: str) -> tuple[str, str] | None:

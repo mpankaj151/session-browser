@@ -262,7 +262,8 @@ async function restoreSession(id){
                           {method:'POST', headers:{'X-Requested-With':'session-browser'}});
   const r = await res.json().catch(()=>({}));
   if(!res.ok){ toast(`Restore failed: ${r.detail || r.status || res.status}`); return; }
-  toast(r.status==='restored' ? 'Restored — the transcript is back; Resume works again'
+  toast(r.reimported===false ? `Restored in the browser, but re-import into the CLI failed: ${r.detail||''}`
+      : r.status==='restored' ? 'Restored — the transcript is back; Resume works again'
                               : 'Already live — re-indexed');
   await loadMeta(); await applyFilters();          // the card moves to Sessions
 }
