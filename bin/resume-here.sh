@@ -21,6 +21,25 @@ set -euo pipefail
 SID="${1:?usage: resume-here.sh <session_id> [cli_source]}"
 CLI="${2:-auto}"
 CUR="$(pwd)"
+# Each CLI can relocate its state; follow the same env vars the CLIs read.
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+
+# Codex rollouts may be zstd-compressed in place (cold, >~7 days) and/or moved
+# to the sibling archived_sessions tree by `codex archive`; all still resume.
+codex_rollout() {
+  find "$CODEX_DIR/sessions" "$CODEX_DIR/archived_sessions" \
+       \( -name "rollout-*$1.jsonl" -o -name "rollout-*$1.jsonl.zst" \) 2>/dev/null | head -1
+}
+
+# Fail BEFORE any side effect when the CLI itself is missing: exec'ing an absent
+# binary died with a bare 127 after the session memory had already been linked.
+need_cli() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  echo "cr: $1 is not on PATH on this machine — session $SID exists but cannot be resumed here" >&2
+  echo "cr: install $1 (or open a shell where it is available) and re-run: cr $SID" >&2
+  exit 1
+}
 
 # Session ids are used in find -name patterns; refuse glob/path metacharacters.
 case "$SID" in
@@ -35,11 +54,11 @@ encode_path() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
 if [ "$CLI" = "auto" ]; then
   if [[ "$SID" == ses_* ]]; then
     CLI=opencode          # OpenCode ids are prefixed; nothing else looks like this
-  elif find "$HOME/.claude/projects" -maxdepth 2 -name "$SID.jsonl" 2>/dev/null | grep -q .; then
+  elif find "$CLAUDE_DIR/projects" -maxdepth 2 -name "$SID.jsonl" 2>/dev/null | grep -q .; then
     CLI=claude
   elif [ -d "$HOME/.copilot/session-state/$SID" ]; then
     CLI=copilot
-  elif find "$HOME/.codex/sessions" -name "rollout-*$SID.jsonl" 2>/dev/null | grep -q .; then
+  elif [ -n "$(codex_rollout "$SID")" ]; then
     CLI=codex
   else
     echo "cr: session '$SID' not found for claude, copilot, codex, or opencode" >&2
@@ -49,11 +68,12 @@ fi
 
 case "$CLI" in
   claude)
-    PROJECTS="$HOME/.claude/projects"
+    PROJECTS="$CLAUDE_DIR/projects"
     SRC="$(find "$PROJECTS" -maxdepth 2 -name "$SID.jsonl" 2>/dev/null | head -1)"
     if [ -z "$SRC" ]; then
       echo "cr: claude session $SID not found under $PROJECTS" >&2; exit 1
     fi
+    need_cli claude
     # Resolve to the REAL file (in case SRC is itself a symlink from a prior cr),
     # so every location links back to one canonical transcript — always in sync.
     SRC_REAL="$(realpath "$SRC" 2>/dev/null || echo "$SRC")"
@@ -81,6 +101,7 @@ case "$CLI" in
     if [ ! -d "$STATE" ]; then
       echo "cr: copilot session $SID not found under ~/.copilot/session-state" >&2; exit 1
     fi
+    need_cli copilot
     if [ -f "$WS" ]; then
       cp "$WS" "$WS.bak"
       if grep -q '^cwd:' "$WS"; then
@@ -98,14 +119,16 @@ case "$CLI" in
   opencode)
     # `opencode --session` is a global lookup by id that runs in the CURRENT
     # directory — exactly what "resume here" means. No memory to port.
+    need_cli opencode
     exec opencode --session "$SID"
     ;;
   codex)
     # Codex stores sessions by date, not by an encoded cwd, so `codex resume`
     # finds the session from any directory — just resume in place.
-    if ! find "$HOME/.codex/sessions" -name "rollout-*$SID.jsonl" 2>/dev/null | grep -q .; then
-      echo "cr: codex session $SID not found under ~/.codex/sessions" >&2; exit 1
+    if [ -z "$(codex_rollout "$SID")" ]; then
+      echo "cr: codex session $SID not found under $CODEX_DIR/{sessions,archived_sessions}" >&2; exit 1
     fi
+    need_cli codex
     exec codex resume "$SID"
     ;;
   *)

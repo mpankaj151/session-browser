@@ -72,7 +72,7 @@ REPO_ROOT = _REPO_ROOT
 # degrade to the documented default, not KeyError every tool at import time.
 _PATHS = CONFIG.get("paths", {})
 _NEW_DB = _expand(_PATHS.get("db", "~/.session-browser/registry.db"))
-_OLD_DB = Path.home() / ".claude" / "session-registry.db"
+_OLD_DB = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")) / "session-registry.db"
 # SB_DB env override wins over everything — used by `sb demo` to point the whole
 # stack at a throwaway seeded database without touching the real registry.
 _ENV_DB = os.environ.get("SB_DB")

@@ -4,6 +4,7 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PURGE=0; [ "${1:-}" = "--purge" ] && PURGE=1
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 if [ "$(uname)" = "Darwin" ]; then
   echo "==> removing launchd jobs"
@@ -20,9 +21,9 @@ UNPY="$REPO/.venv/bin/python"
 [ -x "$UNPY" ] || UNPY="$(command -v python3 || true)"
 if [ -n "$UNPY" ]; then
   "$UNPY" - <<'PYEOF' || echo "   ! could not edit ~/.claude/settings.json — remove the session-hook.py hooks manually"
-import json
+import json, os
 from pathlib import Path
-s = Path.home()/".claude"/"settings.json"
+s = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))/"settings.json"
 if s.exists():
     cfg = json.loads(s.read_text())
     hooks = cfg.get("hooks", {})
@@ -42,7 +43,7 @@ fi
 echo "==> removing Claude skill links"
 for d in "$REPO"/skills/*/; do
   name="$(basename "$d")"
-  target="$HOME/.claude/skills/$name"
+  target="$CLAUDE_DIR/skills/$name"
   # only remove links that point INTO this repo — never a user's own skill
   if [ -L "$target" ] && [ "$(readlink "$target")" = "${d%/}" ]; then
     rm -f "$target" && echo "   unlinked $name"
@@ -71,5 +72,5 @@ if [ "$PURGE" -eq 1 ]; then
   echo "   (reasoning archive at ~/claude-reasoning-archive left intact)"
 fi
 echo "==> uninstalled. Also present if you want them gone:"
-echo "    ~/.claude/settings.json.sb-backup   (pre-install settings backup)"
+echo "    $CLAUDE_DIR/settings.json.sb-backup   (pre-install settings backup)"
 [ "$PURGE" -eq 0 ] && echo "    ~/.session-browser                  (data — rerun with --purge)"

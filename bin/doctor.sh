@@ -45,10 +45,11 @@ except Exception as ex:
 PYEOF
 
 echo "[resume sync]"
-"$PY" - <<'PYEOF'
-import os, collections
+"$PY" - "$REPO" <<'PYEOF'
+import collections, sys; sys.path.insert(0, sys.argv[1])
 from pathlib import Path
-proj = Path.home()/".claude"/"projects"
+from sources.registry import _make_claude
+proj = _make_claude().projects_dir          # honours $CLAUDE_CONFIG_DIR
 real = collections.defaultdict(list)   # session_id -> [dirs] for REAL files
 links = 0
 if proj.exists():
@@ -106,9 +107,14 @@ else:
 PYEOF
 
 echo "[hook]"
-SETTINGS="$HOME/.claude/settings.json"
-if grep -q "session-hook.py" "$SETTINGS" 2>/dev/null; then ok "Stop hook registered"; else
-  printf "  \033[33m∼\033[0m Stop hook NOT registered (live indexing still works via watcher)\n"; fi
+SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+if grep -q "session-hook.py" "$SETTINGS" 2>/dev/null; then ok "Claude Stop hook registered"; else
+  if command -v claude >/dev/null 2>&1; then
+    printf "  \033[33m∼\033[0m Claude Stop hook NOT registered (live indexing still works via watcher; ./install.sh --no-backfill --no-launchd)\n"
+  else
+    printf "  \033[33m∼\033[0m Claude Code not installed here — no Stop hook needed\n"
+  fi
+fi
 OCP_STATUS="$("$PY" "$REPO/scripts/install-opencode-plugin.py" --status 2>/dev/null || echo "unknown")"
 case "$OCP_STATUS" in
   installed) ok "OpenCode plugin installed";;
@@ -117,17 +123,33 @@ case "$OCP_STATUS" in
 esac
 
 echo "[watcher / ui]"
-# Capture once; grep against a here-string so `grep -q` closing early can't
-# SIGPIPE launchctl and trip pipefail (which would falsely report "not loaded").
-JOBS="$(launchctl list 2>/dev/null || true)"
-if grep -q sessionbrowser.watcher <<< "$JOBS"; then ok "watcher launchd job loaded"; else
-  printf "  \033[33m∼\033[0m watcher launchd job not loaded\n"; fi
-if grep -q sessionbrowser.refresh <<< "$JOBS"; then ok "nightly refresh job loaded"; else
-  printf "  \033[33m∼\033[0m nightly refresh job not loaded (run refresh-all.py manually to update)\n"; fi
+# One line per background job, phrased for the scheduler this OS actually has.
+if [ "$(uname)" = "Darwin" ]; then
+  # Capture once; grep against a here-string so `grep -q` closing early can't
+  # SIGPIPE launchctl and trip pipefail (which would falsely report "not loaded").
+  JOBS="$(launchctl list 2>/dev/null || true)"
+  if grep -q sessionbrowser.watcher <<< "$JOBS"; then ok "watcher launchd job loaded"; else
+    printf "  \033[33m∼\033[0m watcher launchd job not loaded (./install.sh --no-backfill)\n"; fi
+  if grep -q sessionbrowser.refresh <<< "$JOBS"; then ok "nightly refresh job loaded"; else
+    printf "  \033[33m∼\033[0m nightly refresh job not loaded (run refresh-all.py manually to update)\n"; fi
+elif command -v systemctl >/dev/null 2>&1; then
+  if systemctl --user is-active --quiet session-browser-watcher.service 2>/dev/null; then ok "watcher systemd --user unit active"; else
+    printf "  \033[33m∼\033[0m watcher systemd --user unit not active (docs/SETUP.md §5)\n"; fi
+  if systemctl --user is-active --quiet session-browser-refresh.timer 2>/dev/null; then ok "nightly refresh systemd timer active"; else
+    printf "  \033[33m∼\033[0m nightly refresh systemd timer not active (docs/SETUP.md §5; or run refresh-all.py manually)\n"; fi
+else
+  printf "  \033[33m∼\033[0m no launchd/systemd here — run watcher.py and scripts/refresh-all.py yourself (docs/SETUP.md §5)\n"
+fi
+# Is something listening on the UI port? lsof is not a given on Linux.
+port_held() {
+  if command -v lsof >/dev/null 2>&1; then lsof -ti tcp:7655 >/dev/null 2>&1
+  elif command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | grep -q ':7655 '
+  else return 1; fi
+}
 # --max-time: a wedged/suspended process holding the port accepts the TCP
 # connect but never answers — without a deadline this health check hangs forever.
 if curl -s --max-time 3 localhost:7655/health >/dev/null 2>&1; then ok "UI responding on :7655"; else
-  if lsof -ti tcp:7655 >/dev/null 2>&1; then
+  if port_held; then
     printf "  \033[31m✗\033[0m :7655 is held by a process that isn't answering — try: sb stop, then sb ui\n"
   else
     printf "  \033[33m∼\033[0m UI not running (start with: sb ui)\n"

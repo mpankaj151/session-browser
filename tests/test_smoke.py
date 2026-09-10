@@ -2371,6 +2371,129 @@ def test_opencode_watch_roots_creates_mirror_dir():
     print("  ok  opencode watch_roots() materialises the mirror dir")
 
 
+# --- portability: shell helpers + CLI home env vars -------------------------------
+def _stub_bin(dirpath: Path, name: str, body: str = 'echo "{name}-stub $*"') -> Path:
+    """A fake CLI on PATH that prints how it was invoked."""
+    dirpath.mkdir(parents=True, exist_ok=True)
+    p = dirpath / name
+    p.write_text("#!/usr/bin/env bash\n" + body.format(name=name) + "\n")
+    p.chmod(0o755)
+    return p
+
+
+def _cr(home: Path, bins: Path, sid: str, env_extra: dict | None = None):
+    import os
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME")}
+    env.update({"HOME": str(home), "PATH": f"{bins}:/usr/bin:/bin"})
+    env.update(env_extra or {})
+    return subprocess.run(["bash", str(_REPO / "bin" / "resume-here.sh"), sid],
+                          env=env, capture_output=True, text=True, timeout=30, cwd=str(home))
+
+
+def test_resume_here_finds_cold_and_archived_codex_rollouts():
+    """Codex zstd-compresses rollouts older than ~7 days in place and `codex
+    archive` moves them to a sibling tree; both are still resumable, but `cr`
+    only looked for plain .jsonl under sessions/ and said 'not found'."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        home, bins = tmp / "home", tmp / "bin"
+        home.mkdir()
+        _stub_bin(bins, "codex")
+        _cx_tree(home / ".codex", _cx_rollout(), root="sessions", compress=True)      # cold
+        r = _cr(home, bins, _CX_ID)
+        assert r.returncode == 0 and f"codex-stub resume {_CX_ID}" in r.stdout, r.stdout + r.stderr
+        arch_id = "019e18fa-0d21-7461-922c-aaaaaaaaaaaa"
+        day = home / ".codex" / "archived_sessions" / "2026" / "08" / "02"
+        day.mkdir(parents=True)
+        (day / f"rollout-2026-08-02T10-00-00-{arch_id}.jsonl").write_text(_cx_rollout())
+        r = _cr(home, bins, arch_id)
+        assert r.returncode == 0 and f"codex-stub resume {arch_id}" in r.stdout, r.stdout + r.stderr
+    print("  ok  cr resumes cold (.zst) and archived codex rollouts")
+
+
+def test_resume_here_explains_missing_binary_before_touching_anything():
+    """On a laptop that has the transcripts but not the CLI (uninstalled, or a
+    stripped PATH), cr used to link the session into the cwd's project dir and
+    then die with a bare exit 127 from `exec`. Check first, say what is missing."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        home, bins = tmp / "home", tmp / "empty-bin"
+        proj = home / ".claude" / "projects" / "-Users-x-proj"
+        proj.mkdir(parents=True)
+        sid = "0a1b2c3d-1111-4222-8333-444455556666"
+        (proj / f"{sid}.jsonl").write_text(_cl_transcript("hello", cwd="/Users/x/proj"))
+        r = _cr(home, bins, sid)
+        assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+        assert "claude" in r.stderr and "not on PATH" in r.stderr, r.stderr
+        linked = [p for p in (home / ".claude" / "projects").glob("*/*.jsonl") if p.is_symlink()]
+        assert not linked, "must not link memory when the CLI cannot run"
+    print("  ok  cr reports a missing CLI binary instead of exit 127")
+
+
+def test_registry_honours_cli_home_env_vars():
+    """Claude Code relocates its whole state with $CLAUDE_CONFIG_DIR, Codex with
+    $CODEX_HOME, OpenCode with $XDG_DATA_HOME. With the documented default in
+    config, the adapters must follow the env var — otherwise a multi-account
+    setup indexes the wrong (usually empty) tree with no error at all."""
+    import os
+    from sources import registry
+    keys = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ["CLAUDE_CONFIG_DIR"] = "/alt/claude"
+        os.environ["CODEX_HOME"] = "/alt/codex"
+        os.environ["XDG_DATA_HOME"] = "/alt/xdg"
+        assert registry._make_claude().projects_dir == Path("/alt/claude/projects")
+        cx = registry._make_codex()
+        assert cx.sessions_dir == Path("/alt/codex/sessions") and cx.archived_dir == Path("/alt/codex/archived_sessions")
+        assert registry._make_opencode().data_dir == Path("/alt/xdg/opencode")
+        for k in keys:
+            os.environ.pop(k)
+        assert registry._make_claude().projects_dir == Path.home() / ".claude" / "projects"
+        assert registry._make_codex().sessions_dir == Path.home() / ".codex" / "sessions"
+        assert registry._make_opencode().data_dir == Path.home() / ".local" / "share" / "opencode"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("  ok  registry follows CLAUDE_CONFIG_DIR / CODEX_HOME / XDG_DATA_HOME at the documented defaults")
+
+
+def _install_python_block(needle: str) -> str:
+    import re as _re
+    return next(
+        m.group(2)
+        for m in _re.finditer(r"<<'?(PYEOF)'?(?:[^\n]*\\\n)*[^\n]*\n(.*?)\n\1",
+                              (_REPO / "install.sh").read_text(), _re.S)
+        if needle in m.group(2))
+
+
+def test_install_hook_creates_settings_dir_and_honours_config_dir():
+    """A brand-new Claude Code install has no ~/.claude yet — registration must
+    create it rather than fail with FileNotFoundError. And with
+    $CLAUDE_CONFIG_DIR set, settings.json lives THERE; writing ~/.claude/
+    settings.json registers a hook Claude never reads."""
+    import os
+    import subprocess
+    block = _install_python_block("session-hook.py")
+    with tempfile.TemporaryDirectory() as home:
+        base = {**os.environ, "HOME": home}
+        base.pop("CLAUDE_CONFIG_DIR", None)
+        r = subprocess.run([sys.executable, "-", str(_REPO)], input=block, env=base,
+                           capture_output=True, text=True)
+        assert r.returncode == 0 and "registered" in r.stdout, r.stdout + r.stderr
+        assert (Path(home) / ".claude" / "settings.json").exists(), "missing parent dir must be created"
+        alt = Path(home) / "cc"
+        r = subprocess.run([sys.executable, "-", str(_REPO)], input=block,
+                           env={**base, "CLAUDE_CONFIG_DIR": str(alt)}, capture_output=True, text=True)
+        assert r.returncode == 0 and "registered" in r.stdout, r.stdout + r.stderr
+        assert (alt / "settings.json").exists(), "must honour CLAUDE_CONFIG_DIR"
+    print("  ok  install.sh hook registration creates the settings dir and honours CLAUDE_CONFIG_DIR")
+
+
 if __name__ == "__main__":
     print("Session Browser smoke + regression tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

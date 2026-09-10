@@ -122,7 +122,8 @@ on the file alone — they are also run on the raw-archive copy.
 
 ```bash
 sb refresh                  # indexes your new source
-python tests/test_smoke.py  # add a fixture test for your adapter
+python tests/test_smoke.py        # add a fixture test for your adapter
+python tests/test_portability.py  # add a one-CLI laptop scenario (seed + stub binary)
 sb doctor                   # your source shows under [sources]
 ```
 

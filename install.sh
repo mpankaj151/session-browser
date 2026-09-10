@@ -10,6 +10,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$REPO/.venv/bin/python"
 HOME_DIR="$HOME"
 LOG_DIR="$HOME/.session-browser/logs"
+# Claude Code relocates its state with CLAUDE_CONFIG_DIR; hooks/skills go there.
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# Claude-specific steps (hook, skills) only make sense where Claude Code is —
+# on an OpenCode/Codex/Copilot-only laptop they would just create ~/.claude.
+HAVE_CLAUDE=0
+if command -v claude >/dev/null 2>&1 || [ -d "$CLAUDE_DIR" ]; then HAVE_CLAUDE=1; fi
 
 NO_HOOK=0; NO_LAUNCHD=0; NO_BACKFILL=0; NO_ENRICH=1; LITE=0; OC_PLUGIN=0   # enrich off by default (uses LLM quota)
 for a in "$@"; do case "$a" in
@@ -24,7 +30,13 @@ echo "==> Session Browser install ($REPO)"
 # `python3` be new: stock macOS resolves it to the Xcode CLT build (often 3.9)
 # even when a modern interpreter is installed as python3.12 — hunt for one.
 PYBOOT=""
+# An existing venv that is new enough needs no bootstrap interpreter at all —
+# re-running the installer must not fail just because python3.12 left PATH.
+if [ -x "$PY" ] && "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+  PYBOOT="$PY"
+fi
 for c in python3.13 python3.12 python3.11 python3; do
+  [ -n "$PYBOOT" ] && break
   if command -v "$c" >/dev/null 2>&1 && \
      "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
     PYBOOT="$(command -v "$c")"; break
@@ -100,13 +112,18 @@ fi
 
 # 6. Stop + SessionEnd hooks (Stop = instant indexing; SessionEnd = indexing +
 #    journal-grade enrichment of the just-ended session)
-if [ "$NO_HOOK" -eq 0 ]; then
+if [ "$NO_HOOK" -eq 0 ] && [ "$HAVE_CLAUDE" -eq 0 ]; then
+  echo "==> Claude Code not detected — skipping its Stop/SessionEnd hook and skills (the watcher indexes everything)"
+fi
+if [ "$NO_HOOK" -eq 0 ] && [ "$HAVE_CLAUDE" -eq 1 ]; then
   echo "==> registering Claude Stop + SessionEnd hooks"
   "$PY" - "$REPO" <<'PYEOF' || echo "   ! hook registration failed — everything else still works (watcher covers indexing)"
-import json, sys, shutil
+import json, os, sys, shutil
 from pathlib import Path
 repo = Path(sys.argv[1])
-settings = Path.home()/".claude"/"settings.json"
+# A brand-new install has no ~/.claude yet; CLAUDE_CONFIG_DIR relocates it.
+settings = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))/"settings.json"
+settings.parent.mkdir(parents=True, exist_ok=True)
 # Back up BEFORE parsing: if the user's file is malformed we must not have
 # touched anything, and they keep a copy either way.
 if settings.exists():
@@ -114,7 +131,7 @@ if settings.exists():
 try:
     cfg = json.loads(settings.read_text()) if settings.exists() else {}
 except (json.JSONDecodeError, OSError) as e:
-    print(f"   ! ~/.claude/settings.json is not valid JSON ({e}) — skipping hook registration.")
+    print(f"   ! {settings} is not valid JSON ({e}) — skipping hook registration.")
     print("     Fix the file, then re-run: ./install.sh --no-backfill --no-launchd")
     sys.exit(0)
 if not isinstance(cfg, dict):
@@ -153,22 +170,24 @@ fi
 if [ "$OC_PLUGIN" -eq 1 ]; then
   echo "==> installing the OpenCode plugin"
   "$PY" "$REPO/scripts/install-opencode-plugin.py"
+elif command -v opencode >/dev/null 2>&1; then
+  echo "==> OpenCode detected: add --opencode-plugin for instant indexing (the watcher already covers it within seconds)"
 fi
 
 # 6b. Claude skills — symlink each shipped skill into ~/.claude/skills so the
 #     work-journal / snapshot / checkpoint skills are discoverable. Symlinks (not
 #     copies) so a repo update updates the skills; skill updates ride git pull.
-if [ "$NO_HOOK" -eq 0 ]; then
+if [ "$NO_HOOK" -eq 0 ] && [ "$HAVE_CLAUDE" -eq 1 ]; then
   echo "==> linking Claude skills"
-  mkdir -p "$HOME/.claude/skills"
+  mkdir -p "$CLAUDE_DIR/skills"
   for d in "$REPO"/skills/*/; do
     name="$(basename "$d")"
-    target="$HOME/.claude/skills/$name"
+    target="$CLAUDE_DIR/skills/$name"
     if [ -L "$target" ]; then
       # repoint after a repo move; no-op when already correct
       [ "$(readlink "$target")" = "${d%/}" ] || { ln -sfn "${d%/}" "$target"; echo "   repointed $name"; }
     elif [ -e "$target" ]; then
-      echo "   ! ~/.claude/skills/$name exists and is not ours — leaving it alone"
+      echo "   ! $target exists and is not ours — leaving it alone"
     else
       ln -s "${d%/}" "$target"
       echo "   linked $name"
