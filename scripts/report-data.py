@@ -104,12 +104,15 @@ def _is_stale(row) -> bool:
 def _artifacts(conn, sids: list[str], kind: str) -> dict[str, list[str]]:
     if not sids:
         return {}
-    marks = ",".join("?" * len(sids))
     out: dict[str, list[str]] = defaultdict(list)
-    for r in conn.execute(
-            f"SELECT session_id, content FROM session_artifacts WHERE type=? "
-            f"AND session_id IN ({marks}) ORDER BY turn_index", [kind, *sids]):
-        out[r["session_id"]].append(r["content"])
+    # Chunked: older libsqlite3 (Ubuntu 20.04) caps bind parameters at 999.
+    for i in range(0, len(sids), 500):
+        chunk = sids[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        for r in conn.execute(
+                f"SELECT session_id, content FROM session_artifacts WHERE type=? "
+                f"AND session_id IN ({marks}) ORDER BY turn_index", [kind, *chunk]):
+            out[r["session_id"]].append(r["content"])
     return out
 
 

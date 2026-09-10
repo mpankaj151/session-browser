@@ -53,10 +53,15 @@ cat >> "$RC" <<EOF
 # Control the Session Browser: sb {ui|stop|open|stats|demo|doctor|refresh [--enrich]}
 sb() {
   local REPO="$REPO"
+  # [ui].port from config (docs/SETUP.md tells users to change it): a fixed
+  # number here printed the wrong URL and made \`sb stop\` kill whatever
+  # unrelated process held it.
+  local P; P="\$("\$REPO/.venv/bin/python" -c 'import sys; sys.path.insert(0, sys.argv[1]); import sbconfig; print(int(sbconfig.CONFIG.get("ui", {}).get("port", 7655)))' "\$REPO" 2>/dev/null || echo 7655)"
+  local PIDS
   case "\${1:-}" in
-    ui)      if [ -n "\$(lsof -ti tcp:7655 2>/dev/null || fuser 7655/tcp 2>/dev/null)" ]; then echo "Port 7655 is already in use — the UI may already be running: http://127.0.0.1:7655  (sb stop to restart)"; else mkdir -p "\$HOME/.session-browser/logs"; nohup "\$REPO/.venv/bin/python" "\$REPO/session-ui/app.py" >"\$HOME/.session-browser/logs/ui.log" 2>&1 & echo "Session Browser UI -> http://127.0.0.1:7655"; fi ;;
-    stop)    { lsof -ti tcp:7655 2>/dev/null || fuser 7655/tcp 2>/dev/null; } | xargs kill 2>/dev/null && echo "UI stopped" || echo "UI not running" ;;
-    open)    open http://127.0.0.1:7655 2>/dev/null || xdg-open http://127.0.0.1:7655 ;;
+    ui)      if [ -n "\$(lsof -ti tcp:"\$P" 2>/dev/null || fuser "\$P"/tcp 2>/dev/null)" ]; then echo "Port \$P is already in use — the UI may already be running: http://127.0.0.1:\$P  (sb stop to restart)"; else mkdir -p "\$HOME/.session-browser/logs"; nohup "\$REPO/.venv/bin/python" "\$REPO/session-ui/app.py" >"\$HOME/.session-browser/logs/ui.log" 2>&1 & echo "Session Browser UI -> http://127.0.0.1:\$P"; fi ;;
+    stop)    PIDS="\$(lsof -ti tcp:"\$P" 2>/dev/null || fuser "\$P"/tcp 2>/dev/null)"; if [ -n "\$PIDS" ]; then kill \$PIDS 2>/dev/null && echo "UI stopped"; else echo "UI not running"; fi ;;
+    open)    open "http://127.0.0.1:\$P" 2>/dev/null || xdg-open "http://127.0.0.1:\$P" ;;
     stats)   "\$REPO/.venv/bin/python" "\$REPO/scripts/stats-report.py" "\${@:2}" ;;
     demo)    "\$REPO/.venv/bin/python" "\$REPO/scripts/demo.py" ;;
     doctor)  "\$REPO/bin/doctor.sh" ;;

@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import indexer  # noqa: E402
 import sbconfig  # noqa: E402
 
-_TOK = "input_tokens+output_tokens+cache_read_tokens+cache_write_tokens"
+_TOK = ("COALESCE(input_tokens,0)+COALESCE(output_tokens,0)"
+        "+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)")
 PFX = "≈" if sbconfig.COST_IS_NOTIONAL else ""
 
 

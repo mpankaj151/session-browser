@@ -59,7 +59,14 @@ def semantic_or_keyword(query: str, limit: int):
     """Try semantic search; fall back to keyword LIKE. Returns list of session_id."""
     try:
         import semsearch
-        hits = semsearch.search(query, limit=limit)
+        # The registry THIS server serves (SESSION_MEMORY_DB), not indexer's
+        # default: the two can differ, and semantic hits from another DB would
+        # be looked up here and silently come back empty.
+        sconn = connect()
+        try:
+            hits = semsearch.search(query, limit=limit, conn=sconn)
+        finally:
+            sconn.close()
         if hits:
             return [sid for sid, _ in hits], {sid: round(sc, 3) for sid, sc in hits}
     except Exception:  # noqa: BLE001

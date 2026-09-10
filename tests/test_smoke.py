@@ -3950,6 +3950,247 @@ def test_restore_rechecks_the_zst_destination_before_writing():
     print("  ok  restore: the .zst twin of the destination counts as live")
 
 
+# ===== final review: UI / API / MCP honesty ==================================
+def _js_function_source(name: str) -> str:
+    """Source text of one top-level `function name(...){ ... }` in the SPA."""
+    html = (_REPO / "session-ui" / "static" / "index.html").read_text()
+    start = html.index(f"function {name}(")
+    if html[max(0, start - 6):start] == "async ":
+        start -= 6
+    depth = 0
+    for i in range(start, len(html)):
+        if html[i] == "{":
+            depth += 1
+        elif html[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return html[start:i + 1]
+    raise AssertionError(f"unterminated function {name}")
+
+
+def test_api_resume_refuses_a_cli_that_is_not_installed():
+    """Resume answered 200 with `cr <id>` for a source whose binary is absent on
+    this machine (rows synced from the other laptop); the user switched
+    terminals and got 'claude is not on PATH'. Bridge already refused — resume
+    now does too, and the SPA can disable the button from /api/sources."""
+    import os
+    from sources.claude import ClaudeSource
+    sb, conn, root, restore = _app_harness()
+    try:
+        indexer.upsert(_header("s1", project_path=str(root / "claude" / "-p")), conn=conn)
+        conn.commit()
+        sb.SOURCES = {"claude": ClaudeSource(root / "claude")}
+        os.environ["PATH"] = str(root / "nobins")
+        c = sb.app.test_client()
+        r = c.get("/api/sessions/s1/resume")
+        assert r.status_code == 409 and "not installed" in r.get_json()["error"], r.data
+        assert c.get("/api/sources").get_json()["claude"]["installed"] is False
+    finally:
+        restore()
+    print("  ok  resume: 409 when the row's CLI is not installed here")
+
+
+def test_api_restorable_is_decided_per_row_not_per_source():
+    """_restore_supported() asked 'does the adapter have restore_path'; the
+    adapter refuses rows whose recorded path is outside its tree (a registry
+    carried from another machine), so Restore was advertised and then 409'd.
+    The API now asks restore.supported_for(row)."""
+    from sources.claude import ClaudeSource
+    sb, conn, root, restore = _app_harness()
+    try:
+        raw = root / "archive" / "raw" / "2026" / "08"
+        raw.mkdir(parents=True)
+        inside, outside = root / "claude" / "-p", Path("/Users/other-laptop/.claude/projects/-p")
+        for sid, pp in (("row-inside", inside), ("row-outside", outside)):
+            (raw / f"{sid}.jsonl").write_text(_cl_transcript("hi", cwd="/x"))
+            indexer.upsert(_header(sid, project_path=str(pp)), conn=conn)
+            indexer.archive(sid, indexer.TRANSCRIPT_MISSING, conn=conn)
+        conn.commit()
+        sb.SOURCES = {"claude": ClaudeSource(root / "claude")}
+        c = sb.app.test_client()
+        rows = {s["session_id"]: s for s in c.get("/api/sessions?state=archived").get_json()}
+        assert rows["row-inside"]["restorable"] is True and rows["row-inside"]["restore_blocker"] is None
+        assert rows["row-outside"]["restorable"] is False and rows["row-outside"]["restore_blocker"] == "unsupported", rows["row-outside"]
+        H = {"X-Requested-With": "session-browser"}
+        assert c.post("/api/sessions/row-outside/restore", headers=H).status_code == 409
+        assert c.post("/api/sessions/row-inside/restore", headers=H).status_code == 200
+    finally:
+        restore()
+    print("  ok  restorable agrees with restore_session() per row")
+
+
+def test_restore_blocker_prefers_no_raw_copy_over_unsupported():
+    """An archived row with no raw copy AND no adapter support was labelled
+    'unsupported', whose tooltip claims 'a raw copy exists' — it does not."""
+    sb, conn, root, restore = _app_harness()
+    try:
+        indexer.upsert(_header("gm-gone", cli_source="gemini"), conn=conn)
+        indexer.archive("gm-gone", indexer.TRANSCRIPT_MISSING, conn=conn)
+        conn.commit()
+        sb.SOURCES = {}
+        row = sb.app.test_client().get("/api/sessions?state=archived").get_json()[0]
+        assert row["restorable"] is False and row["restore_blocker"] == "no-raw-copy", row
+    finally:
+        restore()
+    print("  ok  restore_blocker names the fact that is actually missing")
+
+
+def test_bridge_and_resume_say_when_the_recorded_cwd_is_gone():
+    """`cd <cwd> && <cli> …` died at the cd for a directory from another
+    machine, after the user had already pasted the command. With no such
+    directory the command drops the cd and the primer says so; resume reports
+    origin_cwd_exists."""
+    import os
+    from sources.claude import ClaudeSource
+    sb, conn, root, restore = _app_harness()
+    try:
+        gone = "/Users/other-laptop/code/my proj"
+        indexer.upsert(_header("s1", cwd=gone, project_path=str(root / "claude" / "-p")), conn=conn)
+        conn.commit()
+        sb.SOURCES = {"claude": ClaudeSource(root / "claude")}
+        bins = root / "bins"
+        bins.mkdir()
+        for b in ("claude", "codex"):
+            (bins / b).write_text("#!/bin/sh\nexit 0\n")
+            (bins / b).chmod(0o755)
+        os.environ["PATH"] = str(bins)
+        c = sb.app.test_client()
+        r = c.post("/api/sessions/s1/bridge?target=codex", headers={"X-Requested-With": "x"})
+        assert r.status_code == 200, r.data
+        j = r.get_json()
+        assert not j["command"].startswith("cd "), j["command"]
+        assert "does not exist on this machine" in j["primer"], j["primer"][:400]
+        assert j["origin_cwd_exists"] is False
+        r = c.get("/api/sessions/s1/resume")
+        assert r.status_code == 200 and r.get_json()["origin_cwd_exists"] is False, r.data
+    finally:
+        restore()
+    print("  ok  bridge/resume: a missing origin cwd is reported, never `cd`-ed into")
+
+
+def test_api_sessions_marks_a_truncated_listing():
+    """A hard LIMIT 500 with no marker: the header counted 602 sessions, the
+    list showed 500, and the oldest 102 — the very rows the archive protects —
+    were unreachable from any UI path without a word about it."""
+    sb, conn, root, restore = _app_harness()
+    try:
+        for i in range(503):
+            indexer.upsert(_header(f"s{i:04d}", last_activity=f"2026-01-{1 + i % 28:02d}T00:00:00.000Z"), conn=conn)
+        conn.commit()
+        sb.SOURCES = {}
+        c = sb.app.test_client()
+        r = c.get("/api/sessions")
+        assert len(r.get_json()) == 500
+        assert r.headers.get("X-Result-Truncated") == "1" and r.headers.get("X-Result-Total") == "503", dict(r.headers)
+        r = c.get("/api/sessions?days=0&search=s0002")
+        assert r.headers.get("X-Result-Truncated") in (None, "0")
+    finally:
+        restore()
+    print("  ok  /api/sessions flags a truncated listing with the true total")
+
+
+def test_spa_markdown_blockquote_and_fetch_errors():
+    """(a) mdToHtml sliced the ESCAPED line by the RAW marker length, so every
+    '> ' reasoning line rendered as 't; …'. (b) fetchJson threw Error(status),
+    discarding the server's honest error body."""
+    import shutil
+    import subprocess
+    if not shutil.which("node"):
+        print("  --  node not installed: SPA function check skipped")
+        return
+    src = "\n".join(_js_function_source(n) for n in ("esc", "mdToHtml", "fetchJson"))
+    driver = src + r"""
+const q = mdToHtml("> I need to check the auth flow.\n>\n- item **bold**");
+if (!q.includes("<blockquote") || !q.includes(">I need to check the auth flow.</blockquote>")) { console.error("BAD:" + q); process.exit(2); }
+if (q.includes("t; ")) { console.error("BAD:" + q); process.exit(3); }
+globalThis.fetch = async () => ({ ok: false, status: 409, json: async () => ({ error: "codex is not installed on this machine" }) });
+fetchJson("/x").then(() => process.exit(4)).catch(e => { if (!String(e.message).includes("codex is not installed")) { console.error("BAD:" + e.message); process.exit(5); } console.log("ok"); });
+"""
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "t.js"
+        f.write_text(driver)
+        p = subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, (p.returncode, p.stderr[-400:])
+    print("  ok  SPA: blockquotes render, fetch errors carry the server's message")
+
+
+def test_shell_helpers_read_the_ui_port_from_config():
+    """[ui].port is honoured by app.py, but `sb ui|stop|open` and doctor
+    hard-coded 7655: after the documented remedy for a busy port, sb printed
+    the wrong URL, could not see the running UI, and `sb stop` killed whatever
+    unrelated process held 7655."""
+    import os
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        env = {**os.environ, "HOME": td, "SHELL": "/bin/zsh"}
+        p = subprocess.run(["bash", str(_REPO / "bin" / "install-cr.sh")], env=env, capture_output=True, text=True, timeout=60)
+        assert p.returncode == 0, p.stderr
+        rc = (Path(td) / ".zshrc").read_text()
+        block = rc[rc.index("# >>> session-browser sb >>>"):rc.index("# <<< session-browser sb <<<")]
+        for literal in ("tcp:7655", "127.0.0.1:7655", "7655/tcp"):
+            assert literal not in block, (literal, block)
+        assert "sbconfig" in block, block          # resolved from config; 7655 survives only as the fallback
+    doctor = (_REPO / "bin" / "doctor.sh").read_text()
+    for literal in ("tcp:7655", "localhost:7655", ":7655 "):
+        assert literal not in doctor, ("doctor still hard-codes the port", literal)
+    print("  ok  sb / doctor resolve the UI port from config")
+
+
+def test_stats_report_token_sums_tolerate_null_columns():
+    """_TOK summed the four token columns without per-column COALESCE, so one
+    NULL zeroed a row's whole token count (the dashboard COALESCEs each)."""
+    mod = _load_script("stats-report")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="a"), conn=conn)
+        indexer.upsert(_header(sid="b"), conn=conn)
+        conn.execute("UPDATE sessions SET input_tokens=100, output_tokens=50, cache_read_tokens=NULL, cache_write_tokens=NULL WHERE session_id='a'")
+        conn.execute("UPDATE sessions SET input_tokens=10, output_tokens=10, cache_read_tokens=10, cache_write_tokens=10 WHERE session_id='b'")
+        line = mod._window(conn, "all", "")
+        assert "190 tok" in line, line
+    finally:
+        conn.close()
+    print("  ok  stats-report token sums COALESCE per column")
+
+
+def test_mcp_descriptors_flag_archived_rows_and_tolerate_odd_bytes():
+    """search/list returned aged-out sessions with no `archived` field, so the
+    consuming agent suggested `cr <id>` for a transcript that no longer exists;
+    get_reasoning read the trail strictly and one bad byte became a tool error."""
+    import os
+    tmp = tempfile.mkdtemp(prefix="sb-mcp2-")
+    db = str(Path(tmp) / "r.db")
+    os.environ["SESSION_MEMORY_DB"] = db
+    try:
+        conn = indexer.connect(db)
+        try:
+            for sid in ("live", "aged"):
+                indexer.upsert(_header(sid=sid, last_activity="2026-09-01T00:00:00.000Z", title="find me"), conn=conn)
+            indexer.archive("aged", indexer.TRANSCRIPT_MISSING, conn=conn)
+            trail = Path(tmp) / "trail.md"
+            trail.write_bytes(b"# Decision trail\n\xff\xfe odd bytes\n")
+            conn.execute("UPDATE sessions SET reasoning_path=? WHERE session_id='live'", (str(trail),))
+            conn.commit()
+        finally:
+            conn.close()
+        srv_dir = _REPO / "mcp" / "session-memory"
+        sys.path.insert(0, str(srv_dir))
+        spec = _ilu.spec_from_file_location("sb_mcp_server2", srv_dir / "server.py")
+        srv = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(srv)
+        srv.common.DB_PATH = db
+        recent = {r["session_id"]: r for r in srv.list_recent(days=36500)}
+        assert recent["aged"]["archived"] is True and recent["live"]["archived"] is False, recent
+        found = {r["session_id"]: r for r in srv.search_sessions("find me", limit=5)}
+        assert "archived" in found.get("aged", {}), found
+        got = srv.get_reasoning("live")
+        assert "markdown" in got and "odd bytes" in got["markdown"], got
+        assert "Claude" not in (srv.get_reasoning.__doc__ or "") or "CLI" in (srv.get_reasoning.__doc__ or "")
+    finally:
+        os.environ.pop("SESSION_MEMORY_DB", None)
+    print("  ok  MCP: archived flag on descriptors, lenient trail decoding")
+
+
 if __name__ == "__main__":
     print("Session Browser smoke + regression tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
