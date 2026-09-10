@@ -44,11 +44,6 @@ ENRICH = _REPO / "scripts" / "enrich-sessions.py"
 # suspenders in the adapter).
 _SUPPRESS_ENV = "SESSION_BROWSER_SUPPRESS_HOOK"
 
-# Entries older than this are useless to the watcher's 30s race-guard; pruning
-# on every write keeps .hook-state.json from growing forever.
-_STATE_TTL_S = 300
-
-
 def _read_payload() -> dict:
     try:
         raw = sys.stdin.read()
@@ -67,30 +62,6 @@ def _transcript_path(payload: dict) -> Path | None:
     return None
 
 
-def _write_hook_state(hook_state: Path, session_id: str) -> None:
-    state = {}
-    if hook_state.exists():
-        try:
-            state = json.loads(hook_state.read_text())
-        except (json.JSONDecodeError, OSError):
-            state = {}
-    now = datetime.now(timezone.utc)
-    state[session_id] = now.isoformat()
-    # prune stale entries; tolerate junk values
-    fresh = {}
-    for sid, ts in state.items():
-        try:
-            if (now - datetime.fromisoformat(ts)).total_seconds() < _STATE_TTL_S:
-                fresh[sid] = ts
-        except (ValueError, TypeError):
-            continue
-    hook_state.parent.mkdir(parents=True, exist_ok=True)
-    # atomic replace: a concurrent reader never sees a half-written file
-    tmp = hook_state.with_suffix(f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(fresh))
-    os.replace(tmp, hook_state)
-
-
 def main() -> None:
     if os.environ.get(_SUPPRESS_ENV):
         return  # our own headless enrichment call — nothing to index
@@ -102,6 +73,7 @@ def main() -> None:
 
     # Project imports INSIDE the guard: a broken config.toml or missing dep must
     # not take down the hook (see module docstring contract).
+    import hookstate
     import indexer
     import sbconfig
     from sources.claude import ClaudeSource
@@ -114,7 +86,7 @@ def main() -> None:
         header = ClaudeSource().parse_header(path)
         if header is not None:
             indexer.upsert(header)
-            _write_hook_state(sbconfig.HOOK_STATE, header.session_id)
+            hookstate.mark(header.session_id)
     except Exception as e:  # noqa: BLE001 — a hook must never crash the session
         print(f"[session-hook] index error: {e}", file=sys.stderr)
 

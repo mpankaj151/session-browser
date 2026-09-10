@@ -8,7 +8,7 @@ Step-by-step install for a fresh machine, plus a troubleshooting matrix.
 |------|-------|-------|
 | Python 3.11+ | `brew install python@3.12` | `sudo apt install python3 python3-venv` |
 | git | preinstalled / `brew install git` | `sudo apt install git` |
-| A supported CLI | [Claude Code](https://claude.com/claude-code) and/or [Copilot CLI](https://github.com/github/copilot-cli) / [Codex](https://github.com/openai/codex) | same |
+| A supported CLI | [Claude Code](https://claude.com/claude-code) and/or [Copilot CLI](https://github.com/github/copilot-cli) / [Codex](https://github.com/openai/codex) / [OpenCode](https://opencode.ai) | same |
 
 You need at least one supported CLI **with existing session history** for the
 browser to have anything to show. No history yet? Run `sb demo` after install to
@@ -60,6 +60,7 @@ Install flags:
 | `--lite` | Skip the ~2 GB semantic-search ML stack; search falls back to keyword + full-text |
 | `--enrich` | Also LLM-journal your **existing** history during install (spends your plan's quota; the hooks + nightly job cover *new* sessions regardless). Later: `sb refresh --enrich`. Enrichment runs on `claude-sonnet-5` by default — change or clear it via `[enrichment.claude_headless] model` in `config.toml` |
 | `--no-hook` | Don't register the Claude hooks or link the skills |
+| `--opencode-plugin` | Install the OpenCode plugin (`~/.config/opencode/plugins/session-browser.js`): indexes a session the moment a turn settles, re-syncs on deletion. Optional — the watcher already picks OpenCode changes up within seconds |
 | `--no-launchd` | Don't install macOS launchd jobs |
 | `--no-backfill` | Don't index existing sessions now |
 

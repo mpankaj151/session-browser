@@ -34,7 +34,8 @@ def main() -> None:
 
     if args.session_id:
         r = restore.restore_session(args.session_id)
-        print(f"{r.status:14} {r.session_id}  {r.path or ''}  {r.detail}")
+        flag = "" if r.reimported is None else ("  [re-imported]" if r.reimported else "  [re-import FAILED]")
+        print(f"{r.status:14} {r.session_id}  {r.path or ''}  {r.detail}{flag}")
         sys.exit(0 if r.status in ("restored", "already-live") else 1)
 
     rows = restore.plan()
@@ -57,7 +58,7 @@ def main() -> None:
     for r in can:
         res = restore.restore_session(r["session_id"])
         outcome[res.status] += 1
-        if res.status != "restored":
+        if res.status != "restored" or res.reimported is False:
             print(f"  ! {r['session_id'][:36]} -> {res.status} {res.detail}")
     print("\nDone: " + ", ".join(f"{n} {k}" for k, n in outcome.most_common()))
     print("Re-run `sb refresh` so reasoning trails / full-text pick the restored files up.")

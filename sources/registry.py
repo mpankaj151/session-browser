@@ -31,10 +31,18 @@ def _make_codex() -> SessionSource:
                        cfg.get("archived_sessions_dir"))
 
 
+def _make_opencode() -> SessionSource:
+    from sources.opencode import DATA_DIR, MIRROR_DIR, OpenCodeSource
+    cfg = sbconfig.source_config("opencode")
+    return OpenCodeSource(cfg.get("data_dir", DATA_DIR), cfg.get("mirror_dir", MIRROR_DIR),
+                          db=cfg.get("db"), reimport_on_restore=cfg.get("reimport_on_restore", True))
+
+
 _FACTORIES: dict[str, Callable[[], SessionSource]] = {
     "claude": _make_claude,
     "copilot": _make_copilot,
     "codex": _make_codex,
+    "opencode": _make_opencode,
 }
 
 

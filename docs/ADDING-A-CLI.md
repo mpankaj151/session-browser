@@ -86,18 +86,37 @@ sessions_dir = "~/.mycli/sessions"
 binary       = "mycli"
 ```
 
-## Optional extras
+## Checklist — everything that silently degrades if missed
 
-- **Cost:** add a `_usage_mycli(path) -> (totals, per_model)` function to
-  `scripts/compute-costs.py` and register it in its `_EXTRACTORS` dict. Add your
-  model names to `pricing.json` `aliases`.
-- **Reasoning trail:** add an `extract_mycli(path)` to `reasoning.py` (return
-  `list[ReasoningStep]`) and register it in `extract-reasoning.py` `_EXTRACTORS`.
-- **Bridge target:** add a command template to `_BRIDGE_CMD` in
-  `session-ui/app.py` and the name to `BRIDGE_TARGETS` in the SPA.
-- **cr resume:** add a branch to `bin/resume-here.sh` if the CLI needs memory
-  porting (Claude) or in-place resume (Codex).
-- **UI badge color:** add your source to `SOURCE_COLORS` in `static/index.html`.
+`sources/codex.py` and `sources/opencode.py` are the reference adapters. The
+system is source-agnostic, but a handful of per-source registrations exist and
+**each one fails quietly when absent**:
+
+| Site | If missed |
+|---|---|
+| `scripts/compute-costs.py` `_EXTRACTORS[name]` → `(totals, per_model)` or `(totals, per_model, cost_usd)` when the source already knows the true spend | token columns stay NULL, cost 0 forever |
+| `pricing.json` aliases (substring match) for models you price yourself | unknown model ⇒ `cost_usd = 0.0` + a stderr line |
+| `scripts/extract-reasoning.py` `_EXTRACTORS[name]` + `reasoning.extract_<name>()` | **no decision trail AND no raw-archive copy → never restorable** |
+| `watch_roots()` when your config key is not `projects_dir` / `state_dir` / `sessions_dir` | indexed on backfill, **never watched**, no log line |
+| `session_id_for_path(p) == parse_header(p).session_id` | `prune-sessions.py` archives every row whose ids disagree |
+| `restore_path(row)` (optional) | Restore reports `unsupported`; also used as "where this row's transcript lives" by the context primer and `extract-reasoning --session-id` |
+| `session-ui/app.py` `_BRIDGE_CMD`, `index.html` `SOURCE_COLORS` / `BRIDGE_TARGETS` / `SRC_HEX` | bridge 400s; grey badge and chart |
+| `bin/resume-here.sh` (auto-detect + case), `bin/check-cli-access.sh`, `install.sh` JOB_PATH loop | `cr <id>` fails; launchd jobs can't find the binary |
+| `scripts/demo.py` row, README Supported CLIs table, `docs/ARCHITECTURE.md`, `docs/SETUP.md`, `skills/work-journal/SKILL.md` | docs drift |
+| `tests/test_smoke.py::test_adapters` + a fixture section (mirror the codex/opencode tests) | no regression net |
+
+## Not one-file-per-session? Use the mirror pattern
+
+Every consumer assumes one plain-text file per session at the path `discover()`
+yields (`reasoning.archive_raw` copies it, `restore.py` copies it back,
+`build-fts` and the extractors open it). If your CLI stores sessions as many
+files or as database rows, do what `sources/opencode.py` does: **project** each
+session into `<mirror_dir>/<id>.jsonl` from `discover()` (line 1 = a header
+with everything `parse_header` needs, then the records), keep a manifest so only
+changed sessions are rewritten, archive-then-unlink when a session disappears at
+the source, and implement `watch_roots()` plus a `sync_trigger(path)` so the
+watcher re-syncs on source changes. `parse_header`/`parse_full` must then work
+on the file alone — they are also run on the raw-archive copy.
 
 ## 4. Verify
 
