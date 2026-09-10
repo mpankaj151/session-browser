@@ -2226,6 +2226,67 @@ def test_opencode_plugin_template_renders_and_installs():
     print("  ok  opencode plugin: renders, node-checks, installs/uninstalls, stale detection")
 
 
+# --- portability: config layering -------------------------------------------------
+def test_config_layers_over_example_defaults():
+    """A per-machine config.toml written before a source or provider existed
+    (the work laptop's predates [sources.opencode]) must not silently drop it:
+    sections and keys missing from config.toml inherit config.toml.example;
+    an explicit value (enabled = false) still wins."""
+    import os
+    import sbconfig
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "config.toml"
+        cfg.write_text('[sources.claude]\nenabled = true\n[sources.codex]\nenabled = false\n'
+                       '[enrichment]\nprovider = "claude-headless"\n')
+        merged = sbconfig.load_config(cfg)
+        assert merged["sources"]["opencode"]["enabled"] is True, "new source dropped by a stale config"
+        assert merged["sources"]["codex"]["enabled"] is False, "explicit override lost"
+        assert merged["sources"]["claude"]["projects_dir"] == "~/.claude/projects", "key-level inherit"
+        assert merged["enrichment"]["provider"] == "claude-headless"
+        assert "opencode_headless" in merged["enrichment"], "new provider block dropped"
+        assert merged["ui"]["port"] == 7655
+        # no config.toml at all == the example
+        assert sbconfig.load_config(Path(td) / "absent.toml")["sources"]["opencode"]["enabled"] is True
+        # SB_CONFIG points a whole run (tests, `sb demo`) at another file
+        old = os.environ.get("SB_CONFIG")
+        os.environ["SB_CONFIG"] = str(cfg)
+        try:
+            assert sbconfig.load_config()["sources"]["codex"]["enabled"] is False
+        finally:
+            if old is None:
+                os.environ.pop("SB_CONFIG", None)
+            else:
+                os.environ["SB_CONFIG"] = old
+    print("  ok  config.toml layers over config.toml.example (stale configs keep new sources)")
+
+
+def test_claude_and_copilot_available_without_binary_on_path():
+    """Availability means 'there are transcripts to read'. Gating it on `which
+    <cli>` unsubscribed the watcher and skipped backfill the moment the CLI was
+    uninstalled or fell off the daemon's PATH — the transcripts were still there,
+    and keeping them browsable after a CLI goes away is the point of this tool
+    (codex and opencode already behave this way)."""
+    import os
+    from sources.claude import ClaudeSource
+    from sources.copilot import CopilotSource
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (tmp / "projects").mkdir()
+        (tmp / "state").mkdir()
+        old = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = str(tmp / "no-bins")
+            assert ClaudeSource(tmp / "projects").is_available(), "claude transcripts present but source unavailable"
+            assert CopilotSource(tmp / "state").is_available(), "copilot transcripts present but source unavailable"
+            assert ClaudeSource(tmp / "projects").has_binary() is False
+            assert CopilotSource(tmp / "state").has_binary() is False
+        finally:
+            os.environ["PATH"] = old
+        assert ClaudeSource(tmp / "absent").is_available() is False
+        assert CopilotSource(tmp / "absent").is_available() is False
+    print("  ok  claude/copilot availability = transcripts on disk, not the binary on PATH")
+
+
 if __name__ == "__main__":
     print("Session Browser smoke + regression tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

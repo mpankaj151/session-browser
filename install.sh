@@ -64,8 +64,25 @@ semsearch.get_model()
 PYEOF
 fi
 
-# 2. config
-[ -f "$REPO/config.toml" ] || cp "$REPO/config.toml.example" "$REPO/config.toml"
+# 2. config — a minimal OVERRIDE file, not a copy of the example. config.toml is
+#    layered over config.toml.example at load time, so a full copy would freeze
+#    today's defaults and silently miss every source/provider a later git pull
+#    adds (this is exactly how a pre-OpenCode config hid OpenCode).
+if [ ! -f "$REPO/config.toml" ]; then
+  cat > "$REPO/config.toml" <<'EOF'
+# Per-machine overrides for Session Browser (this file is git-ignored).
+# Layered over config.toml.example: anything NOT set here keeps the example's
+# documented default, so sources and providers added by `git pull` just work.
+# Only write the keys you want to change, e.g.
+#
+# [enrichment]
+# provider = "opencode-headless"     # summarise through OpenCode on this machine
+#
+# [sources.codex]
+# enabled = false                    # never index Codex here
+EOF
+  echo "==> wrote config.toml (overrides only; defaults come from config.toml.example)"
+fi
 
 # 3. runtime dirs + schema
 mkdir -p "$LOG_DIR"

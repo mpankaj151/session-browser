@@ -135,26 +135,76 @@ def render_prompt(turns: list, cli_source: str, model: str, cwd: str,
                     .replace("{transcript}", transcript))
 
 
+# provider name -> (module, class, binary). Also the "auto" preference order:
+# claude first (the daily driver where it exists), then the OpenCode harness,
+# then Copilot (argv-passed prompt — the least private of the three).
+_PROVIDERS: dict[str, tuple[str, str, str]] = {
+    "claude-headless": ("claude_headless", "ClaudeHeadless", "claude"),
+    "opencode-headless": ("opencode_headless", "OpenCodeHeadless", "opencode"),
+    "copilot-headless": ("copilot_headless", "CopilotHeadless", "copilot"),
+}
+_NONE = ("none", "null", None)
+
+
+class UnavailableProvider:
+    """What `provider = "auto"` yields when no summariser CLI is on PATH.
+
+    Distinct from NullProvider on purpose: null facets mark a session as
+    enriched (summary NOT NULL), which would block a real summary once a CLI
+    is installed. This one is simply unavailable, so the driver skips."""
+    name = "auto"
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def is_available(self) -> bool:
+        return False
+
+    def summarize(self, turns: list, cli_source: str, model: str = "", cwd: str = "",
+                  prior: dict | None = None) -> dict:
+        raise RuntimeError(self.reason)
+
+
+def _sub_config(config: dict, name: str) -> dict:
+    return config.get("enrichment", {}).get(name.replace("-", "_"), {})
+
+
+def resolve_provider_name(config: dict) -> str | None:
+    """The concrete provider [enrichment].provider means on THIS machine.
+
+    Explicit names pass through untouched (a typo is reported by get_provider).
+    "auto" = the first provider in _PROVIDERS order whose binary — the
+    configured `binary`, else the default — is on PATH; None when none is."""
+    import shutil
+    name = config.get("enrichment", {}).get("provider", "auto")
+    if name != "auto":
+        return "none" if name in _NONE else name
+    for cand, (_, _, binary) in _PROVIDERS.items():
+        if shutil.which(_sub_config(config, cand).get("binary", binary)):
+            return cand
+    return None
+
+
 def get_provider(config: dict):
     """Factory: maps [enrichment].provider to a provider instance."""
-    name = config.get("enrichment", {}).get("provider", "none")
-    if name in ("none", "null", None):
+    import importlib
+    configured = config.get("enrichment", {}).get("provider", "auto")
+    name = resolve_provider_name(config)
+    if name is None:
+        return UnavailableProvider(
+            "no summariser CLI on PATH (looked for claude, opencode, copilot) — "
+            "install one or set [enrichment].provider explicitly")
+    if name == "none":
         from .null_provider import NullProvider
         return NullProvider()
-    sub = config.get("enrichment", {}).get(name.replace("-", "_"), {})
-    if name == "claude-headless":
-        from .claude_headless import ClaudeHeadless
-        return ClaudeHeadless(sub)
-    if name == "copilot-headless":
-        from .copilot_headless import CopilotHeadless
-        return CopilotHeadless(sub)
-    if name == "opencode-headless":
-        from .opencode_headless import OpenCodeHeadless
-        return OpenCodeHeadless(sub)
-    # A typo here used to degrade silently to the null provider: every nightly
-    # run "succeeded" with empty facets and nothing said why. Say so.
-    print(f"[enrichment] unknown provider {name!r} in config.toml — falling back to the "
-          f"null provider (no LLM). Valid: claude-headless | copilot-headless | "
-          f"opencode-headless | none", file=sys.stderr)
-    from .null_provider import NullProvider
-    return NullProvider()
+    spec = _PROVIDERS.get(name)
+    if spec is None:
+        # A typo here used to degrade silently to the null provider: every nightly
+        # run "succeeded" with empty facets and nothing said why. Say so.
+        print(f"[enrichment] unknown provider {configured!r} in config.toml — falling back to the "
+              f"null provider (no LLM). Valid: auto | {' | '.join(_PROVIDERS)} | none",
+              file=sys.stderr)
+        from .null_provider import NullProvider
+        return NullProvider()
+    module, cls, _ = spec
+    return getattr(importlib.import_module(f".{module}", __package__), cls)(_sub_config(config, name))

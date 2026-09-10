@@ -73,30 +73,35 @@ echo "[sources]"
 import sys; sys.path.insert(0, sys.argv[1])
 from sources.registry import build_source_registry
 for name,a in build_source_registry().items():
-    avail=a.is_available()
+    avail=a.is_available()          # transcripts on disk (indexing never needs the binary)
+    hb=getattr(a, "has_binary", None)
+    binary="" if hb is None else (" · binary on PATH" if hb() else " · binary NOT on PATH (resume/bridge from this shell will fail)")
     mark="\033[32m✓\033[0m" if avail else "\033[33m∼\033[0m"
-    print(f"  {mark} {name}: {'available' if avail else 'binary/dir missing'}")
+    print(f"  {mark} {name}: {'transcripts found' if avail else 'no transcripts yet (nothing to index)'}{binary}")
 PYEOF
 
 echo "[enrichment]"
 "$PY" - "$REPO" <<'PYEOF'
 import shutil, sys; sys.path.insert(0, sys.argv[1])
 import sbconfig
-cfg = sbconfig.CONFIG.get("enrichment", {})
-name = cfg.get("provider", "none")
-sub = cfg.get(name.replace("-", "_"), {}) if isinstance(name, str) else {}
-binary = sub.get("binary", {"claude-headless": "claude", "copilot-headless": "copilot",
-                            "opencode-headless": "opencode"}.get(name, ""))
-model = sub.get("model", "anthropic/claude-sonnet-5" if name == "opencode-headless"
-                else "claude-sonnet-5" if name == "claude-headless" else "")
-if name in ("none", "null"):
+from enrichment.provider import _PROVIDERS, get_provider, resolve_provider_name
+configured = sbconfig.CONFIG.get("enrichment", {}).get("provider", "auto")
+name = resolve_provider_name(sbconfig.CONFIG)
+label = f"{configured} -> {name}" if configured == "auto" and name else str(configured)
+if name is None:
+    print("  \033[33m∼\033[0m provider: auto found no summariser CLI on PATH (claude / opencode / copilot) — "
+          "enrichment is skipped; install one or set [enrichment].provider")
+elif name == "none":
     print("  \033[33m∼\033[0m provider: none (no LLM summaries)")
-elif name not in ("claude-headless", "copilot-headless", "opencode-headless"):
+elif name not in _PROVIDERS:
     print(f"  \033[31m✗\033[0m provider: {name!r} is not a known provider — summaries will be empty")
 else:
+    prov = get_provider(sbconfig.CONFIG)
+    binary = getattr(prov, "binary", _PROVIDERS[name][2])
+    model = getattr(prov, "model", "")
     have = shutil.which(binary) is not None
     mark = "\033[32m✓\033[0m" if have else "\033[31m✗\033[0m"
-    print(f"  {mark} provider: {name}  model: {model or '(CLI default)'}  binary: {binary} "
+    print(f"  {mark} provider: {label}  model: {model or '(CLI default)'}  binary: {binary} "
           f"{'found' if have else 'NOT on PATH'}")
 PYEOF
 

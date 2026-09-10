@@ -169,7 +169,13 @@ def main() -> None:
     provider = get_provider(sbconfig.CONFIG)
     print(f"provider: {provider.name} (available={provider.is_available()})")
     if not provider.is_available():
-        print("provider unavailable; aborting", file=sys.stderr)
+        if provider.name == "auto":
+            # No summariser CLI on this machine at all: a configuration state,
+            # not a failed run — say so once and let refresh-all stay green.
+            print(f"enrichment skipped: {provider.reason}")
+            return
+        print(f"provider {provider.name} unavailable (binary "
+              f"{getattr(provider, 'binary', '?')!r} not on PATH); aborting", file=sys.stderr)
         sys.exit(1)
 
     adapters = build_source_registry(only_available=True)

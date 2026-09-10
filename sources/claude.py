@@ -184,8 +184,19 @@ class ClaudeSource:
     def resume_command(self, session_id: str) -> str:
         return f"claude --resume {shlex.quote(session_id)}"
 
+    def has_binary(self) -> bool:
+        """Whether `claude` is runnable from here — a UI hint for resume/bridge only."""
+        return shutil.which("claude") is not None
+
     def is_available(self) -> bool:
-        return shutil.which("claude") is not None and self.projects_dir.exists()
+        """Whether there are transcripts to read.
+
+        Deliberately NOT gated on `which claude`: the watcher and backfill must
+        keep indexing ~/.claude/projects after Claude Code is uninstalled or
+        drops off the daemon's PATH — those transcripts are exactly what this
+        tool exists to keep browsable (codex/opencode already behave this way).
+        """
+        return self.projects_dir.exists()
 
     # -- helpers ---------------------------------------------------------------
     def _first_typed_message(self, path: Path) -> str:

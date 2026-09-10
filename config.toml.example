@@ -1,4 +1,9 @@
-# Session Browser configuration. Copy to config.toml and edit.
+# Session Browser configuration — the complete, documented DEFAULTS.
+# Per-machine changes go in config.toml (git-ignored), which is LAYERED over this
+# file: any section or key config.toml omits keeps the value here, so a config
+# written before a source/provider existed still picks it up after `git pull`.
+# To switch a source off, set `enabled = false` in config.toml (deleting its
+# block no longer does that). $SB_CONFIG points a run at another override file.
 # Paths use ~ for the home directory; they are expanded at load time.
 
 [paths]
@@ -55,10 +60,12 @@ binary     = "opencode"
 
 # --- Enrichment --------------------------------------------------------------
 [enrichment]
-# Which CLI does the summarising. Per machine: keep claude-headless where Claude
-# Code is the daily driver; use opencode-headless where OpenCode is the harness
-# (any provider it is authenticated for — Anthropic, OpenAI, gateways).
-provider = "claude-headless"   # claude-headless | copilot-headless | opencode-headless | none
+# Which CLI does the summarising. "auto" = the first of claude, opencode, copilot
+# found on PATH, so a laptop with any one of them enriches out of the box. Pin
+# one per machine when several are installed and you care which quota pays:
+# claude-headless where Claude Code is the daily driver, opencode-headless where
+# OpenCode is the harness (any provider it is authenticated for). "none" = no LLM.
+provider = "auto"   # auto | claude-headless | opencode-headless | copilot-headless | none
 
 [enrichment.claude_headless]
 binary          = "claude"

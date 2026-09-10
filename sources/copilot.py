@@ -147,8 +147,13 @@ class CopilotSource:
     def resume_command(self, session_id: str) -> str:
         return f"copilot --resume={shlex.quote(session_id)}"
 
+    def has_binary(self) -> bool:
+        """Whether `copilot` is runnable from here — a UI hint for resume/bridge only."""
+        return shutil.which("copilot") is not None
+
     def is_available(self) -> bool:
-        return shutil.which("copilot") is not None and self.state_dir.exists()
+        """Transcripts to read — never gated on the binary (see ClaudeSource)."""
+        return self.state_dir.exists()
 
     # -- helpers --
     @staticmethod
