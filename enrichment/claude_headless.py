@@ -45,14 +45,34 @@ class ClaudeHeadless:
     def is_available(self) -> bool:
         return shutil.which(self.binary) is not None
 
+    @staticmethod
+    def run_cwd() -> str:
+        """Every headless call writes an sdk-cli transcript under its cwd. Run
+        from one dedicated directory that the Claude adapter refuses to index
+        BY PATH — a filesystem marker no upstream field rename can break."""
+        import sbconfig
+        d = sbconfig.FACETS_DIR.parent / "enrichment-cwd"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return str(sbconfig.FACETS_DIR.parent)
+        return str(d)
+
     def summarize(self, turns: list, cli_source: str, model: str = "", cwd: str = "",
                   prior: dict | None = None) -> dict:
         prompt = render_prompt(turns, cli_source, model, cwd, self.template, prior=prior)
-        proc = subprocess.run(
-            self.command(),
-            input=prompt, capture_output=True, text=True, timeout=self.timeout,
-            env={**os.environ, **_SUPPRESS},
-        )
+        try:
+            proc = subprocess.run(
+                self.command(),
+                input=prompt, capture_output=True, text=True, timeout=self.timeout,
+                env={**os.environ, **_SUPPRESS}, cwd=self.run_cwd(),
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"{self.binary} timed out after {self.timeout}s") from e
         if proc.returncode != 0:
             raise RuntimeError(f"{self.binary} exited {proc.returncode}: {proc.stderr[:200]}")
-        return parse_facet_json(proc.stdout, self.name, model)
+        # _meta.model is the SUMMARISER's model (this provider's pin), not the
+        # enriched session's; `claude --print` exposes no per-call cost.
+        facet = parse_facet_json(proc.stdout, self.name, self.model or None)
+        facet["_meta"]["enrich_cost_usd"] = None
+        return facet

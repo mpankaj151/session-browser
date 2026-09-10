@@ -36,11 +36,19 @@ class CopilotHeadless:
                   prior: dict | None = None) -> dict:
         prompt = render_prompt(turns, cli_source, model, cwd, self.template, prior=prior)
         prompt = prompt[:120_000]  # argv-passed; stay far below ARG_MAX
-        proc = subprocess.run(
-            [self.binary, *self.exec_args, prompt],
-            capture_output=True, text=True, timeout=self.timeout,
-            env={**os.environ, **_SUPPRESS},
-        )
+        try:
+            proc = subprocess.run(
+                [self.binary, *self.exec_args, prompt],
+                capture_output=True, text=True, timeout=self.timeout,
+                env={**os.environ, **_SUPPRESS},
+            )
+        except subprocess.TimeoutExpired as e:
+            # TimeoutExpired.__str__ interpolates argv — here the whole prompt —
+            # and would land the transcript in the nightly error log.
+            raise RuntimeError(f"{self.binary} timed out after {self.timeout}s") from e
         if proc.returncode != 0:
             raise RuntimeError(f"{self.binary} exited {proc.returncode}: {proc.stderr[:200]}")
-        return parse_facet_json(proc.stdout, self.name, model)
+        # Copilot pins no model; the enriched session's model is NOT the summariser's.
+        facet = parse_facet_json(proc.stdout, self.name, "")
+        facet["_meta"]["enrich_cost_usd"] = None
+        return facet
