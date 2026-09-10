@@ -101,7 +101,7 @@ system is source-agnostic, but a handful of per-source registrations exist and
 | `session_id_for_path(p) == parse_header(p).session_id` | `prune-sessions.py` archives every row whose ids disagree |
 | `restore_path(row)` (optional) | Restore reports `unsupported`; also used as "where this row's transcript lives" by the context primer and `extract-reasoning --session-id` |
 | `session-ui/app.py` `_BRIDGE_CMD`, `index.html` `SOURCE_COLORS` / `BRIDGE_TARGETS` / `SRC_HEX` | bridge 400s; grey badge and chart |
-| `bin/resume-here.sh` (auto-detect + case), `bin/check-cli-access.sh`, `install.sh` JOB_PATH loop | `cr <id>` fails; launchd jobs can't find the binary |
+| `bin/resume-here.sh` (auto-detect + case), `bin/check-cli-access.sh`, `install.sh` JOB_PATH loop | `cr <id>` fails; launchd/systemd jobs can't find the binary |
 | `scripts/demo.py` row, README Supported CLIs table, `docs/ARCHITECTURE.md`, `docs/SETUP.md`, `skills/work-journal/SKILL.md` | docs drift |
 | `tests/test_smoke.py::test_adapters` + a fixture section (mirror the codex/opencode tests) | no regression net |
 

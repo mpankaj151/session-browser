@@ -9,7 +9,7 @@ CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 if [ "$(uname)" = "Darwin" ]; then
   echo "==> removing launchd jobs"
   AGENTS="$HOME/Library/LaunchAgents"
-  for job in watcher refresh enrich; do
+  for job in watcher refresh; do
     P="$AGENTS/com.sessionbrowser.$job.plist"
     [ -f "$P" ] && launchctl unload "$P" 2>/dev/null; rm -f "$P"
   done

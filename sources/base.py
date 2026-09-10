@@ -110,11 +110,18 @@ class SessionSource(Protocol):
         ...
 
     def is_available(self) -> bool:
-        """True if the CLI binary and its session directory are present."""
+        """True if there are transcripts to read (the session directory / DB /
+        mirror exists). Deliberately NOT "the binary is on PATH": indexing and
+        watching must keep working after a CLI is uninstalled or falls off a
+        daemon's PATH — those transcripts are what this tool keeps."""
         ...
 
-    # Optional — NOT a Protocol member, so adapters without it still satisfy
-    # isinstance(). restore.py looks it up with getattr():
+    # Optional — NOT Protocol members, so adapters without them still satisfy
+    # isinstance(). Looked up with getattr():
+    #
+    #   def has_binary(self) -> bool:
+    #       """Whether the CLI is runnable from here — a hint for resume/bridge
+    #       and `sb doctor` only; never consulted by indexing."""
     #
     #   def restore_path(self, row) -> Optional[Path]:
     #       """Where a restored transcript for this `sessions` row must be

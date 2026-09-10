@@ -42,14 +42,21 @@ source ~/.zshrc
 
 1. Creates a venv and installs `requirements.txt` (plus sentence-transformers
    unless `--lite`).
-2. Copies `config.toml.example` → `config.toml` (edit anytime).
+2. Writes a minimal `config.toml` **override** file if none exists (git-ignored;
+   only the keys you want to change). It is layered over `config.toml.example`,
+   so anything you don't set keeps that file's documented default — and a new
+   source or provider added by `git pull` just works. `$SB_CONFIG` points a run
+   at a different override file.
 3. Builds the SQLite schema and backfills every existing session.
 4. Computes costs, extracts reasoning trails, builds the full-text and vector
    indexes.
-5. Registers the Claude Stop + SessionEnd hooks in `~/.claude/settings.json`
-   (backup kept) — Stop indexes instantly; SessionEnd journals the ended
-   session — and links the shipped skills (work-journal, snapshot, checkpoint)
-   into `~/.claude/skills`.
+5. **If Claude Code is present** (`claude` on PATH or `~/.claude` exists):
+   registers the Claude Stop + SessionEnd hooks in `settings.json` (backup
+   kept; `$CLAUDE_CONFIG_DIR` honoured) — Stop indexes instantly; SessionEnd
+   journals the ended session — and links the shipped skills (work-journal,
+   snapshot, checkpoint) into the same directory's `skills/`. On a laptop
+   without Claude Code this step is skipped with one line; the watcher still
+   indexes everything. (OpenCode's equivalent is `--opencode-plugin`.)
 6. Installs the background jobs: launchd agents on macOS, systemd --user units on
    Linux (live watcher + nightly 01:00 refresh). Without either, it prints the
    two commands to schedule yourself.
@@ -100,23 +107,42 @@ two commands to schedule yourself — a `cron` line for the refresh plus
 
 ## 6. Register the MCP server (optional)
 
-Let Claude recall past sessions. Add to your Claude Code MCP config:
+Let your coding CLI recall past sessions (search, session detail, decisions).
+The server is a plain stdio MCP server with nothing CLI-specific in it, so any
+MCP-capable client can use it — register it with whichever CLI(s) you run.
+Everywhere below, `PY` = `/absolute/path/to/session-browser/.venv/bin/python`
+and `SERVER` = `/absolute/path/to/session-browser/mcp/session-memory/server.py`.
+
+**Claude Code** — `~/.claude/settings.json` (or `claude mcp add session-memory -- PY SERVER`):
 
 ```json
-{
-  "mcpServers": {
-    "session-memory": {
-      "command": "/absolute/path/to/session-browser/.venv/bin/python",
-      "args": ["/absolute/path/to/session-browser/mcp/session-memory/server.py"]
-    }
-  }
-}
+{ "mcpServers": { "session-memory": { "command": "PY", "args": ["SERVER"] } } }
+```
+
+**Codex CLI** — `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.session-memory]
+command = "PY"
+args    = ["SERVER"]
+```
+
+**OpenCode** — `~/.config/opencode/opencode.json` (or a project's `opencode.json`):
+
+```json
+{ "mcp": { "session-memory": { "type": "local", "command": ["PY", "SERVER"], "enabled": true } } }
+```
+
+**Copilot CLI** — `/mcp add` inside the CLI, or `~/.copilot/mcp-config.json`:
+
+```json
+{ "mcpServers": { "session-memory": { "type": "local", "command": "PY", "args": ["SERVER"], "tools": ["*"] } } }
 ```
 
 ## 7. Uninstall
 
 ```bash
-./uninstall.sh            # removes hook, launchd jobs, cr/sb shell blocks
+./uninstall.sh            # removes hooks, launchd/systemd jobs, the OpenCode plugin, skill links, cr/sb shell blocks
 ./uninstall.sh --purge    # also deletes ~/.session-browser (the database)
 ```
 
