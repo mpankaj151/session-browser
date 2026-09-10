@@ -76,8 +76,9 @@ def search(query: str, limit: int = 20, conn=None) -> list[tuple[str, float]]:
     # embed-sessions.py re-embeds them on its next run.
     usable = [(r[0], r[1]) for r in rows if len(r[1]) // 4 == q.shape[0]]
     if len(usable) < len(rows):
+        import sys
         print(f"[semsearch] skipping {len(rows) - len(usable)} embeddings with a stale "
-              f"dimension — run scripts/embed-sessions.py to refresh them")
+              f"dimension — run scripts/embed-sessions.py to refresh them", file=sys.stderr)
     if not usable:
         return []
     ids = [sid for sid, _ in usable]

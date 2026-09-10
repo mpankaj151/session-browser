@@ -37,7 +37,7 @@ def _make_claude() -> SessionSource:
 def _make_copilot() -> SessionSource:
     from sources.copilot import CopilotSource
     cfg = sbconfig.source_config("copilot")
-    return CopilotSource(cfg.get("state_dir", "~/.copilot/session-state"))
+    return CopilotSource(_cli_home(cfg.get("state_dir"), "~/.copilot/session-state", "", ""))
 
 
 def _make_codex() -> SessionSource:

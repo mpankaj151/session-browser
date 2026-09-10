@@ -21,8 +21,10 @@ Storage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -150,7 +152,17 @@ def extract_copilot(events_path: Path | str) -> list[ReasoningStep]:
     return steps
 
 
-def extract_codex(rollout_path: Path | str) -> list[ReasoningStep]:
+def extract_codex(rollout_path) -> list:
+    """Codex decision trail; a corrupt or truncated zstd rollout is 'no trail',
+    never a traceback (zstandard.ZstdError is not a ValueError)."""
+    from sources.codex import ROLLOUT_ERRORS
+    try:
+        return _extract_codex(rollout_path)
+    except ROLLOUT_ERRORS:
+        return []
+
+
+def _extract_codex(rollout_path: Path | str) -> list[ReasoningStep]:
     """Codex decision trail. Codex stores reasoning as `type:reasoning` records but
     their text is encrypted (encrypted_content only) — like Claude's empty thinking,
     the plaintext isn't recoverable. So we reconstruct the visible agent messages
@@ -378,11 +390,26 @@ def _slug(text: str) -> str:
     return s[:60] or "session"
 
 
+_YM = re.compile(r"^\d{4}-\d{2}")
+
+
 def _ym_dir(base: Path, last_activity: str) -> Path:
-    ym = (last_activity or "0000-00")[:7].replace("-", "/")  # YYYY/MM
+    # Exactly two components: the raw-copy glob is */*/*.jsonl, so anything
+    # else would be archived where nothing looks (unrestorable, silently).
+    head = (last_activity or "")[:7]
+    ym = head.replace("-", "/") if _YM.match(head) else "0000/00"
     d = base / ym
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _safe_sid(sid) -> str:
+    """session_id is file CONTENT (a rollout's payload.id, a mirror header) used
+    as a path component: refuse anything that could leave the vault."""
+    sid = str(sid or "")
+    if not sid or "/" in sid or "\\" in sid or sid in (".", "..") or sid.startswith(".."):
+        raise ValueError(f"refusing to archive with an unsafe session id {sid!r}")
+    return sid
 
 
 # Raw copies keep the source's representation: Codex zstd-compresses cold
@@ -399,7 +426,7 @@ def archive_raw(transcript_path: Path, header: dict) -> Path:
     """Copy the raw transcript into the archive, versioning on content change."""
     src = Path(transcript_path)
     dest_dir = _ym_dir(ARCHIVE / "raw", header.get("last_activity", ""))
-    sid = header.get("session_id") or src.name.split(".")[0]
+    sid = _safe_sid(header.get("session_id") or src.name.split(".")[0])
     suffix = _raw_suffix(src)
     dest = dest_dir / f"{sid}{suffix}"
     if dest.exists():
@@ -432,16 +459,19 @@ def _raw_copies():
                 mtime = p.stat().st_mtime
             except OSError:
                 continue
-            yield m.group("sid"), mtime, p
+            # mtime first, then the @vN version: equal mtimes (1 s volumes, an
+            # unchanged source mtime) used to tie-break on the path STRING, so
+            # @v9 beat @v10 and Restore put back the older, shorter copy.
+            yield m.group("sid"), (mtime, int(m.group("v") or 1)), p
 
 
 def archived_raw_index() -> dict[str, Path]:
     """session_id -> newest raw transcript copy in the archive. A single
     directory walk, so the UI can label 500 archived rows without 500 walks."""
-    best: dict[str, tuple[float, Path]] = {}
-    for sid, mtime, p in _raw_copies():
-        if sid not in best or (mtime, str(p)) > (best[sid][0], str(best[sid][1])):
-            best[sid] = (mtime, p)
+    best: dict[str, tuple[tuple, Path]] = {}
+    for sid, key, p in _raw_copies():
+        if sid not in best or (key, str(p)) > (best[sid][0], str(best[sid][1])):
+            best[sid] = (key, p)
     return {sid: p for sid, (_, p) in best.items()}
 
 
@@ -449,26 +479,39 @@ def find_archived_raw(session_id: str) -> Path | None:
     """Newest raw copy of one session's transcript, or None. This is what makes
     an aged-out session restorable after Claude Code's cleanup deleted the
     original: refresh-all copies every indexable transcript here first."""
-    hits = [(mtime, str(p), p) for sid, mtime, p in _raw_copies() if sid == session_id]
+    hits = [(key, str(p), p) for sid, key, p in _raw_copies() if sid == session_id]
     return max(hits)[2] if hits else None
 
 
 def write_readable(steps: list[ReasoningStep], header: dict) -> Path:
     dest_dir = _ym_dir(ARCHIVE / "readable", header.get("last_activity", ""))
-    sid = header.get("session_id", "")
+    sid = _safe_sid(header.get("session_id", ""))
     fname = f"{sid}-{_slug(header.get('title') or header.get('first_message',''))}.md"
     dest = dest_dir / fname
+    # Write atomically FIRST, retire the previous renders AFTER: the old order
+    # (unlink, then a plain write) left no trail at all on ENOSPC or a kill
+    # between the two, while sessions.reasoning_path still pointed at the
+    # deleted file.
+    fd, tmp = tempfile.mkstemp(dir=dest_dir, prefix=fname + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(render_markdown(steps, header))
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     # A later title (from enrichment) or a month rollover changes the path; remove
     # the session's previous renders so the archive holds exactly one trail per
     # session. Keyed on the FULL id: an 8-char prefix collides for OpenCode
     # (`ses_` + a ms clock) and Codex (UUIDv7) ids and deleted other sessions'
     # trails. Legacy prefix-named files are retired by persist(), which knows
     # the path each row recorded.
-    if sid:
-        for old in (ARCHIVE / "readable").glob(f"*/*/{sid}-*.md"):
-            if old != dest:
-                old.unlink(missing_ok=True)
-    dest.write_text(render_markdown(steps, header), encoding="utf-8")
+    for old in (ARCHIVE / "readable").glob(f"*/*/{sid}-*.md"):
+        if old != dest:
+            old.unlink(missing_ok=True)
     return dest
 
 

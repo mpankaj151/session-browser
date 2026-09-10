@@ -88,13 +88,16 @@ def _backfill_archive_reason(conn: sqlite3.Connection) -> int:
     """Rows archived before archived_reason existed carry NULL. Classify them
     once with the shared derived rule; a reason recorded at the source (watcher,
     prune) is authoritative and never overwritten. Idempotent by construction."""
-    rows = conn.execute(
-        "SELECT session_id, turn_count, first_message FROM sessions "
-        "WHERE archived = 1 AND archived_reason IS NULL"
-    ).fetchall()
-    for sid, turns, first in rows:
-        reason = indexer.infer_archive_reason({"turn_count": turns, "first_message": first})
-        conn.execute("UPDATE sessions SET archived_reason = ? WHERE session_id = ?", (reason, sid))
+    # The WHOLE row: infer_archive_reason weighs tokens/cost/model/summary as
+    # "this session did work" — a 3-column projection hid all of them, so a
+    # slash-command-only session was filed as not-a-session, permanently.
+    cur = conn.execute("SELECT * FROM sessions WHERE archived = 1 AND archived_reason IS NULL")
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    for row in rows:
+        reason = indexer.infer_archive_reason(row)
+        conn.execute("UPDATE sessions SET archived_reason = ? WHERE session_id = ?",
+                     (reason, row["session_id"]))
     return len(rows)
 
 

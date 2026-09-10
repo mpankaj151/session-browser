@@ -73,7 +73,11 @@ def main() -> None:
         print(f"FTS5 unavailable: {e}", file=sys.stderr)
         sys.exit(1)
     if args.rebuild:
-        conn.execute("DELETE FROM sessions_fts")
+        if args.source:   # only THIS source's rows — never the other CLIs' full-text
+            conn.execute("DELETE FROM sessions_fts WHERE session_id IN "
+                         "(SELECT session_id FROM sessions WHERE cli_source = ?)", (args.source,))
+        else:
+            conn.execute("DELETE FROM sessions_fts")
 
     registry = build_source_registry(only_available=True)
     if args.source:
@@ -101,7 +105,12 @@ def main() -> None:
             if i % 20 == 0:
                 conn.commit()
         conn.commit()
-    m = index_archived(conn, registry)
+    # Archived rows are read from the vault copy, so the CLI's transcript tree
+    # being gone (the very state the archive exists for) must not drop them.
+    archived_registry = build_source_registry()
+    if args.source:
+        archived_registry = {k: v for k, v in archived_registry.items() if k == args.source}
+    m = index_archived(conn, archived_registry)
     conn.close()
     print(f"Indexed full text for {n} sessions (+{m} archived, from the raw archive).")
 

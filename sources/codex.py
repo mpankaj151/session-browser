@@ -84,6 +84,21 @@ def _payload(rec: dict) -> tuple[str, dict]:
     return rec.get("type") or "", rec
 
 
+def _rollout_errors() -> tuple:
+    """What a reader must tolerate: I/O, a truncated frame (ValueError from the
+    text wrapper) and zstandard's own ZstdError — which is NOT a ValueError."""
+    errs: tuple = (OSError, ValueError)
+    try:
+        import zstandard
+        errs += (zstandard.ZstdError,)
+    except ImportError:
+        pass
+    return errs
+
+
+ROLLOUT_ERRORS = _rollout_errors()
+
+
 @contextlib.contextmanager
 def open_rollout(path: Path):
     """Line reader for a rollout, plain `.jsonl` or zstd `.jsonl.zst`.
@@ -257,8 +272,8 @@ class CodexSource:
                     if turn and turn[0] == "user":
                         turn_count += 1
                         first_message = first_message or turn[1]
-        except (OSError, ValueError):
-            # ValueError covers a truncated/corrupt zstd frame mid-compression.
+        except ROLLOUT_ERRORS:
+            # a truncated or corrupt zstd frame is "not a session", never a traceback
             return None
 
         if len(_HDR_CACHE) > 4096:
@@ -314,7 +329,7 @@ class CodexSource:
                     turn = _turn_of(*_payload(rec))
                     if turn:
                         turns.append(Turn(role=turn[0], content=turn[1]))
-        except (OSError, ValueError):
+        except ROLLOUT_ERRORS:
             return None
         return ParsedSession(header=header, turns=turns)
 

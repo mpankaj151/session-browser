@@ -56,12 +56,20 @@ def main() -> None:
         return
     outcome: collections.Counter = collections.Counter()
     for r in can:
-        res = restore.restore_session(r["session_id"])
+        try:
+            res = restore.restore_session(r["session_id"])
+        except Exception as e:  # noqa: BLE001 — one locked DB / corrupt copy must not abort the batch
+            outcome["error"] += 1
+            print(f"  ! {r['session_id'][:36]} -> error: {e}", file=sys.stderr)
+            continue
         outcome[res.status] += 1
         if res.status != "restored" or res.reimported is False:
             print(f"  ! {r['session_id'][:36]} -> {res.status} {res.detail}")
     print("\nDone: " + ", ".join(f"{n} {k}" for k, n in outcome.most_common()))
     print("Re-run `sb refresh` so reasoning trails / full-text pick the restored files up.")
+    failed = sum(n for k, n in outcome.items() if k not in ("restored", "already-live"))
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -179,6 +179,14 @@ class ClaudeSource:
         # bogus session row.
         if path.suffix != ".jsonl" or _SUBAGENT_DIR in path.parts:
             return None
+        # Exactly <projects>/<project>/<sid>.jsonl — the depth discover() globs.
+        # Deeper files (a future <sid>/workflows/x/journal.jsonl) would index as
+        # a session named after the file and then be archived by prune.
+        try:
+            if path.parent.parent.resolve() != self.projects_dir.resolve():
+                return None
+        except OSError:
+            return None
         return path.stem
 
     def resume_command(self, session_id: str) -> str:

@@ -81,8 +81,12 @@ def run(session_id: str, *, adapter=None, conn=None, deleted: bool = False, spaw
         import sbconfig
         try:
             log = open(sbconfig.LOG_DIR / "reasoning-hook.log", "a")
+            # No --archive here: session.idle fires per TURN, and archive_raw
+            # writes a new @vN copy whenever the size changed — a 60-turn session
+            # left ~60 full copies. The nightly run and archive-then-unlink on
+            # deletion own the raw vault; this only refreshes the trail.
             subprocess.Popen([sys.executable, str(EXTRACT), "--source", "opencode",
-                              "--session", str(path), "--archive"],
+                              "--session", str(path)],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
         except Exception as e:  # noqa: BLE001
             print(f"[opencode-hook] spawn error: {e}", file=sys.stderr)

@@ -64,21 +64,35 @@ def restore_session(session_id: str, conn: sqlite3.Connection | None = None,
             return RestoreResult(session_id, "unsupported",
                                  detail=f"restore is not supported for {row['cli_source']} sessions")
         adapter = registry[row["cli_source"]]
-        if dest.exists():
-            _reindex(adapter, dest, conn)
+        src = reasoning.find_archived_raw(session_id)
+        # A compressed raw copy (Codex cold rollout) stays compressed: the
+        # adapter reads .jsonl.zst, and zstd bytes under a .jsonl name would be
+        # unreadable — the very corruption archive_raw now avoids. Decide the
+        # real destination BEFORE the already-live check so the .zst twin of a
+        # plain name counts as live and is never overwritten.
+        if src is not None and src.name.endswith(".zst") and not dest.name.endswith(".zst"):
+            dest = dest.with_name(dest.name + ".zst")
+        live = dest if dest.exists() else next(
+            (t for t in (dest.with_name(dest.name + ".zst"),) if t.exists()), None)
+        if live is not None:
+            _reindex(adapter, live, conn)
             if own:
                 conn.commit()
-            return RestoreResult(session_id, "already-live", path=dest)
-        src = reasoning.find_archived_raw(session_id)
+            result = RestoreResult(session_id, "already-live", path=live)
+            # A previous restore may have put the file back while the CLI-side
+            # re-import failed; offer it again so the UI can retry.
+            _reimport(adapter, live, result)
+            return result
         if src is None:
             return RestoreResult(session_id, "no-raw-copy",
                                  detail=f"no raw copy under {reasoning.ARCHIVE / 'raw'}")
-        # A compressed raw copy (Codex cold rollout) stays compressed: the
-        # adapter reads .jsonl.zst, and zstd bytes under a .jsonl name would be
-        # unreadable — the very corruption archive_raw now avoids.
-        if src.name.endswith(".zst") and not dest.name.endswith(".zst"):
-            dest = dest.with_name(dest.name + ".zst")
         dest.parent.mkdir(parents=True, exist_ok=True)
+        # Sources with a watcher-side "deleted upstream" rule (OpenCode) mark the
+        # file as deliberately restored BEFORE it appears, or a sync in between
+        # archives it straight back.
+        protect = getattr(adapter, "protect", None)
+        if callable(protect):
+            protect(dest)
         # copyfile, not copy2: the restored file must carry a FRESH mtime, or an
         # age-based cleanup would delete it again on its next pass. The archive
         # copy is left in place — it is the durable vault, not a staging area.
@@ -90,19 +104,31 @@ def restore_session(session_id: str, conn: sqlite3.Connection | None = None,
                                detail=f"copied {src.name} from the reasoning archive")
         # The row is live and browsable regardless of what follows; the
         # re-import only decides whether the CLI itself can resume it.
-        hook = getattr(adapter, "reimport", None)
-        if callable(hook):
-            try:
-                ok, detail = hook(dest)
-            except Exception as e:  # noqa: BLE001
-                ok, detail = False, f"re-import raised: {e}"
-            result.reimported = ok
-            if detail:
-                result.detail += f"; {detail}"
+        _reimport(adapter, dest, result)
         return result
     finally:
         if own:
             conn.close()
+
+
+def _reimport(adapter, path: Path, result: RestoreResult) -> None:
+    hook = getattr(adapter, "reimport", None)
+    if not callable(hook):
+        return
+    try:
+        ok, detail = hook(path)
+    except Exception as e:  # noqa: BLE001
+        ok, detail = False, f"re-import raised: {e}"
+    result.reimported = ok
+    if detail:
+        result.detail = f"{result.detail}; {detail}" if result.detail else detail
+
+
+def supported_for(row, registry) -> bool:
+    """Per ROW, not per source: an adapter refuses rows whose recorded path is
+    outside its tree (a registry carried over from another machine), and the
+    UI's Restore button must say the same thing restore_session() will."""
+    return _dest_for(row, registry) is not None
 
 
 def plan(conn: sqlite3.Connection | None = None, registry: dict | None = None) -> list[dict]:

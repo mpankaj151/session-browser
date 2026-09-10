@@ -35,9 +35,11 @@ def plugin_path(config_dir: Path | str | None = None) -> Path:
 
 def render(repo: Path = REPO, python: Path | None = None) -> str:
     python = python or repo / ".venv" / "bin" / "python"
+    import sbconfig
     return (TEMPLATE.read_text(encoding="utf-8")
             .replace("__VENV_PY__", str(python))
-            .replace("__HOOK__", str(repo / "scripts" / "opencode-hook.py")))
+            .replace("__HOOK__", str(repo / "scripts" / "opencode-hook.py"))
+            .replace("__LOG_DIR__", str(sbconfig.LOG_DIR)))
 
 
 def install(config_dir: Path | str | None = None, repo: Path = REPO, python: Path | None = None) -> Path:

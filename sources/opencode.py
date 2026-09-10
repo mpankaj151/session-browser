@@ -33,6 +33,7 @@ env/config only. Ids are NOT chronologically sortable (36-bit truncated clock)
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -40,6 +41,7 @@ import shlex
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -305,9 +307,11 @@ class OpenCodeSource:
         return {k: v for k, v in info.items() if v is not None}
 
     def _project_root(self, conn: sqlite3.Connection, root: str, kids: list[str],
-                      by_id: dict, fingerprint: list, migration: str) -> tuple[dict, list[dict]]:
+                      by_id: dict, fingerprint: list, migration: str,
+                      prev_inlined: dict | None = None, warnings: list | None = None) -> tuple[dict, list[dict]]:
         lines: list[dict] = []
         models: dict[str, dict] = {}
+        unattributed = 0
         turn_count = 0
         first_message = ""
         message_count = recognised = 0
@@ -326,7 +330,7 @@ class OpenCodeSource:
                     pd = _loads(pr["data"])
                     pd["id"], pd["messageID"], pd["sessionID"] = pr["id"], m["id"], sid
                     if pd.get("type") == "tool":
-                        self._inline_spill(pd)
+                        self._inline_spill(pd, prev_inlined or {})
                     parts.append(pd)
                 lines.append({"type": "message", "session": sid, "info": info, "parts": parts})
                 message_count += 1
@@ -341,8 +345,14 @@ class OpenCodeSource:
                         first_message = first_message or text
                 elif role == "assistant":
                     key = _model_key(info)
+                    tk = info.get("tokens") if isinstance(info.get("tokens"), dict) else {}
+                    if not key and (tk or info.get("cost")):
+                        # Spend without providerID/modelID (a renamed field upstream, an
+                        # aborted message): bucket it, never drop it — the cost extractor
+                        # treats this roll-up as authoritative.
+                        key = "unknown/unknown"
+                        unattributed += 1
                     if key:
-                        tk = info.get("tokens") if isinstance(info.get("tokens"), dict) else {}
                         cache = tk.get("cache") if isinstance(tk.get("cache"), dict) else {}
                         acc = models.setdefault(key, {"input": 0, "output": 0, "reasoning": 0,
                                                       "cache_read": 0, "cache_write": 0, "cost": 0.0})
@@ -354,6 +364,9 @@ class OpenCodeSource:
                         acc["cost"] += float(info.get("cost") or 0)
         for acc in models.values():
             acc["cost"] = round(acc["cost"], 6)
+        if unattributed and warnings is not None:
+            warnings.append(f"{root}: {unattributed} assistant message(s) carry tokens/cost but no "
+                            f"providerID/modelID — spend bucketed under unknown/unknown")
         row = by_id[root]
         raw_title = _get(row, "title") or ""
         stats = {
@@ -377,11 +390,13 @@ class OpenCodeSource:
 
     _SPILL_MAX = 16 * 1024 * 1024
 
-    def _inline_spill(self, pd: dict) -> None:
+    def _inline_spill(self, pd: dict, prev_inlined: dict | None = None) -> None:
         """Outputs over 2000 lines / 50 KB are spilled to <data>/tool-output/tool_<id>
         (state.metadata.outputPath; older builds only leave the path in the
         preview text) and purged after SEVEN days. The mirror is the backup, so
-        inline the blob while it exists; a missing blob leaves the part as stored."""
+        inline the blob while it exists. Once the blob is gone, the copy the
+        previous projection already inlined is carried forward — a re-projection
+        must never be lossier than the file it replaces."""
         st = pd.get("state")
         if not isinstance(st, dict):
             return
@@ -395,23 +410,58 @@ class OpenCodeSource:
         blob = Path(ref)
         if not blob.is_absolute():
             blob = self.data_dir / "tool-output" / blob.name
+        text = None
         try:
-            if not blob.is_file() or blob.stat().st_size > self._SPILL_MAX:
-                return
-            st["output"] = blob.read_text(encoding="utf-8", errors="replace")
+            if blob.is_file() and blob.stat().st_size <= self._SPILL_MAX:
+                text = blob.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            text = None
+        if text is None:
+            text = (prev_inlined or {}).get(pd.get("id"))
+        if text is None:
             return
+        st["output"] = text
         meta["inlined"] = True
         st["metadata"] = meta
 
     @staticmethod
+    def _inlined_outputs(path: Path) -> dict[str, str]:
+        """part id -> output text for every tool part the existing mirror file
+        already inlined (the blob may be purged by now)."""
+        out: dict[str, str] = {}
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                next(fh, None)
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    for pd in rec.get("parts") or []:
+                        st = pd.get("state") if isinstance(pd, dict) else None
+                        meta = st.get("metadata") if isinstance(st, dict) and isinstance(st.get("metadata"), dict) else {}
+                        if meta.get("inlined") and isinstance(st.get("output"), str) and pd.get("id"):
+                            out[pd["id"]] = st["output"]
+        except OSError:
+            pass
+        return out
+
+    @staticmethod
     def _write_atomic(path: Path, head: dict, lines: list[dict]) -> None:
-        tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(head, separators=(",", ":")) + "\n")
-            for line in lines:
-                fh.write(json.dumps(line, separators=(",", ":")) + "\n")
-        os.replace(tmp, path)
+        # A temp name unique to this writer: the hook and the watcher project the
+        # same root within seconds of each other, and a shared <file>.tmp let them
+        # interleave bytes and race on os.replace.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(head, separators=(",", ":")) + "\n")
+                for line in lines:
+                    fh.write(json.dumps(line, separators=(",", ":")) + "\n")
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     # -- manifest ----------------------------------------------------------------
     @property
@@ -427,9 +477,31 @@ class OpenCodeSource:
             return {}          # lost or corrupt: one full resync, no harm
 
     def _save_manifest(self, roots: dict[str, list]) -> None:
-        tmp = self._manifest_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"schema": SCHEMA, "roots": roots}, separators=(",", ":")), encoding="utf-8")
-        os.replace(tmp, self._manifest_path)
+        fd, tmp = tempfile.mkstemp(dir=self.mirror_dir, prefix=".manifest.json.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"schema": SCHEMA, "roots": roots}, separators=(",", ":")))
+            os.replace(tmp, self._manifest_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+
+    @contextlib.contextmanager
+    def _mirror_lock(self):
+        """Serialise sync() across processes (hook vs watcher vs nightly) on
+        <mirror>/.sync.lock. No-op where flock is unavailable."""
+        try:
+            import fcntl
+        except ImportError:   # pragma: no cover — non-POSIX
+            yield
+            return
+        with open(self.mirror_dir / ".sync.lock", "a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
 
     # -- sync --------------------------------------------------------------------
     def sync(self, only: list[str] | None = None, *, force: bool = False,
@@ -437,16 +509,30 @@ class OpenCodeSource:
         """Project every changed root session into the mirror. Read-only on the
         DB, never spawns a subprocess. An unreadable DB changes nothing."""
         report = SyncReport()
+        # Nothing in here may escape: every batch script calls discover() outside
+        # its per-file try, so an OSError here used to take the whole nightly down
+        # for EVERY source. A failed sync degrades to "serve what is mirrored".
+        try:
+            self.mirror_dir.mkdir(parents=True, exist_ok=True)
+            with self._mirror_lock():
+                self._sync_locked(only, force, on_delete, report)
+        except (OSError, sqlite3.Error) as e:
+            msg = f"mirror sync failed under {self.mirror_dir}: {e}"
+            _warn(msg)
+            report.warnings.append(msg)
+        return report
+
+    def _sync_locked(self, only, force, on_delete, report: SyncReport) -> None:
         conn = self._open_ro()
         if conn is None:
             report.db_missing = True
-            return report
+            return
         try:
             for w in self._schema_check(conn):
                 _warn(w)
                 report.warnings.append(w)
             if any("is missing" in w or "v2 session store" in w for w in report.warnings):
-                return report
+                return
             migration = self._migration_fingerprint(conn)
             try:
                 by_id, tree = self._tree(conn)
@@ -456,8 +542,7 @@ class OpenCodeSource:
                 msg = f"cannot read sessions from {self.db_path}: {e}"
                 _warn(msg)
                 report.warnings.append(msg)
-                return report
-            self.mirror_dir.mkdir(parents=True, exist_ok=True)
+                return
             manifest = self._load_manifest()
             for root, kids in tree.items():
                 if only is not None and root not in only:
@@ -467,7 +552,9 @@ class OpenCodeSource:
                     report.skipped += 1
                     continue
                 try:
-                    head, lines = self._project_root(conn, root, kids, by_id, fps[root], migration)
+                    prev = self._inlined_outputs(path) if path.exists() else {}
+                    head, lines = self._project_root(conn, root, kids, by_id, fps[root], migration,
+                                                     prev_inlined=prev, warnings=report.warnings)
                     self._write_atomic(path, head, lines)
                     manifest[root] = fps[root]
                     report.written.append(root)
@@ -480,17 +567,31 @@ class OpenCodeSource:
             self._save_manifest(manifest)
         finally:
             conn.close()
-        return report
 
     # -- deletions ---------------------------------------------------------------
     @staticmethod
-    def _archive_before_delete(path: Path, header: dict) -> None:
+    def _archive_before_delete(path: Path, header: dict) -> Path:
         """Default archiver: the versioned raw vault (<archive>/raw/YYYY/MM/<sid>.jsonl),
-        the same copy refresh-all makes nightly and Restore reads back."""
+        the same copy refresh-all makes nightly and Restore reads back. With the
+        archive switched off there is nowhere to put the last copy, so this
+        RAISES — _remove_deleted then keeps the mirror file instead of destroying it."""
         import reasoning
         import sbconfig
-        if sbconfig.REASONING_ENABLED:
-            reasoning.archive_raw(path, header)
+        if not sbconfig.REASONING_ENABLED:
+            raise RuntimeError("reasoning archive disabled ([reasoning] enabled = false) — "
+                               "no vault to hold the last copy")
+        return reasoning.archive_raw(path, header)
+
+    @staticmethod
+    def _source_db_of(path: Path) -> str | None:
+        """The DB a mirror file was projected from (line 1, source.db)."""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                head = json.loads(fh.readline())
+            src = head.get("source") if isinstance(head, dict) else None
+            return src.get("db") if isinstance(src, dict) else None
+        except (OSError, ValueError):
+            return None
 
     def _remove_deleted(self, live_roots: set[str], manifest: dict, on_delete, report: SyncReport) -> None:
         """A mirror file whose root is gone from the DB is the LAST copy of that
@@ -504,12 +605,26 @@ class OpenCodeSource:
         for marker in self.mirror_dir.glob("ses_*.jsonl" + _RESTORED):
             if marker.name[:-len(".jsonl" + _RESTORED)] in live_roots:
                 marker.unlink(missing_ok=True)
+        foreign_warned = False
         for path in sorted(self.mirror_dir.glob("ses_*.jsonl")):
             sid = path.stem
             if not _SID.match(sid) or sid in live_roots:
                 continue
             if path.with_name(path.name + _RESTORED).exists():
                 report.skipped += 1
+                continue
+            origin = self._source_db_of(path)
+            if origin and origin != str(self.db_path):
+                # Projected from ANOTHER OpenCode DB (XDG_DATA_HOME / OPENCODE_DB set
+                # in the shell but not in the daemon's environment). Absent from
+                # this DB proves nothing — never archive-and-unlink it from here.
+                report.skipped += 1
+                if not foreign_warned:
+                    msg = (f"{sid}: mirror file was projected from another OpenCode DB ({origin}); "
+                           f"this daemon resolves {self.db_path} — leaving it alone")
+                    _warn(msg)
+                    report.warnings.append(msg)
+                    foreign_warned = True
                 continue
             header = self.parse_header(path)
             hdr = asdict(header) if header is not None else {"session_id": sid, "last_activity": ""}
@@ -647,7 +762,10 @@ class OpenCodeSource:
             self.mirror_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        return [self.mirror_dir, self.data_dir]
+        # The data dir is watched NON-recursively: only opencode*.db / -wal at
+        # its top level ever trigger a sync, while log/, tool-output/, snapshot/
+        # and project/ are hundreds of directories (one inotify watch each).
+        return [(self.mirror_dir, True), (self.data_dir, False)]
 
     def sync_trigger(self, path: Path) -> bool:
         """A write to opencode*.db or its WAL means sessions changed. Never the
@@ -666,6 +784,17 @@ class OpenCodeSource:
         except ValueError:
             return None
         return dest
+
+    def protect(self, path: Path) -> None:
+        """Called by restore BEFORE the raw copy is written back: the marker
+        must already exist when the file appears, or a watcher sync in between
+        sees a mirror file with no DB row and no marker and archives it away."""
+        marker = path.with_name(path.name + _RESTORED)
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(_now_iso(), encoding="utf-8")
+        except OSError:
+            pass
 
     def reimport(self, path: Path) -> tuple[bool | None, str]:
         """Second half of a restore: put the session back into OpenCode itself

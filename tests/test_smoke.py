@@ -337,7 +337,7 @@ def test_adapters():
     assert "claude" in reg and "copilot" in reg and "opencode" in reg, list(reg)
     assert isinstance(reg["opencode"], OpenCodeSource)
     assert reg["opencode"].session_id_for_path(Path(f"/m/{_OC_ROOT}.jsonl")) == _OC_ROOT
-    assert ClaudeSource().session_id_for_path(Path("/p/abc-1.jsonl")) == "abc-1"
+    assert ClaudeSource("/p").session_id_for_path(Path("/p/-proj/abc-1.jsonl")) == "abc-1"
     assert CopilotSource().session_id_for_path(Path("/s/sid9/events.jsonl")) == "sid9"
     assert CopilotSource().session_id_for_path(Path("/s/sid9/other.jsonl")) is None
     print(f"  ok  adapters registered + path->id mapping: {list(reg)}")
@@ -352,7 +352,7 @@ def test_claude_ignores_subagent_transcripts():
     discover()'s glob — is what has to reject them.
     """
     from sources.claude import ClaudeSource
-    src = ClaudeSource()
+    src = ClaudeSource("/p")
     root = "/p/-Users-me-proj/6550180f-14ff-4b91-a93d-d951ed98c2f7"
     # real transcript still maps to its id (the discover() `*/*.jsonl` shape)
     assert src.session_id_for_path(Path("/p/-Users-me-proj/abc-1.jsonl")) == "abc-1"
@@ -1901,7 +1901,7 @@ def test_watcher_sync_trigger_resyncs_mirror():
     try:
         with tempfile.TemporaryDirectory() as td:
             src = _oc_source(Path(td))
-            assert src.watch_roots() == [src.mirror_dir, src.data_dir]
+            assert [r[0] for r in src.watch_roots()] == [src.mirror_dir, src.data_dir]
             for yes in ("opencode.db", "opencode.db-wal", "opencode-beta.db-wal"):
                 assert src.sync_trigger(src.data_dir / yes) is True, yes
             for no in ("opencode.db-shm", "log/2026.log", "tool-output/tool_x", "auth.json"):
@@ -2376,7 +2376,7 @@ def test_opencode_watch_roots_creates_mirror_dir():
     with tempfile.TemporaryDirectory() as td:
         mirror = Path(td) / "mirror"
         roots = OpenCodeSource(data_dir=Path(td) / "data", mirror_dir=mirror).watch_roots()
-        assert mirror.is_dir() and mirror in roots, (mirror.exists(), roots)
+        assert mirror.is_dir() and mirror in [r[0] for r in roots], (mirror.exists(), roots)
     print("  ok  opencode watch_roots() materialises the mirror dir")
 
 
@@ -2926,8 +2926,8 @@ def test_archive_reason_uses_content_signals_and_watcher_agrees():
     import watcher
     conn = _temp_db()
     db_path = conn.execute("PRAGMA database_list").fetchone()[2]
-    indexer.upsert(_header("cmd-only", turn_count=0, first_message="", project_path="/p"), conn=conn)
-    indexer.upsert(_header("empty", turn_count=0, first_message="", project_path="/p"), conn=conn)
+    indexer.upsert(_header("cmd-only", turn_count=0, first_message="", project_path="/p/-proj"), conn=conn)
+    indexer.upsert(_header("empty", turn_count=0, first_message="", project_path="/p/-proj"), conn=conn)
     conn.execute("UPDATE sessions SET output_tokens=3000, model_used='claude-opus-4-5' WHERE session_id='cmd-only'")
     conn.commit()
     rows = {r["session_id"]: r for r in conn.execute("SELECT * FROM sessions")}
@@ -2945,8 +2945,8 @@ def test_archive_reason_uses_content_signals_and_watcher_agrees():
 
             def __init__(self, p):
                 self.src_path = p
-        h.on_deleted(Ev("/p/cmd-only.jsonl"))
-        h.on_deleted(Ev("/p/empty.jsonl"))
+        h.on_deleted(Ev("/p/-proj/cmd-only.jsonl"))     # <projects>/<project>/<sid>.jsonl
+        h.on_deleted(Ev("/p/-proj/empty.jsonl"))
         got = {r[0]: r[1] for r in conn.execute("SELECT session_id, archived_reason FROM sessions")}
         assert got == {"cmd-only": indexer.TRANSCRIPT_MISSING, "empty": indexer.NOT_A_SESSION}, got
     finally:
@@ -3129,6 +3129,825 @@ def test_codex_cost_extractor_reads_model_from_top_level_turn_context():
             assert totals["input"] == 600 and totals["cache_read"] == 400, totals
             assert list(per_model) == ["gpt-5.5"], (label, dict(per_model))
     print("  ok  codex cost extractor attributes tokens to the rollout's real model (both dialects)")
+
+
+# ===== final review: OpenCode mirror safety ==================================
+def test_opencode_deleted_session_kept_when_reasoning_archive_is_disabled():
+    """With [reasoning] enabled = false the default archiver was a silent no-op
+    and _remove_deleted still unlinked: the LAST copy of a deleted OpenCode
+    session was destroyed. The file is kept and the report says why."""
+    import sbconfig
+    old = sbconfig.REASONING_ENABLED
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        path = next(iter(src.discover()))
+        _oc_wipe(src.db_path)
+        sbconfig.REASONING_ENABLED = False
+        try:
+            r = src.sync()
+        finally:
+            sbconfig.REASONING_ENABLED = old
+        assert r.removed == [] and path.exists(), r
+        assert any("reasoning" in w and "keeping" in w for w in r.warnings), r.warnings
+    print("  ok  opencode: reasoning archive off -> a deleted session's mirror file is kept")
+
+
+def test_opencode_sync_never_removes_mirror_files_projected_from_another_db():
+    """A daemon that resolves a DIFFERENT OpenCode DB (XDG_DATA_HOME/OPENCODE_DB
+    set in the shell, not in the launchd/systemd job) must not archive and
+    unlink every mirror file the hook wrote from the real DB. Line 1 records
+    the source DB; a mismatch is skipped, never deleted."""
+    from sources.opencode import OpenCodeSource
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        real = _oc_source(root)
+        path = next(iter(real.discover()))
+        other_dir = root / "other"
+        other_dir.mkdir()
+        c = sqlite3.connect(str(other_dir / "opencode.db"))
+        _oc_schema(c)
+        c.close()                                            # valid, empty
+        other = OpenCodeSource(data_dir=other_dir, mirror_dir=real.mirror_dir)
+        r = other.sync()
+        assert path.exists() and r.removed == [], r
+        assert r.skipped >= 1 and any("another OpenCode DB" in w for w in r.warnings), r
+    print("  ok  opencode: a mirror file projected from another DB is never archived or unlinked")
+
+
+def test_opencode_atomic_writes_use_unique_temp_names_and_sync_is_serialised():
+    """The hook (idle + 1.5 s) and the watcher (WAL + 2.5 s) both project the
+    same root; a fixed <file>.tmp name let two writers interleave and one crash
+    on os.replace. Temp names are unique per writer and sync() holds
+    <mirror>/.sync.lock so concurrent syncs serialise."""
+    import fcntl
+    import os as _os
+    import threading
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        seen = []
+        real_replace = _os.replace
+
+        def spy(a, b):
+            seen.append(str(a))
+            real_replace(a, b)
+        _os.replace = spy
+        try:
+            src.sync(force=True)
+            src.sync(force=True)
+        finally:
+            _os.replace = real_replace
+        tmps = [s for s in seen if ".tmp" in s]
+        assert len(tmps) >= 4 and len(set(tmps)) == len(tmps), tmps
+        assert not list(src.mirror_dir.glob("*.tmp")), "temp litter"
+        lock = src.mirror_dir / ".sync.lock"
+        fh = open(lock, "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (src.sync(force=True), done.set()), daemon=True)
+        t.start()
+        assert not done.wait(0.5), "sync() ran while another writer held the mirror lock"
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        assert done.wait(10), "sync() never completed after the lock was released"
+    print("  ok  opencode: unique temp names, concurrent sync() serialised on the mirror lock")
+
+
+def test_opencode_discover_survives_an_unwritable_mirror_dir():
+    """sync() raised OSError out of discover() (manifest write on a read-only
+    mirror dir) and every batch script calls discover() outside its per-file
+    try — one bad directory took the whole nightly down for EVERY source. A
+    failed sync degrades to 'serve what is already mirrored' plus a warning."""
+    import os as _os
+    if _os.geteuid() == 0:
+        print("  --  skipped: root ignores directory permissions")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        path = next(iter(src.discover()))
+        src.mirror_dir.chmod(0o555)
+        try:
+            r = src.sync(force=True)
+            assert any("mirror" in w for w in r.warnings), r
+            src._last_sync = 0.0
+            assert list(src.discover()) == [path]
+        finally:
+            src.mirror_dir.chmod(0o755)
+    print("  ok  opencode: an unwritable mirror dir warns instead of crashing every source's batch")
+
+
+def test_opencode_reprojection_keeps_inlined_tool_output_after_the_blob_is_purged():
+    """OpenCode purges spilled tool outputs after 7 days; the mirror inlined the
+    blob while it existed, but every re-projection rebuilt parts from the DB
+    and dropped the copy again — and the smaller file became a new raw archive
+    version, so Restore would have brought back the lossy one."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = _oc_source(root, seed=False)
+        conn = sqlite3.connect(str(src.db_path))
+        _oc_seed(conn)
+        spill_dir = src.data_dir / "tool-output"
+        spill_dir.mkdir()
+        blob = spill_dir / "tool_keepme"
+        blob.write_text("line\n" * 3000)
+        conn.execute("INSERT INTO part VALUES (?, 'msg_a1', ?, ?, ?, ?)",
+                     ("prt_keep", _OC_ROOT, _OC_T0 + 2100, _OC_T0 + 2100, json.dumps({
+                         "type": "tool", "tool": "bash", "callID": "prt_keep",
+                         "state": {"status": "completed", "input": {"command": "cat big"},
+                                   "output": "(truncated preview)", "title": "cat big",
+                                   "metadata": {"truncated": True, "outputPath": str(blob)}}})))
+        conn.commit()
+        src.sync()
+        blob.unlink()                                        # the 7-day purge
+        conn.execute("INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+                     ("msg_later", _OC_ROOT, _OC_T0 + 90_000, _OC_T0 + 90_000,
+                      json.dumps({"role": "user"})))
+        conn.commit()
+        conn.close()
+        r = src.sync()
+        assert r.written == [_OC_ROOT], r
+        path = src.mirror_dir / f"{_OC_ROOT}.jsonl"
+        a1 = next(json.loads(l) for l in path.read_text().splitlines()[1:]
+                  if json.loads(l)["info"]["id"] == "msg_a1")
+        part = next(pd for pd in a1["parts"] if pd["id"] == "prt_keep")
+        assert part["state"]["output"] == "line\n" * 3000, part["state"]["output"][:40]
+        assert part["state"]["metadata"]["inlined"] is True
+    print("  ok  opencode: re-projection carries an inlined tool output forward after the blob is purged")
+
+
+def test_opencode_unattributed_assistant_spend_is_bucketed_not_dropped():
+    """An assistant message without providerID/modelID contributed nothing to
+    the roll-up while the cost extractor still reported the total as
+    authoritative — a renamed field upstream would silently zero every OpenCode
+    session. Unknown spend lands in an 'unknown/unknown' bucket and sync warns."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        conn = sqlite3.connect(str(src.db_path))
+        conn.execute("INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+                     ("msg_nomodel", _OC_ROOT, _OC_T0 + 9000, _OC_T0 + 9000, json.dumps({
+                         "role": "assistant", "cost": 9.99,
+                         "tokens": {"input": 50000, "output": 9000, "reasoning": 0,
+                                    "cache": {"read": 0, "write": 0}}})))
+        conn.commit()
+        conn.close()
+        r = src.sync()
+        head = json.loads(next(iter(src.discover())).read_text().splitlines()[0])
+        bucket = head["stats"]["models"].get("unknown/unknown")
+        assert bucket and bucket["input"] == 50000 and bucket["cost"] == 9.99, head["stats"]["models"]
+        assert head["stats"]["cost_usd"] >= 9.99, head["stats"]
+        assert any("unknown" in w.lower() and "model" in w.lower() for w in r.warnings), r.warnings
+    print("  ok  opencode: spend without a model name is bucketed and warned, never dropped")
+
+
+def test_opencode_hook_does_not_archive_a_raw_copy_per_turn():
+    """session.idle fires per turn; the hook spawned extract-reasoning --archive
+    every time and archive_raw writes a new @vN copy whenever the size changed,
+    so a 60-turn session left ~60 full copies. The per-turn spawn refreshes the
+    trail only; the nightly run and archive-then-unlink on deletion own the vault."""
+    import subprocess
+    import sbconfig
+    hook = _load_script("opencode-hook")
+    captured = []
+    real = subprocess.Popen
+    subprocess.Popen = lambda argv, **kw: captured.append(list(argv)) or type("P", (), {"pid": 1})()
+    old_log = sbconfig.LOG_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            sbconfig.LOG_DIR = Path(td) / "logs"
+            sbconfig.LOG_DIR.mkdir()
+            src = _oc_source(Path(td))
+            conn = _temp_db()
+            try:
+                hook.run(_OC_ROOT, adapter=src, conn=conn, spawn=True)
+            finally:
+                conn.close()
+    finally:
+        subprocess.Popen = real
+        sbconfig.LOG_DIR = old_log
+    assert captured and "--archive" not in captured[0], captured
+    assert "--source" in captured[0] and "opencode" in captured[0], captured
+    print("  ok  opencode hook: per-turn spawn refreshes the trail without a new raw copy")
+
+
+def test_opencode_plugin_runs_under_node_and_spawns_on_the_leading_edge():
+    """Bun.spawn inside a bare try/catch meant an OpenCode build that loads
+    plugins under Node silently never indexed anything; and a trailing-edge
+    debounce dropped the LAST turn when `opencode run` exited inside the
+    window. Under node: the first idle event spawns immediately, a burst
+    coalesces into one trailing spawn, and failures are logged, not swallowed."""
+    import shutil
+    import subprocess
+    inst = _load_script("install-opencode-plugin")
+    js = inst.render(repo=_REPO, python=Path("/bin/sh"))
+    assert "typeof Bun" in js and "child_process" in js, "no Node fallback"
+    assert "catch (_) {}" not in js, "failures are still swallowed silently"
+    if not shutil.which("node"):
+        print("  --  node not installed: plugin runtime check skipped")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        log = root / "spawns.log"
+        hook = root / "hook.sh"
+        hook.write_text(f"#!/bin/sh\necho \"$@\" >> '{log}'\n")
+        hook.chmod(0o755)
+        plugin = root / "plugin.mjs"
+        plugin.write_text(js.replace(str(_REPO / "scripts" / "opencode-hook.py"), str(hook)))
+        driver = root / "drive.mjs"
+        driver.write_text(f"""
+import {{ SessionBrowser }} from '{plugin}';
+const h = await SessionBrowser({{}});
+const idle = (id) => h.event({{ event: {{ type: 'session.idle', properties: {{ sessionID: id }} }} }});
+await idle('ses_a'); await idle('ses_a'); await idle('ses_a');
+await new Promise(r => setTimeout(r, 300));
+const fs = await import('node:fs');
+const early = fs.existsSync('{log}') ? fs.readFileSync('{log}', 'utf8').trim().split('\\n').filter(Boolean).length : 0;
+await new Promise(r => setTimeout(r, 2200));
+const late = fs.readFileSync('{log}', 'utf8').trim().split('\\n').filter(Boolean).length;
+console.log(JSON.stringify({{ early, late }}));
+""")
+        p = subprocess.run(["node", str(driver)], capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, p.stderr[-800:]
+        got = json.loads(p.stdout.strip().splitlines()[-1])
+        assert got["early"] == 1, ("first event must spawn immediately", got, p.stderr[-300:])
+        assert got["late"] == 2, ("a burst must coalesce into one trailing spawn", got)
+    print("  ok  opencode plugin: runs under node, leading-edge spawn, burst coalesced")
+
+
+def test_opencode_data_dir_is_watched_non_recursively():
+    """watch_roots() returned the whole OpenCode data dir and the watcher
+    subscribed recursively — log/, tool-output/, snapshot/, project/ are hundreds
+    of directories that never trigger a sync but each cost an inotify watch
+    (ENOSPC on Linux, timer churn on macOS). A root may declare (path, recursive)."""
+    import watcher
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        roots = src.watch_roots()
+        as_pairs = [(Path(r[0]), r[1]) if isinstance(r, tuple) else (Path(r), True) for r in roots]
+        assert (src.mirror_dir, True) in as_pairs and (src.data_dir, False) in as_pairs, roots
+        calls = []
+
+        class Obs:
+            def is_alive(self):
+                return True
+
+            def schedule(self, handler, path, recursive=True):
+                calls.append((Path(path), recursive))
+        pairs = watcher._build_watch_pairs()
+        oc = [p for p in pairs if p[1].name == "opencode"]
+        assert oc and all(len(p) == 3 for p in oc), oc
+        sched = watcher._RootScheduler(Obs(), [(src.mirror_dir, src, True), (src.data_dir, src, False)],
+                                       log=lambda m: None)
+        sched.poll()
+        assert (src.data_dir, False) in calls and (src.mirror_dir, True) in calls, calls
+    print("  ok  opencode: the data dir is watched non-recursively (only the DB/WAL matter)")
+
+
+def test_backup_opencode_leaves_no_stub_when_the_snapshot_fails():
+    """A locked DB (OpenCode running) made VACUUM INTO raise; the fallback
+    created the destination file before failing on the same lock, and the
+    0-byte stub then satisfied is_due() for another 7 days."""
+    bk = _load_script("backup-opencode")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        db = root / "opencode.db"
+        c = sqlite3.connect(str(db))
+        _oc_schema(c)
+        c.close()
+        out = root / "snaps"
+        real_connect = sqlite3.connect
+
+        def locked(*a, **kw):
+            conn = real_connect(*a, **kw)
+            if kw.get("uri") and "mode=ro" in str(a[0]):
+                class C:
+                    def execute(self, *x, **y):
+                        raise sqlite3.OperationalError("database is locked")
+
+                    def backup(self, *x, **y):
+                        raise sqlite3.OperationalError("database is locked")
+
+                    def close(self):
+                        conn.close()
+                return C()
+            return conn
+        bk.sqlite3.connect = locked
+        try:
+            try:
+                bk.snapshot(db, out, keep=3)
+                raised = False
+            except sqlite3.OperationalError:
+                raised = True
+        finally:
+            bk.sqlite3.connect = real_connect
+        assert raised, "a locked DB must be reported, not swallowed"
+        assert bk.snapshots(out) == [] and not list(out.glob("*.db")), list(out.iterdir())
+        assert bk.is_due(out, 7) is True
+    print("  ok  backup-opencode: a failed snapshot leaves no stub that would silence is_due()")
+
+
+def test_restore_protects_the_mirror_file_before_copying_and_retries_reimport_when_live():
+    """(a) restore copied the mirror file back BEFORE the .restored marker was
+    written; a watcher sync in that window saw a file with no DB row and no
+    marker and archived + unlinked it — un-restoring the session. The marker
+    goes first now. (b) 'already-live' returned before reimport, so a restore
+    whose import failed could never be retried from the UI."""
+    import restore
+    import shutil
+    old_archive = reasoning.ARCHIVE
+    conn = _temp_db()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root / "archive"
+            src = _oc_source(root)
+            live = next(iter(src.discover()))
+            indexer.upsert(src.parse_header(live), conn=conn)
+            raw = root / "archive" / "raw" / "2026" / "08"
+            raw.mkdir(parents=True)
+            (raw / f"{_OC_ROOT}.jsonl").write_bytes(live.read_bytes())
+            _oc_wipe(src.db_path)
+            live.unlink()
+            indexer.archive(_OC_ROOT, indexer.TRANSCRIPT_MISSING, conn=conn)
+            marker = live.with_name(live.name + ".restored")
+            seen = []
+            real_copy = shutil.copyfile
+            restore.shutil.copyfile = lambda s, d: seen.append(marker.exists()) or real_copy(s, d)
+            try:
+                src._run_import = lambda file, cwd: (False, "import failed")
+                res = restore.restore_session(_OC_ROOT, conn=conn, registry={"opencode": src})
+            finally:
+                restore.shutil.copyfile = real_copy
+            assert res.status == "restored" and res.reimported is False, res
+            assert seen == [True], "marker must exist before the copy lands"
+            assert marker.exists(), "marker stays until the session is back in the DB"
+            # (b) retry from the UI: file is live, DB still lacks the session
+            calls = []
+            src._run_import = lambda file, cwd: calls.append(file) or (True, "")
+            res = restore.restore_session(_OC_ROOT, conn=conn, registry={"opencode": src})
+            assert res.status == "already-live" and res.reimported is True, res
+            assert calls, "already-live must still offer the re-import"
+    finally:
+        reasoning.ARCHIVE = old_archive
+        conn.close()
+    print("  ok  restore: sidecar before copy; already-live still re-imports")
+
+
+# ===== final review: indexing core ==========================================
+def test_migrate_backfills_archive_reason_from_the_whole_row():
+    """Legacy archived rows (schema v1) were classified from a 3-column
+    projection, so a slash-command-only session with tokens/cost/model was
+    labelled not-a-session — hidden from the Archived tab, never offered for
+    restore — and the idempotency guard made it permanent."""
+    mig = _load_script("migrate-db")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="init-only", turn_count=0, first_message=""), conn=conn)
+        conn.execute("UPDATE sessions SET archived=1, archived_reason=NULL, output_tokens=1200, "
+                     "cost_usd=0.42, model_used='claude-opus-4-8' WHERE session_id='init-only'")
+        indexer.upsert(_header(sid="noise", turn_count=0, first_message=""), conn=conn)
+        conn.execute("UPDATE sessions SET archived=1, archived_reason=NULL WHERE session_id='noise'")
+        conn.commit()
+        mig._backfill_archive_reason(conn)
+        got = dict(conn.execute("SELECT session_id, archived_reason FROM sessions").fetchall())
+        assert got == {"init-only": indexer.TRANSCRIPT_MISSING, "noise": indexer.NOT_A_SESSION}, got
+    finally:
+        conn.close()
+    print("  ok  migrate: legacy archived rows are classified from the whole row")
+
+
+def test_watcher_starts_the_observer_before_subscribing_roots():
+    """watchdog defers emitter start until Observer.start(); roots scheduled
+    BEFORE start raised their inotify ENOSPC out of start() — outside the
+    scheduler's guard — and the daemon died (systemd respawned it into the same
+    crash). The observer is started first so every failure lands in poll()."""
+    import errno
+    import watcher
+
+    class Obs:
+        def __init__(self):
+            self.started = False
+            self.deferred = []
+
+        def is_alive(self):
+            return self.started
+
+        def schedule(self, handler, path, recursive=True):
+            if not self.started:
+                self.deferred.append(path)
+                return
+            raise OSError(errno.ENOSPC, "inotify watch limit reached")
+
+        def start(self):
+            self.started = True
+            if self.deferred:
+                raise OSError(errno.ENOSPC, "inotify watch limit reached")
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "projects"
+        d.mkdir()
+        obs = Obs()
+        logs = []
+        adapter = type("A", (), {"name": "claude"})()
+        roots = watcher.start_watching(obs, [(d, adapter)], log=logs.append)
+        assert obs.started and roots.pending and not roots.scheduled, (roots.pending, roots.scheduled)
+        assert any("cannot watch" in m for m in logs), logs
+    print("  ok  watcher: observer started before roots are subscribed (ENOSPC lands in poll())")
+
+
+def test_watcher_pairs_follow_relocated_cli_homes():
+    """_build_watch_pairs re-derived Claude/Copilot roots from raw config keys,
+    bypassing registry._cli_home(): with CLAUDE_CONFIG_DIR set the watcher
+    subscribed ~/.claude/projects and never indexed a live session. Roots come
+    from the adapters — the single source of truth."""
+    import os as _os
+    import watcher
+    with tempfile.TemporaryDirectory() as td:
+        alt = Path(td) / "alt-claude"
+        (alt / "projects").mkdir(parents=True)
+        old = _os.environ.get("CLAUDE_CONFIG_DIR")
+        _os.environ["CLAUDE_CONFIG_DIR"] = str(alt)
+        try:
+            pairs = watcher._build_watch_pairs()
+        finally:
+            if old is None:
+                _os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                _os.environ["CLAUDE_CONFIG_DIR"] = old
+        claude_roots = [p[0] for p in pairs if p[1].name == "claude"]
+        assert claude_roots == [alt / "projects"], pairs
+    print("  ok  watcher: roots follow CLAUDE_CONFIG_DIR / CODEX_HOME / XDG_DATA_HOME like the registry")
+
+
+def test_backfill_holds_the_write_lock_only_for_the_burst():
+    """parse_header ran inside the open write transaction (commit every 200
+    rows), so a nightly backfill of multi-MB transcripts held the lock for
+    5+ s and the Stop hook's extract-reasoning died with 'database is locked'
+    (busy_timeout 5 s). Headers are parsed outside the transaction and written
+    in one short burst."""
+    import threading
+    import time as _time
+    bf = _load_script("backfill")
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db = f.name
+    indexer.connect(db).close()                         # migrate the schema
+
+    class Slow:
+        name = "claude"
+
+        def discover(self):
+            return [Path(f"/x/s{i}.jsonl") for i in range(5)]
+
+        def parse_header(self, p):
+            _time.sleep(0.12)
+            return _header(sid=p.stem)
+    errors = []
+
+    def run():
+        conn = indexer.connect(db)                      # sqlite connections are per thread
+        try:
+            bf.index_source(conn, "claude", Slow(), commit_every=200)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+        finally:
+            conn.close()
+    t = threading.Thread(target=run)
+    t.start()
+    _time.sleep(0.25)                                   # mid-backfill
+    other = sqlite3.connect(db, timeout=0.25)
+    try:
+        other.execute("PRAGMA busy_timeout=250")
+        other.execute("INSERT INTO session_artifacts (session_id, type, content) VALUES ('h', 'journal', 'x')")
+        other.commit()
+    finally:
+        other.close()
+        t.join()
+    assert not errors, errors
+    c = sqlite3.connect(db)
+    assert c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 5
+    c.close()
+    print("  ok  backfill: parse outside the write transaction; a concurrent writer gets through")
+
+
+def test_codex_corrupt_zst_rollout_is_not_a_session():
+    """zstandard.ZstdError is not a ValueError: a .jsonl.zst whose bytes are not
+    a zstd frame raised straight out of parse_header/parse_full (and the
+    reasoning and cost readers) instead of returning None — a restore that had
+    already copied the file then 500'd in the UI."""
+    cc = _load_script("compute-costs")
+    with tempfile.TemporaryDirectory() as td:
+        cx = _cx_source(Path(td))
+        day = Path(td) / "sessions" / "2026" / "08" / "01"
+        day.mkdir(parents=True)
+        bad = day / (_CX_NAME + ".zst")
+        bad.write_bytes(b"this is not a zstd frame at all")
+        assert cx.parse_header(bad) is None and cx.parse_full(bad) is None
+        assert reasoning.extract_codex(bad) == []
+        totals, per_model = cc._usage_codex(bad)
+        assert not totals and not per_model
+    print("  ok  codex: a corrupt .zst rollout is 'not a session' in every reader, never a traceback")
+
+
+def test_claude_session_id_gate_matches_discover_depth():
+    """discover() globs exactly <projects>/*/*.jsonl, but session_id_for_path
+    accepted a .jsonl at ANY depth: a future <project>/<sid>/workflows/x/
+    journal.jsonl would be indexed as session 'journal' (every one colliding on
+    one row) and then archived by prune because discover() never yields it."""
+    from sources.claude import ClaudeSource
+    with tempfile.TemporaryDirectory() as td:
+        projects = Path(td) / "projects"
+        proj = projects / "-Users-x-proj"
+        proj.mkdir(parents=True)
+        cl = ClaudeSource(projects_dir=projects)
+        sid = "0f0f0f0f-0000-4000-8000-000000000001"
+        assert cl.session_id_for_path(proj / f"{sid}.jsonl") == sid
+        assert cl.session_id_for_path(proj / sid / "workflows" / "wf-1" / "journal.jsonl") is None
+        assert cl.session_id_for_path(projects / "stray.jsonl") is None
+        assert cl.session_id_for_path(proj / "subagents" / "agent-1.jsonl") is None
+    print("  ok  claude: session_id_for_path rejects what discover() would never yield")
+
+
+def test_copilot_factory_default_and_symlink_guard():
+    """(a) an explicit state_dir = "" fell through cfg.get()'s default and made
+    CopilotSource('.') 'available' (a recursive watch on the daemon's cwd);
+    (b) copilot discover() did not skip symlinked session dirs, so a symlink
+    indexed a second row carrying another session's turns."""
+    import sbconfig
+    from sources import registry as reg
+    from sources.copilot import CopilotSource
+    real = sbconfig.source_config
+    sbconfig.source_config = lambda name: {"state_dir": ""} if name == "copilot" else real(name)
+    try:
+        assert reg._make_copilot().state_dir == Path("~/.copilot/session-state").expanduser()
+    finally:
+        sbconfig.source_config = real
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "session-state"
+        real_dir = state / "11111111-1111-4111-8111-111111111111"
+        real_dir.mkdir(parents=True)
+        (real_dir / "workspace.yaml").write_text("cwd: /x\n")
+        (real_dir / "events.jsonl").write_text("")
+        (state / "22222222-2222-4222-8222-222222222222").symlink_to(real_dir)
+        assert [p.parent.name for p in CopilotSource(state).discover()] == [real_dir.name]
+    print("  ok  copilot: empty state_dir means the default; symlinked session dirs are skipped")
+
+
+# ===== final review: archive / restore / costs ===============================
+def test_raw_copy_version_breaks_an_mtime_tie():
+    """Newest-by-mtime tie-broke on the full path string, so @v9 beat @v10 on a
+    1-second-granularity volume or when copy2 preserved an unchanged source
+    mtime — and Restore put back the OLDER, shorter transcript."""
+    import os as _os
+    old_archive = reasoning.ARCHIVE
+    with tempfile.TemporaryDirectory() as td:
+        reasoning.ARCHIVE = Path(td)
+        try:
+            d = Path(td) / "raw" / "2026" / "08"
+            d.mkdir(parents=True)
+            for v in (9, 10):
+                p = d / f"sid-a@v{v}.jsonl"
+                p.write_text("x" * v)
+                _os.utime(p, (1_700_000_000, 1_700_000_000))
+            assert reasoning.find_archived_raw("sid-a").name == "sid-a@v10.jsonl"
+            assert reasoning.archived_raw_index()["sid-a"].name == "sid-a@v10.jsonl"
+        finally:
+            reasoning.ARCHIVE = old_archive
+    print("  ok  raw copies: an mtime tie is broken by the @vN version, not the path string")
+
+
+def test_readable_trail_is_written_atomically_before_the_old_one_is_retired():
+    """write_readable unlinked every older <sid>-*.md FIRST and then wrote the
+    new file non-atomically: a kill or ENOSPC between the two left no trail at
+    all while sessions.reasoning_path still pointed at the deleted file."""
+    import os as _os
+    old_archive = reasoning.ARCHIVE
+    with tempfile.TemporaryDirectory() as td:
+        reasoning.ARCHIVE = Path(td)
+        try:
+            hdr = {"session_id": "sid-trail", "last_activity": "2026-08-01T00:00:00.000Z",
+                   "cli_source": "claude", "cwd": "/x", "folder_name": "x", "title": "Old"}
+            step = reasoning.ReasoningStep(turn_index=0, thinking="why", decision="do", actions=[])
+            first = reasoning.write_readable([step], hdr)
+            assert first.exists()
+            real_replace = _os.replace
+            _os.replace = lambda a, b: (_ for _ in ()).throw(OSError("ENOSPC"))
+            try:
+                try:
+                    reasoning.write_readable([step], {**hdr, "title": "New"})
+                except OSError:
+                    pass
+            finally:
+                _os.replace = real_replace
+            assert first.exists(), "the previous trail must survive a failed rewrite"
+            assert not list(first.parent.glob("*.tmp")), "no temp litter"
+            second = reasoning.write_readable([step], {**hdr, "title": "New"})
+            assert second.exists() and (second == first or not first.exists())
+        finally:
+            reasoning.ARCHIVE = old_archive
+    print("  ok  readable trail: atomic write, previous trail retired only after the new one landed")
+
+
+def test_archive_paths_never_leave_the_vault():
+    """session_id and last_activity are file content (a Codex rollout's payload.id,
+    a mirror header) yet were used as path components: '../x' escaped the
+    archive, and a malformed last_activity produced a one-level directory the
+    raw-copy glob could never see — archived, but permanently unrestorable."""
+    old_archive = reasoning.ARCHIVE
+    with tempfile.TemporaryDirectory() as td:
+        reasoning.ARCHIVE = Path(td) / "archive"
+        try:
+            src = Path(td) / "t.jsonl"
+            src.write_text('{"x":1}\n')
+            for bad in ("../../pwn", "a/b", "a\\b", ".."):
+                try:
+                    reasoning.archive_raw(src, {"session_id": bad, "last_activity": "2026-08-01T00:00:00.000Z"})
+                    raise AssertionError(f"archive_raw accepted {bad!r}")
+                except ValueError:
+                    pass
+                try:
+                    reasoning.write_readable([], {"session_id": bad, "last_activity": "2026-08-01T00:00:00.000Z",
+                                                  "cli_source": "claude", "cwd": "/x", "folder_name": "x"})
+                    raise AssertionError(f"write_readable accepted {bad!r}")
+                except ValueError:
+                    pass
+            dest = reasoning.archive_raw(src, {"session_id": "sid-odd", "last_activity": "2026"})
+            assert dest.parent.relative_to(reasoning.ARCHIVE / "raw").parts == ("0000", "00"), dest
+            assert reasoning.find_archived_raw("sid-odd") == dest
+        finally:
+            reasoning.ARCHIVE = old_archive
+    print("  ok  archive: session ids are validated and odd timestamps still land where the glob looks")
+
+
+def test_compute_costs_never_overwrites_a_price_with_zero_for_unpriced_models():
+    """cost_usd was written unconditionally, so a Copilot session on a model
+    with no pricing alias — or a run with an unreadable pricing.json — zeroed
+    a previously correct cost. When nothing in the session is priced, the
+    stored cost is left alone (and the unknown-model line still warns)."""
+    cc = _load_script("compute-costs")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="cp1", cli_source="copilot"), conn=conn)
+        conn.execute("UPDATE sessions SET cost_usd=1.5 WHERE session_id='cp1'")
+        conn.commit()
+
+        class Ad:
+            name = "copilot"
+
+            def parse_header(self, p):
+                return _header(sid="cp1", cli_source="copilot")
+        cc._EXTRACTORS["copilot"] = lambda p: ({"input": 1000, "output": 10, "cache_read": 0, "cache_write": 0},
+                                              {"gemini-9-ultra": {"input": 1000, "output": 10,
+                                                                  "cache_read": 0, "cache_write": 0}})
+        try:
+            r = cc.process(Path("/x/cp1"), Ad(), conn)
+        finally:
+            cc._EXTRACTORS["copilot"] = cc._usage_copilot
+        assert r is not None and r["cost"] is None, r
+        assert conn.execute("SELECT cost_usd FROM sessions WHERE session_id='cp1'").fetchone()[0] == 1.5
+    finally:
+        conn.close()
+    print("  ok  compute-costs: an unpriced session keeps its stored cost instead of being zeroed")
+
+
+def test_restore_session_batch_survives_one_failure_and_exits_nonzero():
+    """restore-session.py --all --apply had no per-row guard: one locked DB or
+    corrupt rollout aborted the batch mid-way, and main() returned 0 even when
+    every restore failed — on the one command a user runs after losing data."""
+    import restore
+    rs = _load_script("restore-session")
+    rows = [{"session_id": s, "restorable": True, "supported": True, "cli_source": "claude",
+             "folder_name": "x", "last_activity": "2026-08-01T00:00:00.000Z", "title": s,
+             "archived_at": None, "raw_path": None} for s in ("ok1", "boom", "ok2")]
+    calls = []
+
+    def fake(sid):
+        calls.append(sid)
+        if sid == "boom":
+            raise sqlite3.OperationalError("database is locked")
+        return restore.RestoreResult(sid, "restored")
+    real_plan, real_restore = rs.restore.plan, rs.restore.restore_session
+    rs.restore.plan, rs.restore.restore_session = (lambda: rows), fake
+    old_argv = sys.argv
+    sys.argv = ["restore-session.py", "--all", "--apply"]
+    try:
+        try:
+            rs.main()
+            code = 0
+        except SystemExit as e:
+            code = e.code
+    finally:
+        sys.argv = old_argv
+        rs.restore.plan, rs.restore.restore_session = real_plan, real_restore
+    assert calls == ["ok1", "boom", "ok2"], calls
+    assert code not in (0, None), "a failed restore must make the batch exit non-zero"
+    print("  ok  restore-session --all: one failure is reported, the rest proceed, exit is non-zero")
+
+
+def test_redaction_masks_bare_platform_tokens():
+    """Unnamed credentials in tool output — a Slack webhook URL, HF / GitLab /
+    PyPI tokens — reached the readable trail and the MCP egress verbatim."""
+    import redact
+    # Built at runtime: a token-shaped literal in the source trips GitHub's
+    # push protection even though every one of these is fake.
+    slack = "https://hooks." + "slack.com/services/" + "T0" + "A" * 7 + "/B0" + "B" * 7 + "/" + "X" * 24
+    samples = {
+        "slack-webhook": "curl -X POST " + slack,
+        "hf": "export HF_TOKEN=" + "hf_" + "Q" * 34,
+        "gitlab": "git clone https://oauth2:" + "glpat-" + "y" * 20 + "@gitlab.com/x/y.git",
+        "pypi": "twine upload -p " + "pypi-" + "AgEIcHlwaS5vcmc" + "C" * 50,
+    }
+    for name, text in samples.items():
+        out = redact.redact(text)
+        assert out != text and "REDACTED" in out.upper(), (name, out)
+    print("  ok  redaction: Slack webhook, HF, GitLab and PyPI tokens are masked")
+
+
+def test_build_fts_rebuild_with_source_only_clears_that_source():
+    """--rebuild --source claude ran DELETE FROM sessions_fts before narrowing
+    the registry, silently destroying full-text for every OTHER source."""
+    import os as _os
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "r.db"
+        conn = indexer.connect(db)
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(session_id UNINDEXED, body)")
+        for sid, src in (("c1", "claude"), ("x1", "codex")):
+            indexer.upsert(_header(sid=sid, cli_source=src), conn=conn)
+            conn.execute("INSERT INTO sessions_fts (session_id, body) VALUES (?, ?)", (sid, f"body of {sid}"))
+        conn.commit()
+        conn.close()
+        env = {**_os.environ, "SB_DB": str(db), "HOME": td}
+        p = subprocess.run([sys.executable, str(_REPO / "scripts" / "build-fts.py"), "--rebuild", "--source", "claude"],
+                           capture_output=True, text=True, env=env, timeout=120)
+        assert p.returncode == 0, p.stderr[-500:]
+        conn = sqlite3.connect(str(db))
+        left = sorted(r[0] for r in conn.execute("SELECT session_id FROM sessions_fts"))
+        conn.close()
+        assert left == ["x1"], left
+    print("  ok  build-fts: --rebuild --source clears only that source's full-text rows")
+
+
+def test_fts_archived_index_ignores_source_availability():
+    """index_archived received the availability-narrowed registry: once the
+    CLI's transcript tree was gone (the exact end state the archive exists
+    for) the adapter was dropped and every archived row lost full-text — while
+    Restore, using the full registry, still worked."""
+    import os as _os
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        db = home / "r.db"
+        raw = home / "claude-reasoning-archive" / "raw" / "2026" / "08"
+        raw.mkdir(parents=True)
+        sid = "aaaaaaaa-0000-4000-8000-000000000001"
+        (raw / f"{sid}.jsonl").write_text(_cl_transcript("find me in fts", cwd="/Users/x/proj"))
+        conn = indexer.connect(db)
+        indexer.upsert(_header(sid=sid, cli_source="claude", project_path=str(home / "gone")), conn=conn)
+        indexer.archive(sid, indexer.TRANSCRIPT_MISSING, conn=conn)
+        conn.commit()
+        conn.close()
+        env = {**_os.environ, "SB_DB": str(db), "HOME": str(home)}
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        p = subprocess.run([sys.executable, str(_REPO / "scripts" / "build-fts.py")],
+                           capture_output=True, text=True, env=env, timeout=120)
+        assert p.returncode == 0, p.stderr[-500:]
+        assert "+1 archived" in p.stdout, p.stdout
+        conn = sqlite3.connect(str(db))
+        n = conn.execute("SELECT COUNT(*) FROM sessions_fts WHERE sessions_fts MATCH 'fts'").fetchone()[0]
+        conn.close()
+        assert n == 1, n
+    print("  ok  build-fts: archived rows are indexed from the vault even when the CLI's tree is gone")
+
+
+def test_restore_rechecks_the_zst_destination_before_writing():
+    """dest was re-pointed to .zst AFTER the already-live check, so a live cold
+    rollout could be overwritten if an adapter ever returned the plain name."""
+    import restore
+    old_archive = reasoning.ARCHIVE
+    conn = _temp_db()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            reasoning.ARCHIVE = Path(td) / "archive"
+            raw = reasoning.ARCHIVE / "raw" / "2026" / "08"
+            raw.mkdir(parents=True)
+            (raw / "z1.jsonl.zst").write_bytes(b"archived-bytes")
+            live = Path(td) / "live.jsonl.zst"
+            live.write_bytes(b"LIVE")
+            indexer.upsert(_header(sid="z1", cli_source="codex"), conn=conn)
+            indexer.archive("z1", indexer.TRANSCRIPT_MISSING, conn=conn)
+
+            class Ad:
+                name = "codex"
+
+                def restore_path(self, row):
+                    return Path(td) / "live.jsonl"          # plain name; the .zst twin is live
+
+                def parse_header(self, p):
+                    return _header(sid="z1", cli_source="codex")
+            res = restore.restore_session("z1", conn=conn, registry={"codex": Ad()})
+            assert res.status == "already-live", res
+            assert live.read_bytes() == b"LIVE", "a live transcript must never be overwritten"
+    finally:
+        reasoning.ARCHIVE = old_archive
+        conn.close()
+    print("  ok  restore: the .zst twin of the destination counts as live")
 
 
 if __name__ == "__main__":
