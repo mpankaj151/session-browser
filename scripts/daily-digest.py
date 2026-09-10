@@ -59,7 +59,7 @@ def collect_days(conn, tz: tzinfo | None = None) -> dict[str, list]:
     """Local date -> sessions started that day (skips rows with no timestamp)."""
     days: dict[str, list] = defaultdict(list)
     for row in conn.execute(
-            "SELECT * FROM sessions WHERE archived = 0 ORDER BY start_time"):
+            f"SELECT * FROM sessions WHERE {indexer.VISIBLE} ORDER BY start_time"):
         day = _local_date(row["start_time"], tz)
         if day:
             days[day].append(row)

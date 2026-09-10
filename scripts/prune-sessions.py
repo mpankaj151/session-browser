@@ -44,6 +44,19 @@ def _live_ids(registry) -> set[str]:
     return live
 
 
+def archive_stale(rows, conn) -> collections.Counter:
+    """Archive each stale row with the reason its own content implies: a row
+    that never held a conversation is sidechain noise (hidden for good); one
+    with turns is a real session whose transcript went missing (still shown in
+    the UI's Archived view and counted in usage stats)."""
+    reasons: collections.Counter = collections.Counter()
+    for r in rows:
+        reason = indexer.infer_archive_reason(r)
+        indexer.archive(r["session_id"], reason, conn=conn)
+        reasons[reason] += 1
+    return reasons
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="perform changes (default: dry-run)")
@@ -61,8 +74,8 @@ def main() -> None:
     conn = indexer.connect()
     try:
         rows = conn.execute(
-            "SELECT session_id, cli_source, folder_name, turn_count, last_activity "
-            "FROM sessions WHERE archived = 0"
+            "SELECT session_id, cli_source, folder_name, turn_count, last_activity, "
+            f"first_message FROM sessions WHERE {indexer.LIVE}"
         ).fetchall()
 
         # Only prune rows belonging to a source we can actually see right now; a
@@ -80,16 +93,17 @@ def main() -> None:
             sample = [r for r in stale if r["cli_source"] == src][: args.limit]
             for r in sample:
                 print(f"      {r['session_id'][:40]:42} {str(r['folder_name'] or '-')[:28]:30} "
-                      f"turns={r['turn_count'] or 0:<4} {r['last_activity'] or '-'}")
+                      f"turns={r['turn_count'] or 0:<4} {r['last_activity'] or '-'}  "
+                      f"-> {indexer.infer_archive_reason(r)}")
             if n > len(sample):
                 print(f"      ... and {n - len(sample)} more")
             print()
 
         if args.apply:
-            for r in stale:
-                indexer.archive(r["session_id"], conn=conn)
+            reasons = archive_stale(stale, conn)
             conn.commit()
-            print(f"Done. Archived {len(stale)} row(s) (archived=1 — nothing deleted).")
+            detail = ", ".join(f"{n} {k}" for k, n in reasons.most_common())
+            print(f"Done. Archived {len(stale)} row(s): {detail} (archived=1 — nothing deleted).")
         else:
             print("Nothing changed. Re-run with --apply to archive these rows.")
     finally:

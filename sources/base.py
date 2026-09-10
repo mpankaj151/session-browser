@@ -112,3 +112,11 @@ class SessionSource(Protocol):
     def is_available(self) -> bool:
         """True if the CLI binary and its session directory are present."""
         ...
+
+    # Optional — NOT a Protocol member, so adapters without it still satisfy
+    # isinstance(). restore.py looks it up with getattr():
+    #
+    #   def restore_path(self, row) -> Optional[Path]:
+    #       """Where a restored transcript for this `sessions` row must be
+    #       written so the CLI's own resume finds it, or None if this source
+    #       can't be restored from a bare <session_id>.jsonl raw copy."""

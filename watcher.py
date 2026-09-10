@@ -182,8 +182,10 @@ class _Handler(FileSystemEventHandler):
             if canonical_dir is not None and Path(canonical_dir) != path.parent:
                 _log(f"skip archive (non-canonical copy deleted) {sid}")
                 return
-            indexer.archive(sid)
-            _log(f"archive [{self.adapter.name}] {sid}")
+            # Proven above: the path that vanished IS the canonical transcript,
+            # so this is a real session aged out — keep it visible as such.
+            indexer.archive(sid, indexer.TRANSCRIPT_MISSING)
+            _log(f"archive [{self.adapter.name}] {sid} ({indexer.TRANSCRIPT_MISSING})")
         except Exception as e:  # noqa: BLE001
             _log(f"archive error {sid}: {e}")
 

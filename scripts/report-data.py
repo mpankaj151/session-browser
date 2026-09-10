@@ -116,7 +116,7 @@ def _artifacts(conn, sids: list[str], kind: str) -> dict[str, list[str]]:
 def build_report(conn, lo: date, hi: date, label: str,
                  tz: tzinfo | None = None, on_disk: dict[str, int] | None = None) -> dict:
     rows = []
-    for r in conn.execute("SELECT * FROM sessions WHERE archived=0 ORDER BY start_time"):
+    for r in conn.execute(f"SELECT * FROM sessions WHERE {indexer.VISIBLE} ORDER BY start_time"):
         local = _local(r["start_time"], tz)
         if local and lo <= local.date() <= hi:
             rows.append((local, r))

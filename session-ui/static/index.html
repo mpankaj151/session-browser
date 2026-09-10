@@ -31,6 +31,7 @@
     </div>
     <div class="flex items-center gap-2">
       <button id="tabSessions" class="text-sm px-3 py-1.5 rounded-lg bg-indigo-600 text-white">Sessions</button>
+      <button id="tabArchived" title="Sessions whose transcript was deleted (e.g. Claude Code's cleanupPeriodDays) — kept with all their metadata, restorable when a raw copy exists" class="text-sm px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800">🗄 Archived</button>
       <button id="tabStats" class="text-sm px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800">📊 Usage</button>
       <button id="darkToggle" class="text-sm px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800">🌓</button>
     </div>
@@ -86,7 +87,9 @@ const SOURCE_COLORS = {
   copilot: 'bg-sky-500/15 text-sky-600 dark:text-sky-300 border-sky-500/30',
   codex: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border-emerald-500/30',
 };
-let STATE = { source: 'all', sessions: [], kbIndex: -1 };
+// state: 'live' (Sessions tab) | 'archived' (Archived tab — transcript aged out)
+let STATE = { source: 'all', state: 'live', sessions: [], kbIndex: -1 };
+const ARCHIVED_CLS = 'bg-amber-500/10 text-amber-600 dark:text-amber-300 border-amber-500/30';
 
 const $ = s => document.querySelector(s);
 async function fetchJson(url, opts){ const r = await fetch(url, opts); if(!r.ok) throw new Error(r.status); return r.json(); }
@@ -161,12 +164,22 @@ function group(sessions){
 function badge(text, cls){ return `<span class="px-2 py-0.5 rounded-md text-xs border ${cls}">${esc(text)}</span>`; }
 
 function renderCard(s, idx){
-  const dot = s.is_active ? 'bg-emerald-500' : (s.summary ? 'bg-indigo-500' : 'bg-slate-400');
+  const dot = s.archived ? 'bg-amber-500' : s.is_active ? 'bg-emerald-500' : (s.summary ? 'bg-indigo-500' : 'bg-slate-400');
   const srcCls = SOURCE_COLORS[s.cli_source] || 'bg-slate-500/15 text-slate-400 border-slate-500/30';
   const sid = esc(s.session_id);
   const topics = (s.topics||[]).slice(0,4).map(t=>`<button data-act="topic" data-topic="${esc(t)}" class="px-2 py-0.5 rounded-md text-xs bg-slate-200 dark:bg-slate-800 hover:bg-indigo-500/20">#${esc(t)}</button>`).join(' ');
   const reasoningBtn = s.has_reasoning
     ? `<button data-act="reasoning" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-violet-600/90 hover:bg-violet-500 text-white">🧠 Reasoning</button>` : '';
+  // Archived: the transcript file is gone, so Resume has nothing to open. Offer
+  // Restore when the reasoning archive still holds a raw copy; otherwise say why.
+  const when = s.archived_at ? new Date(s.archived_at).toLocaleDateString() : '';
+  const archivedBadge = s.archived
+    ? badge(`⌛ Archived · transcript aged out${when?' · '+when:''}`, ARCHIVED_CLS) : '';
+  const primaryBtn = !s.archived
+    ? `<button data-act="resume" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>`
+    : s.restorable
+      ? `<button data-act="restore" data-sid="${sid}" title="Copy the raw transcript back from the reasoning archive; Resume works again afterwards" class="text-xs px-2.5 py-1 rounded-md bg-amber-600 hover:bg-amber-500 text-white">♻ Restore</button>`
+      : `<button disabled title="Transcript deleted and no raw copy in the reasoning archive — metadata only" class="text-xs px-2.5 py-1 rounded-md bg-slate-300 dark:bg-slate-700 text-slate-500 cursor-not-allowed">▶ Resume</button>`;
   return `<div class="card border border-slate-200 dark:border-slate-800 rounded-xl p-4 bg-white dark:bg-slate-900 hover:border-indigo-400/50 transition" data-idx="${idx}">
     <div class="flex items-start justify-between gap-3">
       <div class="flex items-center gap-2 min-w-0">
@@ -176,6 +189,7 @@ function renderCard(s, idx){
       <div class="flex items-center gap-2 shrink-0">${fmtCost(s.cost)} ${badge(s.cli_source, srcCls)}</div>
     </div>
     <div class="flex flex-wrap items-center gap-1.5 mt-2 text-xs text-slate-500">
+      ${archivedBadge}
       ${badge(s.folder_name||'—','bg-slate-100 dark:bg-slate-800 border-slate-300/40 dark:border-slate-700')}
       ${s.session_type?badge(s.session_type,'bg-purple-500/10 text-purple-500 border-purple-500/30'):''}
       ${s.outcome?badge(s.outcome,'bg-green-500/10 text-green-600 border-green-500/30'):''}
@@ -185,7 +199,7 @@ function renderCard(s, idx){
     <p class="clamp2 text-sm text-slate-600 dark:text-slate-300 mt-2">${esc(s.summary||s.first_message||'')}</p>
     <div class="flex flex-wrap gap-1.5 mt-2">${topics}</div>
     <div class="flex flex-wrap gap-2 mt-3">
-      <button data-act="resume" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>
+      ${primaryBtn}
       ${reasoningBtn}
       <button data-act="copy" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">📋 Copy Context</button>
       <button data-act="export" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700">⬇ Export</button>
@@ -206,6 +220,7 @@ document.addEventListener('click', e => {
   const sid = b.dataset.sid;
   switch(b.dataset.act){
     case 'resume':    resume(sid); break;
+    case 'restore':   restoreSession(sid); break;
     case 'reasoning': showReasoning(sid); break;
     case 'copy':      copyContext(sid); break;
     case 'export':    exportContext(sid); break;
@@ -234,9 +249,21 @@ function render(){
 }
 
 async function resume(id){
-  const r = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/resume`);
+  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/resume`);
+  const r = await res.json().catch(()=>({}));
+  if(!res.ok){ toast(r.error || `Cannot resume (${res.status})`); return; }
   await navigator.clipboard.writeText(r.command);
   toast(`Copied "${r.command}" — run it in the directory where you want to resume`);
+}
+async function restoreSession(id){
+  // POST + custom header, like bridge: this writes into the CLI's session tree.
+  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/restore`,
+                          {method:'POST', headers:{'X-Requested-With':'session-browser'}});
+  const r = await res.json().catch(()=>({}));
+  if(!res.ok){ toast(`Restore failed: ${r.detail || r.status || res.status}`); return; }
+  toast(r.status==='restored' ? 'Restored — the transcript is back; Resume works again'
+                              : 'Already live — re-indexed');
+  await loadMeta(); await applyFilters();          // the card moves to Sessions
 }
 async function showReasoning(id){
   try{
@@ -338,7 +365,8 @@ function renderSibling(s){
       <div class="text-xs text-slate-500 dark:text-slate-400 truncate">${esc(one)}</div>
       <div class="text-[11px] text-slate-400">${new Date(s.last_activity).toLocaleString()} · ${esc(s.turn_count)} turns</div>
     </div>
-    <button data-act="resume" data-sid="${esc(s.session_id)}" class="shrink-0 text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>
+    ${s.archived ? badge('⌛ archived', ARCHIVED_CLS+' shrink-0')
+                 : `<button data-act="resume" data-sid="${esc(s.session_id)}" class="shrink-0 text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>`}
   </div>`;
 }
 
@@ -350,13 +378,15 @@ async function applyFilters(){
   if($('#days').value) p.set('days',$('#days').value);
   if($('#mode').value) p.set('mode',$('#mode').value);
   if(STATE.source!=='all') p.set('source',STATE.source);
+  if(STATE.state==='archived') p.set('state','archived');
   STATE.sessions = await fetchJson('/api/sessions?'+p.toString());
   render();
 }
 
 async function loadMeta(){
-  const stats = await fetchJson('/api/stats');
-  let line = `${stats.total} sessions · ${stats.enriched} enriched · ${stats.folders} folders`;
+  const stats = await fetchJson('/api/stats?state='+STATE.state);
+  let line = `${stats.total} ${STATE.state==='archived'?'archived ':''}sessions · ${stats.enriched} enriched · ${stats.folders} folders`;
+  $('#tabArchived').textContent = `🗄 Archived${stats.archived ? ' '+stats.archived : ''}`;
   if(stats.billing && stats.billing.mode === 'subscription'){
     line += ` · ${stats.billing.plan} (costs ≈ API-equiv, not billed)`;
   }
@@ -470,14 +500,21 @@ function statTile(big, small, accent){
   </div>`;
 }
 function showTab(which){
-  const sess = which==='sessions';
-  $('#sessionsView').classList.toggle('hidden', !sess);
-  $('#statsView').classList.toggle('hidden', sess);
-  $('#tabSessions').className = 'text-sm px-3 py-1.5 rounded-lg '+(sess?'bg-indigo-600 text-white':'border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800');
-  $('#tabStats').className = 'text-sm px-3 py-1.5 rounded-lg '+(!sess?'bg-indigo-600 text-white':'border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800');
-  if(!sess) renderStats();
+  const stats = which==='stats';
+  STATE.state = which==='archived' ? 'archived' : 'live';
+  $('#sessionsView').classList.toggle('hidden', stats);
+  $('#statsView').classList.toggle('hidden', !stats);
+  const on  = 'text-sm px-3 py-1.5 rounded-lg bg-indigo-600 text-white';
+  const off = 'text-sm px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800';
+  $('#tabSessions').className = which==='sessions' ? on : off;
+  $('#tabArchived').className = which==='archived' ? on : off;
+  $('#tabStats').className    = stats ? on : off;
+  $('#empty').textContent = which==='archived'
+    ? 'No archived sessions — nothing has aged out of the browser.' : 'No sessions match.';
+  if(stats) renderStats(); else { loadMeta(); applyFilters(); }
 }
 $('#tabSessions').onclick = ()=>showTab('sessions');
+$('#tabArchived').onclick = ()=>showTab('archived');
 $('#tabStats').onclick = ()=>showTab('stats');
 
 // debounced search

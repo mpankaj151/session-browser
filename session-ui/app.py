@@ -18,7 +18,9 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 import indexer  # noqa: E402
+import reasoning  # noqa: E402
 import redact as _redact  # noqa: E402
+import restore  # noqa: E402
 import sbconfig  # noqa: E402
 from sources.registry import build_source_registry  # noqa: E402
 
@@ -47,7 +49,10 @@ def _check_host():
 
 
 # --- helpers ------------------------------------------------------------------
-def _row_to_dict(row) -> dict:
+def _row_to_dict(row, raw_index: dict | None = None) -> dict:
+    """raw_index: reasoning.archived_raw_index(), computed once per request by
+    the callers that list archived rows — it labels which of them still have
+    a raw transcript copy to restore from."""
     d = dict(row)
     # topics / models_used are JSON-encoded text columns.
     for key in ("topics", "models_used"):
@@ -60,6 +65,8 @@ def _row_to_dict(row) -> dict:
             d[key] = []
     d["is_active"] = _is_active(d.get("last_activity"))
     d["has_reasoning"] = bool(d.get("reasoning_path"))
+    d["restorable"] = bool(d.get("archived")) and raw_index is not None \
+        and d["session_id"] in raw_index
     d["cost"] = {
         "usd": d.get("cost_usd"),
         "input": d.get("input_tokens"), "output": d.get("output_tokens"),
@@ -104,6 +111,9 @@ def api_sessions():
     topic = request.args.get("topic") or ""
     days = request.args.get("days")
     mode = request.args.get("mode") or ""
+    # live (default): a transcript exists. archived: real sessions whose
+    # transcript aged out — the Archived tab. Noise rows are in neither.
+    state = request.args.get("state") or "live"
 
     # Semantic mode: rank by embedding similarity, then apply the same filters.
     sem_ids: list[str] | None = None
@@ -129,7 +139,7 @@ def api_sessions():
             finally:
                 conn0.close()
 
-    where = ["archived = 0"]
+    where = [indexer.ARCHIVED_VISIBLE if state == "archived" else indexer.LIVE]
     params: list = []
     if folder:
         where.append("folder_name = ?")
@@ -166,7 +176,8 @@ def api_sessions():
         rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
-    results = [_row_to_dict(r) for r in rows]
+    raw_index = reasoning.archived_raw_index() if state == "archived" else None
+    results = [_row_to_dict(r, raw_index) for r in rows]
     # In semantic mode, preserve similarity ranking from sem_ids.
     if sem_ids is not None:
         rank = {sid: i for i, sid in enumerate(sem_ids)}
@@ -180,7 +191,7 @@ def api_folders():
     try:
         rows = conn.execute(
             "SELECT DISTINCT folder_name FROM sessions "
-            "WHERE archived = 0 AND folder_name <> '' ORDER BY folder_name"
+            f"WHERE {indexer.VISIBLE} AND folder_name <> '' ORDER BY folder_name"
         ).fetchall()
     finally:
         conn.close()
@@ -192,7 +203,7 @@ def api_topics():
     conn = indexer.connect()
     try:
         rows = conn.execute(
-            "SELECT topics FROM sessions WHERE archived = 0 AND topics IS NOT NULL"
+            f"SELECT topics FROM sessions WHERE {indexer.VISIBLE} AND topics IS NOT NULL"
         ).fetchall()
     finally:
         conn.close()
@@ -211,12 +222,18 @@ def api_resume(sid: str):
     conn = indexer.connect()
     try:
         row = conn.execute(
-            "SELECT cli_source, cwd FROM sessions WHERE session_id = ?", (sid,)
+            "SELECT cli_source, cwd, archived, archived_reason FROM sessions WHERE session_id = ?",
+            (sid,),
         ).fetchone()
     finally:
         conn.close()
     if not row:
         return jsonify({"error": "not found"}), 404
+    if row["archived"]:
+        # No file for `claude --resume` to open. Say why instead of handing
+        # back a command that fails in the terminal.
+        return jsonify({"error": "transcript missing — restore the session first",
+                        "archived_reason": row["archived_reason"]}), 409
     src = SOURCES.get(row["cli_source"])
     raw = src.resume_command(sid) if src else f"# unknown source {row['cli_source']}"
     cwd = row["cwd"] or ""
@@ -228,6 +245,24 @@ def api_resume(sid: str):
     command_full = f'{shlex.quote(str(wrapper))} {shlex.quote(sid)} {row["cli_source"]}'
     return jsonify({"command": command, "command_full": command_full,
                     "raw_command": raw, "origin_cwd": cwd, "cli_source": row["cli_source"]})
+
+
+@app.post("/api/sessions/<sid>/restore")
+def api_restore(sid: str):
+    """Copy the newest raw transcript from the reasoning archive back to where
+    the CLI looks for it and re-index — the row leaves the Archived view."""
+    # Writes into the CLI's own session tree: same drive-by guard as bridge.
+    if not request.headers.get("X-Requested-With"):
+        return jsonify({"error": "missing X-Requested-With header"}), 403
+    res = restore.restore_session(sid, registry=SOURCES)
+    if res.status in ("restored", "already-live"):
+        code = 200
+    elif res.status == "not-found":
+        code = 404
+    else:
+        code = 409
+    return jsonify({"status": res.status, "path": str(res.path) if res.path else None,
+                    "detail": res.detail}), code
 
 
 def _build_context(conn, sid: str) -> tuple[str, str] | None:
@@ -398,13 +433,13 @@ def api_thread(sid: str):
         if row["cwd"]:
             rows = conn.execute(
                 "SELECT * FROM sessions WHERE cwd = ? AND session_id <> ? "
-                "AND archived = 0 ORDER BY last_activity DESC LIMIT 50",
+                f"AND {indexer.VISIBLE} ORDER BY last_activity DESC LIMIT 50",
                 (row["cwd"], sid),
             ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT * FROM sessions WHERE folder_name = ? AND session_id <> ? "
-                "AND archived = 0 ORDER BY last_activity DESC LIMIT 50",
+                f"AND {indexer.VISIBLE} ORDER BY last_activity DESC LIMIT 50",
                 (row["folder_name"], sid),
             ).fetchall()
     finally:
@@ -451,35 +486,35 @@ def api_stats_timeseries():
             "SELECT substr(last_activity,1,10) AS day, COUNT(*) AS sessions, "
             "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
             "COALESCE(SUM(cost_usd),0) AS cost "
-            "FROM sessions WHERE archived=0 AND last_activity!='' "
+            f"FROM sessions WHERE {indexer.VISIBLE} AND last_activity!='' "
             "GROUP BY day ORDER BY day"
         ).fetchall()]
         by_model = [dict(r) for r in conn.execute(
             "SELECT COALESCE(model_used,'unknown') AS model, COUNT(*) AS sessions, "
             "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
-            "COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE archived=0 "
+            f"COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE {indexer.VISIBLE} "
             "GROUP BY model ORDER BY cost DESC LIMIT 20"
         ).fetchall()]
         by_project = [dict(r) for r in conn.execute(
             "SELECT COALESCE(NULLIF(folder_name,''),'—') AS project, COUNT(*) AS sessions, "
             "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
-            "COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE archived=0 "
+            f"COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE {indexer.VISIBLE} "
             "GROUP BY project ORDER BY cost DESC LIMIT 15"
         ).fetchall()]
         by_source = [dict(r) for r in conn.execute(
             "SELECT cli_source AS source, COUNT(*) AS sessions, "
             "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
-            "COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE archived=0 "
+            f"COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE {indexer.VISIBLE} "
             "GROUP BY source ORDER BY cost DESC"
         ).fetchall()]
         totals = dict(conn.execute(
             "SELECT COUNT(*) AS sessions, "
             "COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens, "
-            "COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE archived=0"
+            f"COALESCE(SUM(cost_usd),0) AS cost FROM sessions WHERE {indexer.VISIBLE}"
         ).fetchone())
         # this-calendar-month cost (the headline "≈$X of API-equivalent" number)
         month_cost = conn.execute(
-            "SELECT COALESCE(SUM(cost_usd),0) FROM sessions WHERE archived=0 "
+            f"SELECT COALESCE(SUM(cost_usd),0) FROM sessions WHERE {indexer.VISIBLE} "
             "AND last_activity >= strftime('%Y-%m-01', 'now')"
         ).fetchone()[0]
     finally:
@@ -491,24 +526,32 @@ def api_stats_timeseries():
 
 @app.get("/api/stats")
 def api_stats():
+    # ?state=live|archived scopes the counts to one tab so the source pills
+    # match the list beneath them; the default (everything visible) is what
+    # the header line and other consumers want.
+    pred = {"live": indexer.LIVE, "archived": indexer.ARCHIVED_VISIBLE}.get(
+        request.args.get("state") or "", indexer.VISIBLE)
     conn = indexer.connect()
     try:
-        total = conn.execute("SELECT COUNT(*) FROM sessions WHERE archived = 0").fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM sessions WHERE {pred}").fetchone()[0]
         enriched = conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE archived = 0 AND summary IS NOT NULL"
+            f"SELECT COUNT(*) FROM sessions WHERE {pred} AND summary IS NOT NULL"
         ).fetchone()[0]
         folders = conn.execute(
-            "SELECT COUNT(DISTINCT folder_name) FROM sessions WHERE archived = 0"
+            f"SELECT COUNT(DISTINCT folder_name) FROM sessions WHERE {pred}"
         ).fetchone()[0]
         by_source = {
             r[0]: r[1] for r in conn.execute(
-                "SELECT cli_source, COUNT(*) FROM sessions WHERE archived = 0 GROUP BY cli_source"
+                f"SELECT cli_source, COUNT(*) FROM sessions WHERE {pred} GROUP BY cli_source"
             ).fetchall()
         }
+        archived = conn.execute(
+            f"SELECT COUNT(*) FROM sessions WHERE {indexer.ARCHIVED_VISIBLE}"
+        ).fetchone()[0]
     finally:
         conn.close()
     return jsonify({"total": total, "enriched": enriched, "folders": folders,
-                    "by_source": by_source, "billing": sbconfig.BILLING})
+                    "archived": archived, "by_source": by_source, "billing": sbconfig.BILLING})
 
 
 if __name__ == "__main__":

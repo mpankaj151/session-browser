@@ -68,7 +68,7 @@ def semantic_or_keyword(query: str, limit: int):
     try:
         like = f"%{query}%"
         rows = conn.execute(
-            "SELECT session_id FROM sessions WHERE archived = 0 AND "
+            f"SELECT session_id FROM sessions WHERE {indexer.VISIBLE} AND "
             "(first_message LIKE ? OR summary LIKE ? OR title LIKE ? OR topics LIKE ?) "
             "ORDER BY last_activity DESC LIMIT ?",
             (like, like, like, like, limit),

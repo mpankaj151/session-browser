@@ -6,6 +6,7 @@ never deleted, preserving history.
 """
 from __future__ import annotations
 
+import importlib.util
 import sqlite3
 from pathlib import Path
 
@@ -14,13 +15,40 @@ from sources.base import SessionHeader
 
 DB_PATH = sbconfig.DB_PATH
 
+# Bumped whenever migrate-db.py changes the schema. migrate() stamps it into
+# PRAGMA user_version; connect() compares the two so a registry the running
+# code is ahead of (a `git pull` before the nightly refresh) heals itself.
+#   1: everything up to reasoning_path
+#   2: archived_reason / archived_at
+SCHEMA_VERSION = 2
+
 
 def connect(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    _ensure_schema(conn)
     return conn
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """One integer read in steady state. Migrates only when the registry is
+    behind — the Stop hook and watcher upsert straight after a pull, long
+    before refresh-all runs migrate-db, and the upsert SQL names new columns."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+        return
+    spec = importlib.util.spec_from_file_location(
+        "migrate_db", Path(__file__).resolve().parent / "scripts" / "migrate-db.py")
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)  # type: ignore[union-attr]
+    try:
+        mig.migrate(conn)
+    except sqlite3.OperationalError:
+        # Two processes (hook + watcher) racing the same upgrade: the loser's
+        # ADD COLUMN sees "duplicate column". Fine if the winner finished.
+        if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            raise
 
 
 _UPSERT_SQL = """
@@ -52,9 +80,32 @@ ON CONFLICT(session_id) DO UPDATE SET
   cli_version   = COALESCE(NULLIF(sessions.cli_version, ''), NULLIF(excluded.cli_version, '')),
   model_used    = COALESCE(NULLIF(excluded.model_used, ''), sessions.model_used),
   -- an upsert only ever comes from parsing a file that exists on disk, so the
-  -- session is alive: resurrect it if it was (possibly wrongly) archived.
-  archived      = 0;
+  -- session is alive: resurrect it if it was (possibly wrongly) archived, and
+  -- leave no stale reason behind.
+  archived        = 0,
+  archived_reason = NULL,
+  archived_at     = NULL;
 """
+
+# Closed vocabulary for sessions.archived_reason.
+#   TRANSCRIPT_MISSING — the canonical transcript was deleted (Claude Code's
+#       cleanupPeriodDays, a manual rm). The row is a real session: still shown
+#       in the UI's Archived view and still counted in usage stats.
+#   NOT_A_SESSION — the row never mapped to a real transcript (subagent
+#       sidechains, workflow journals indexed before the adapter gate was
+#       tightened). Hidden everywhere, counted nowhere.
+TRANSCRIPT_MISSING = "transcript-missing"
+NOT_A_SESSION = "not-a-session"
+
+# SQL predicates on `sessions`. Use these instead of spelling `archived = 0`:
+#   LIVE    — a transcript exists on disk right now. For anything that must
+#             open the file (enrichment, reasoning extraction, prune).
+#   VISIBLE — what the user should see and what usage stats should count:
+#             live rows plus real sessions whose transcript aged out. Rows
+#             archived without a recorded reason (mid-upgrade) stay hidden.
+LIVE = "archived = 0"
+ARCHIVED_VISIBLE = f"(archived = 1 AND archived_reason = '{TRANSCRIPT_MISSING}')"
+VISIBLE = f"({LIVE} OR {ARCHIVED_VISIBLE})"
 
 
 def _params(h: SessionHeader) -> dict:
@@ -87,11 +138,32 @@ def upsert(header: SessionHeader, conn: sqlite3.Connection | None = None) -> Non
             conn.close()
 
 
-def archive(session_id: str, conn: sqlite3.Connection | None = None) -> None:
+def infer_archive_reason(row) -> str:
+    """Classify an archived row from its own content (for rows archived before
+    the reason was recorded, and for prune-sessions, which sees both kinds).
+
+    A row with no typed turns and no first message never held a conversation —
+    that's a subagent sidechain or workflow journal, never a session. Anything
+    with content was a real session whose transcript is now missing. Derived
+    from what the row holds, never from the shape of its id.
+    """
+    turns = row["turn_count"] or 0
+    first = (row["first_message"] or "").strip()
+    return NOT_A_SESSION if turns == 0 and not first else TRANSCRIPT_MISSING
+
+
+def archive(session_id: str, reason: str, conn: sqlite3.Connection | None = None) -> None:
+    """Flip a row to archived=1 and record why (TRANSCRIPT_MISSING / NOT_A_SESSION
+    — required, so no caller can archive without saying which). Never deletes:
+    history is kept, and a later upsert from a real file resurrects the row."""
     own = conn is None
     conn = conn or connect()
     try:
-        conn.execute("UPDATE sessions SET archived = 1 WHERE session_id = ?", (session_id,))
+        conn.execute(
+            "UPDATE sessions SET archived = 1, archived_reason = ?, "
+            "archived_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE session_id = ?",
+            (reason, session_id),
+        )
         if own:
             conn.commit()
     finally:

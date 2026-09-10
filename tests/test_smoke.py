@@ -492,7 +492,7 @@ def test_archive_resurrect_roundtrip():
     conn = _temp_db()
     try:
         indexer.upsert(_header(), conn=conn)
-        indexer.archive("__smoke__", conn=conn)
+        indexer.archive("__smoke__", indexer.TRANSCRIPT_MISSING, conn=conn)
         assert conn.execute("SELECT archived FROM sessions WHERE session_id='__smoke__'").fetchone()[0] == 1
         indexer.upsert(_header(), conn=conn)
         assert conn.execute("SELECT archived FROM sessions WHERE session_id='__smoke__'").fetchone()[0] == 0
@@ -707,6 +707,527 @@ def test_watcher_ignores_compression_representation_change():
         plain.unlink()
         assert watcher._is_representation_change(plain) is False
     print("  ok  watcher treats compression as a representation change, not a delete")
+
+
+
+# --- archive lifecycle: reason + visibility ----------------------------------
+def test_archive_records_reason_and_resurrect_clears_it():
+    """An archived row must say WHY. A transcript that aged out (Claude's
+    cleanupPeriodDays) is a real session the UI should keep showing; a subagent
+    sidechain that never was a session is not. Same flag, different meaning."""
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(), conn=conn)
+        indexer.archive("__smoke__", reason="transcript-missing", conn=conn)
+        row = conn.execute("SELECT archived, archived_reason, archived_at FROM sessions "
+                           "WHERE session_id='__smoke__'").fetchone()
+        assert row["archived"] == 1
+        assert row["archived_reason"] == "transcript-missing"
+        assert row["archived_at"], "archived_at must be stamped"
+        # a fresh upsert (file exists again) must leave no stale reason behind
+        indexer.upsert(_header(), conn=conn)
+        row = conn.execute("SELECT archived, archived_reason, archived_at FROM sessions "
+                           "WHERE session_id='__smoke__'").fetchone()
+        assert row["archived"] == 0
+        assert row["archived_reason"] is None and row["archived_at"] is None
+    finally:
+        conn.close()
+    print("  ok  archive records a reason + timestamp; resurrect clears both")
+
+
+def test_infer_archive_reason_separates_noise_from_aged_out():
+    """Backfilling history (rows archived before the reason column existed): a
+    row with zero turns and no first message never held a conversation — it's a
+    subagent sidechain or workflow journal. Anything with content was a real
+    session whose transcript went missing. Derived, never guessed from the id."""
+    infer = indexer.infer_archive_reason
+    assert infer({"turn_count": 0, "first_message": ""}) == indexer.NOT_A_SESSION
+    assert infer({"turn_count": 0, "first_message": None}) == indexer.NOT_A_SESSION
+    assert infer({"turn_count": None, "first_message": "  "}) == indexer.NOT_A_SESSION
+    assert infer({"turn_count": 3, "first_message": "fix the bug"}) == indexer.TRANSCRIPT_MISSING
+    # one typed turn is still a conversation
+    assert infer({"turn_count": 1, "first_message": "hi"}) == indexer.TRANSCRIPT_MISSING
+    # content survives even when an ancient row never got a turn_count
+    assert infer({"turn_count": None, "first_message": "x"}) == indexer.TRANSCRIPT_MISSING
+    print("  ok  infer_archive_reason: 0 turns + no message -> noise, else aged-out")
+
+
+def test_migrate_backfills_reason_onto_legacy_archived_rows():
+    """Upgrading a registry that archived rows before the reason column existed:
+    migrate() classifies them with the derived rule, touches nothing live, never
+    overwrites a reason already recorded, and is idempotent."""
+    conn = _temp_db()
+    try:
+        conn.executemany(
+            "INSERT INTO sessions (session_id, archived, turn_count, first_message) VALUES (?,?,?,?)",
+            [("agent-abc", 1, 0, ""),           # subagent sidechain noise
+             ("real-1", 1, 12, "refactor x"),   # real session, transcript aged out
+             ("live-1", 0, 3, "y")])            # live — must stay untouched
+        conn.commit()
+        migrate = _load_script("migrate-db").migrate
+        migrate(conn)
+        rows = dict(conn.execute("SELECT session_id, archived_reason FROM sessions").fetchall())
+        assert rows["agent-abc"] == indexer.NOT_A_SESSION, rows
+        assert rows["real-1"] == indexer.TRANSCRIPT_MISSING, rows
+        assert rows["live-1"] is None, rows
+        # a reason recorded at the source is authoritative; re-migrating keeps it
+        conn.execute("UPDATE sessions SET archived_reason=? WHERE session_id='agent-abc'",
+                     (indexer.TRANSCRIPT_MISSING,))
+        conn.commit()
+        migrate(conn)
+        assert conn.execute("SELECT archived_reason FROM sessions WHERE session_id='agent-abc'"
+                            ).fetchone()[0] == indexer.TRANSCRIPT_MISSING
+    finally:
+        conn.close()
+    print("  ok  migrate backfills archived_reason on legacy rows (idempotent, non-clobbering)")
+
+
+def test_visible_predicate_includes_aged_out_excludes_noise():
+    """Two named SQL predicates replace the `archived = 0` literal copy-pasted
+    across the UI, stats and search: LIVE (a transcript exists on disk) and
+    VISIBLE (what the user should see — live rows plus real sessions whose
+    transcript aged out, never sidechain noise)."""
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header("live"), conn=conn)
+        indexer.upsert(_header("aged"), conn=conn)
+        indexer.archive("aged", reason=indexer.TRANSCRIPT_MISSING, conn=conn)
+        indexer.upsert(_header("noise", turn_count=0, first_message=""), conn=conn)
+        indexer.archive("noise", reason=indexer.NOT_A_SESSION, conn=conn)
+        visible = {r[0] for r in conn.execute(f"SELECT session_id FROM sessions WHERE {indexer.VISIBLE}")}
+        assert visible == {"live", "aged"}, visible
+        live = {r[0] for r in conn.execute(f"SELECT session_id FROM sessions WHERE {indexer.LIVE}")}
+        assert live == {"live"}, live
+        # an archived row with no reason yet (mid-upgrade) must not leak through
+        conn.execute("UPDATE sessions SET archived_reason = NULL WHERE session_id = 'noise'")
+        visible = {r[0] for r in conn.execute(f"SELECT session_id FROM sessions WHERE {indexer.VISIBLE}")}
+        assert visible == {"live", "aged"}, visible
+    finally:
+        conn.close()
+    print("  ok  VISIBLE = live + transcript-missing; LIVE = archived=0 only")
+
+
+def test_no_archived_sql_literal_outside_schema_layer():
+    """`archived = 0` used to be copy-pasted into ~15 queries across 8 files, so
+    a visibility rule would have to be re-derived at every site. The flag's SQL
+    is spelled out only in indexer.py (predicates) and migrate-db.py (schema);
+    everything else composes indexer.LIVE / VISIBLE / ARCHIVED_VISIBLE."""
+    import re as _re
+    pat = _re.compile(r"\b(WHERE|AND|OR)\s+(\w+\.)?archived\s*=\s*[01]\b")
+    allowed = {"indexer.py", "scripts/migrate-db.py"}
+    offenders = []
+    for py in _REPO.rglob("*.py"):
+        rel = py.relative_to(_REPO)
+        if rel.parts[0] in (".venv", ".worktrees", "tests") or "__pycache__" in rel.parts:
+            continue
+        if str(rel) in allowed:
+            continue
+        for i, line in enumerate(py.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if pat.search(line):
+                offenders.append(f"{rel}:{i}")
+    assert not offenders, ("compose indexer.LIVE / VISIBLE instead of a literal:\n  "
+                           + "\n  ".join(offenders))
+    print("  ok  archived-flag SQL is spelled only in the schema layer")
+
+
+def test_watcher_delete_archives_as_transcript_missing():
+    """The watcher reaches archive() only after proving the deleted path WAS the
+    canonical transcript — a real session aged out. It must say so, or the row
+    is indistinguishable from sidechain noise and vanishes from the UI."""
+    import watcher
+    from sources.claude import ClaudeSource
+    conn = _temp_db()
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    orig_connect, orig_log = indexer.connect, watcher._log
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "-proj-x"
+            proj.mkdir()
+            gone = proj / "sid-1.jsonl"          # never created: it was deleted
+            indexer.upsert(_header("sid-1", project_path=str(proj)), conn=conn)
+            conn.commit()
+            indexer.connect = lambda *a, **k: orig_connect(db_path)
+            watcher._log = lambda msg: None      # never touch ~/.session-browser
+            ev = type("Ev", (), {"is_directory": False, "src_path": str(gone)})()
+            watcher._Handler(ClaudeSource(td)).on_deleted(ev)
+        row = conn.execute("SELECT archived, archived_reason FROM sessions "
+                           "WHERE session_id='sid-1'").fetchone()
+        assert row["archived"] == 1, dict(row)
+        assert row["archived_reason"] == indexer.TRANSCRIPT_MISSING, dict(row)
+    finally:
+        indexer.connect, watcher._log = orig_connect, orig_log
+        conn.close()
+    print("  ok  watcher delete -> archived as transcript-missing (stays VISIBLE)")
+
+
+def test_prune_classifies_each_stale_row():
+    """prune-sessions sees BOTH kinds of dead row — sidechain noise, and real
+    transcripts deleted while the watcher was down — so it must classify each
+    one with the shared rule, never blanket-label the batch."""
+    prune = _load_script("prune-sessions")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header("agent-1", turn_count=0, first_message=""), conn=conn)
+        indexer.upsert(_header("real-1", turn_count=9, first_message="ship it"), conn=conn)
+        stale = conn.execute("SELECT * FROM sessions").fetchall()
+        prune.archive_stale(stale, conn=conn)
+        rows = dict(conn.execute("SELECT session_id, archived_reason FROM sessions "
+                                 "WHERE archived = 1").fetchall())
+        assert rows == {"agent-1": indexer.NOT_A_SESSION,
+                        "real-1": indexer.TRANSCRIPT_MISSING}, rows
+    finally:
+        conn.close()
+    print("  ok  prune archives noise as not-a-session, real rows as transcript-missing")
+
+
+def test_find_archived_raw_prefers_newest_version():
+    """archive_raw() keeps <sid>.jsonl plus <sid>@vN.jsonl on content change.
+    Restore wants the newest — numerically (v10 > v2), not lexically — and the
+    list view needs one directory walk for 500 rows, not 500 walks."""
+    old = reasoning.ARCHIVE
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root
+            d = root / "raw" / "2026" / "05"
+            d.mkdir(parents=True)
+            for name in ("sid-a.jsonl", "sid-a@v2.jsonl", "sid-a@v10.jsonl", "sid-b.jsonl"):
+                (d / name).write_text(name)
+            assert reasoning.find_archived_raw("sid-a") == d / "sid-a@v10.jsonl"
+            assert reasoning.find_archived_raw("sid-b") == d / "sid-b.jsonl"
+            assert reasoning.find_archived_raw("nope") is None
+            assert reasoning.archived_raw_index() == {"sid-a": d / "sid-a@v10.jsonl",
+                                                      "sid-b": d / "sid-b.jsonl"}
+            reasoning.ARCHIVE = root / "never-created"
+            assert reasoning.find_archived_raw("sid-a") is None
+            assert reasoning.archived_raw_index() == {}
+    finally:
+        reasoning.ARCHIVE = old
+    print("  ok  find_archived_raw: newest @vN wins numerically; index is one walk")
+
+
+def _cl_transcript(first_message: str, cwd: str = "/x") -> str:
+    """A minimal Claude transcript parse_header/parse_full accept. Compact JSON:
+    the adapter's turn counter prefilters on the '"type":"user"' substring."""
+    recs = [
+        {"type": "user", "cwd": cwd, "version": "2.0.0", "promptSource": "typed",
+         "timestamp": "2026-05-01T10:00:00.000Z",
+         "message": {"role": "user", "content": first_message}},
+        {"type": "assistant", "timestamp": "2026-05-01T10:00:05.000Z",
+         "message": {"model": "claude-test", "content": [{"type": "text", "text": "done"}]}},
+    ]
+    return "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in recs)
+
+
+def test_restore_session_from_raw_archive():
+    """Claude Code's cleanup deleted the transcript; the reasoning archive still
+    holds a raw copy. Restore puts the NEWEST copy back where Claude Code looks
+    for it (recreating the project dir if needed) and re-indexes, so the row
+    goes live again and `cr <id>` / --resume work. The archive copy stays."""
+    import restore
+    from sources.claude import ClaudeSource
+    old = reasoning.ARCHIVE
+    conn = _temp_db()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root / "archive"
+            projects = root / "projects"
+            proj = projects / "-x"                      # deliberately NOT created
+            raw = root / "archive" / "raw" / "2026" / "05"
+            raw.mkdir(parents=True)
+            (raw / "sid-r.jsonl").write_text(_cl_transcript("older copy"))
+            (raw / "sid-r@v2.jsonl").write_text(_cl_transcript("restore me please"))
+            indexer.upsert(_header("sid-r", project_path=str(proj), turn_count=1,
+                                   first_message="restore me please"), conn=conn)
+            indexer.archive("sid-r", indexer.TRANSCRIPT_MISSING, conn=conn)
+            registry = {"claude": ClaudeSource(projects)}
+
+            res = restore.restore_session("sid-r", conn=conn, registry=registry)
+            assert res.status == "restored", res
+            dest = proj / "sid-r.jsonl"
+            assert res.path == dest and dest.exists(), res
+            assert dest.read_text() == (raw / "sid-r@v2.jsonl").read_text()
+            assert (raw / "sid-r@v2.jsonl").exists(), "archive copy must survive"
+            row = conn.execute("SELECT archived, archived_reason, turn_count, cwd FROM sessions "
+                               "WHERE session_id='sid-r'").fetchone()
+            assert row["archived"] == 0 and row["archived_reason"] is None, dict(row)
+            assert row["turn_count"] == 1 and row["cwd"] == "/x", dict(row)
+            # second call: the live file is back, so nothing to copy — just re-index
+            again = restore.restore_session("sid-r", conn=conn, registry=registry)
+            assert again.status == "already-live", again
+    finally:
+        reasoning.ARCHIVE = old
+        conn.close()
+    print("  ok  restore: newest raw copy -> project dir, row resurrected, archive kept")
+
+
+def test_restore_refuses_when_nothing_to_restore():
+    """Every way restore can't proceed is a distinct, honest status — never a
+    silent no-op and never a write into ~/.claude/projects it can't justify."""
+    import restore
+    from sources.claude import ClaudeSource
+    from sources.copilot import CopilotSource
+    old = reasoning.ARCHIVE
+    conn = _temp_db()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root / "archive"          # exists but empty
+            (root / "archive" / "raw").mkdir(parents=True)
+            projects = root / "projects"
+            registry = {"claude": ClaudeSource(projects),
+                        "copilot": CopilotSource(root / "copilot")}
+
+            assert restore.restore_session("ghost", conn=conn, registry=registry).status == "not-found"
+
+            indexer.upsert(_header("agent-z", project_path=str(projects / "-p"),
+                                   turn_count=0, first_message=""), conn=conn)
+            indexer.archive("agent-z", indexer.NOT_A_SESSION, conn=conn)
+            assert restore.restore_session("agent-z", conn=conn, registry=registry).status == "not-a-session"
+
+            indexer.upsert(_header("no-copy", project_path=str(projects / "-p")), conn=conn)
+            indexer.archive("no-copy", indexer.TRANSCRIPT_MISSING, conn=conn)
+            assert restore.restore_session("no-copy", conn=conn, registry=registry).status == "no-raw-copy"
+
+            indexer.upsert(_header("cp-1", cli_source="copilot",
+                                   project_path=str(root / "copilot" / "cp-1")), conn=conn)
+            indexer.archive("cp-1", indexer.TRANSCRIPT_MISSING, conn=conn)
+            assert restore.restore_session("cp-1", conn=conn, registry=registry).status == "unsupported"
+
+            assert not (projects).exists(), "no refusal may write into the projects dir"
+            for sid in ("agent-z", "no-copy", "cp-1"):
+                assert conn.execute("SELECT archived FROM sessions WHERE session_id=?",
+                                    (sid,)).fetchone()[0] == 1, sid
+    finally:
+        reasoning.ARCHIVE = old
+        conn.close()
+    print("  ok  restore refuses: not-found / not-a-session / no-raw-copy / unsupported")
+
+
+def test_restore_plan_lists_only_aged_out_rows():
+    """`restore-session.py --all --dry-run` is the first thing to run on a machine
+    that lost sessions: it says which archived rows CAN come back before anyone
+    counts on them. Noise rows never appear in the plan."""
+    import restore
+    from sources.claude import ClaudeSource
+    old = reasoning.ARCHIVE
+    conn = _temp_db()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root / "archive"
+            raw = root / "archive" / "raw" / "2026" / "06"
+            raw.mkdir(parents=True)
+            (raw / "have.jsonl").write_text(_cl_transcript("x"))
+            for sid, reason, kw in (("have", indexer.TRANSCRIPT_MISSING, {}),
+                                    ("lost", indexer.TRANSCRIPT_MISSING, {}),
+                                    ("noise", indexer.NOT_A_SESSION,
+                                     dict(turn_count=0, first_message=""))):
+                indexer.upsert(_header(sid, project_path=str(root / "p"), **kw), conn=conn)
+                indexer.archive(sid, reason, conn=conn)
+            indexer.upsert(_header("live"), conn=conn)
+            plan = restore.plan(conn=conn, registry={"claude": ClaudeSource(root / "p")})
+            got = {p["session_id"]: p["restorable"] for p in plan}
+            assert got == {"have": True, "lost": False}, got
+    finally:
+        reasoning.ARCHIVE = old
+        conn.close()
+    print("  ok  restore.plan: aged-out rows with/without a raw copy; noise omitted")
+
+
+# --- Flask API: archived view --------------------------------------------------
+def _load_app():
+    spec = _ilu.spec_from_file_location("sb_app", _REPO / "session-ui" / "app.py")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_api_archived_state_and_visible_stats():
+    """The Archived tab lists aged-out sessions — why, when, and whether a raw
+    copy exists to restore from. The default list is unchanged. Usage stats
+    count aged-out sessions (their spend was real) but never noise."""
+    sb = _load_app()
+    conn = _temp_db()
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    orig_connect, old_archive = indexer.connect, reasoning.ARCHIVE
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root
+            raw = root / "raw" / "2026" / "05"
+            raw.mkdir(parents=True)
+            (raw / "aged-has-copy.jsonl").write_text(_cl_transcript("x"))
+            indexer.upsert(_header("live"), conn=conn)
+            conn.execute("UPDATE sessions SET cost_usd=1.0 WHERE session_id='live'")
+            for sid in ("aged-has-copy", "aged-no-copy"):
+                indexer.upsert(_header(sid), conn=conn)
+                indexer.archive(sid, indexer.TRANSCRIPT_MISSING, conn=conn)
+                conn.execute("UPDATE sessions SET cost_usd=2.0 WHERE session_id=?", (sid,))
+            indexer.upsert(_header("agent-noise", turn_count=0, first_message=""), conn=conn)
+            indexer.archive("agent-noise", indexer.NOT_A_SESSION, conn=conn)
+            conn.execute("UPDATE sessions SET cost_usd=100.0 WHERE session_id='agent-noise'")
+            conn.commit()
+            indexer.connect = lambda *a, **k: orig_connect(db_path)
+            c = sb.app.test_client()
+
+            ids = [s["session_id"] for s in c.get("/api/sessions").get_json()]
+            assert ids == ["live"], ids
+            arch = c.get("/api/sessions?state=archived").get_json()
+            got = {s["session_id"]: (s["archived_reason"], s["restorable"]) for s in arch}
+            assert got == {"aged-has-copy": (indexer.TRANSCRIPT_MISSING, True),
+                           "aged-no-copy": (indexer.TRANSCRIPT_MISSING, False)}, got
+            assert all(s["archived_at"] for s in arch), arch
+            stats = c.get("/api/stats").get_json()
+            assert stats["total"] == 3 and stats["archived"] == 2, stats
+            assert stats["by_source"] == {"claude": 3}, stats
+            # the source pills must match the tab they sit above
+            live = c.get("/api/stats?state=live").get_json()
+            assert live["total"] == 1 and live["by_source"] == {"claude": 1}, live
+            arch_stats = c.get("/api/stats?state=archived").get_json()
+            assert arch_stats["total"] == 2 and arch_stats["by_source"] == {"claude": 2}, arch_stats
+            assert arch_stats["archived"] == 2, arch_stats
+            totals = c.get("/api/stats/timeseries").get_json()["totals"]
+            assert totals["sessions"] == 3 and abs(totals["cost"] - 5.0) < 1e-9, totals
+    finally:
+        indexer.connect, reasoning.ARCHIVE = orig_connect, old_archive
+        conn.close()
+    print("  ok  /api/sessions?state=archived + stats count aged-out, never noise")
+
+
+def test_api_restore_endpoint_and_resume_refusal():
+    """Resume on an aged-out session is refused with the reason (there is no
+    file for `claude --resume` to open); POST restore brings it back, after
+    which resume works. Refusals map to honest HTTP statuses."""
+    from sources.claude import ClaudeSource
+    sb = _load_app()
+    conn = _temp_db()
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    orig_connect, old_archive, old_sources = indexer.connect, reasoning.ARCHIVE, sb.SOURCES
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root / "archive"
+            raw = root / "archive" / "raw" / "2026" / "05"
+            raw.mkdir(parents=True)
+            (raw / "aged.jsonl").write_text(_cl_transcript("bring me back"))
+            projects = root / "projects"
+            for sid in ("aged", "no-copy"):
+                indexer.upsert(_header(sid, project_path=str(projects / "-x")), conn=conn)
+                indexer.archive(sid, indexer.TRANSCRIPT_MISSING, conn=conn)
+            conn.commit()
+            indexer.connect = lambda *a, **k: orig_connect(db_path)
+            sb.SOURCES = {"claude": ClaudeSource(projects)}
+            c = sb.app.test_client()
+
+            r = c.get("/api/sessions/aged/resume")
+            assert r.status_code == 409 and r.get_json()["archived_reason"] == indexer.TRANSCRIPT_MISSING, r.data
+            # restore writes into the CLI's session tree: same CSRF guard as bridge
+            assert c.post("/api/sessions/aged/restore").status_code == 403
+            assert not (projects / "-x" / "aged.jsonl").exists()
+            H = {"X-Requested-With": "session-browser"}
+            r = c.post("/api/sessions/aged/restore", headers=H)
+            assert r.status_code == 200 and r.get_json()["status"] == "restored", r.data
+            assert (projects / "-x" / "aged.jsonl").exists()
+            assert c.get("/api/sessions/aged/resume").status_code == 200
+            assert [s["session_id"] for s in c.get("/api/sessions").get_json()] == ["aged"]
+
+            assert c.post("/api/sessions/nope/restore", headers=H).status_code == 404
+            r = c.post("/api/sessions/no-copy/restore", headers=H)
+            assert r.status_code == 409 and r.get_json()["status"] == "no-raw-copy", r.data
+    finally:
+        indexer.connect, reasoning.ARCHIVE, sb.SOURCES = orig_connect, old_archive, old_sources
+        conn.close()
+    print("  ok  resume refused (409) while aged out; POST restore -> live -> resume ok")
+
+
+def test_fts_indexes_archived_sessions_from_raw_copy():
+    """Full-text search must keep working for aged-out sessions: build-fts reads
+    their body from the reasoning archive's raw copy when the live transcript is
+    gone. Rows with no copy, and noise rows, are skipped."""
+    from sources.claude import ClaudeSource
+    fts = _load_script("build-fts")
+    conn = _temp_db()
+    old = reasoning.ARCHIVE
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root
+            raw = root / "raw" / "2026" / "05"
+            raw.mkdir(parents=True)
+            (raw / "aged.jsonl").write_text(_cl_transcript("zebra migration strategy"))
+            for sid, reason, kw in (("aged", indexer.TRANSCRIPT_MISSING, {}),
+                                    ("lost", indexer.TRANSCRIPT_MISSING, {}),
+                                    ("noise", indexer.NOT_A_SESSION,
+                                     dict(turn_count=0, first_message=""))):
+                indexer.upsert(_header(sid, **kw), conn=conn)
+                indexer.archive(sid, reason, conn=conn)
+            n = fts.index_archived(conn, {"claude": ClaudeSource(root / "projects")})
+            assert n == 1, n
+            hits = [r[0] for r in conn.execute(
+                "SELECT session_id FROM sessions_fts WHERE sessions_fts MATCH 'zebra'")]
+            assert hits == ["aged"], hits
+    finally:
+        reasoning.ARCHIVE = old
+        conn.close()
+    print("  ok  build-fts indexes aged-out sessions from their raw archive copy")
+
+
+# --- schema self-heal: code ahead of the registry --------------------------
+def _old_schema_db(path: Path) -> None:
+    """A registry as it existed before archived_reason — built WITHOUT
+    indexer.connect(), which would upgrade it."""
+    mig = _load_script("migrate-db")
+    conn = sqlite3.connect(str(path))
+    conn.executescript(mig.BASE_DDL)
+    for col in mig.ADDITIVE_COLUMNS:
+        if not col.startswith("archived_"):
+            mig._add_column_if_missing(conn, "sessions", col)
+    conn.execute("INSERT INTO sessions (session_id, archived, turn_count, first_message, "
+                 "cli_source, project_path) VALUES ('legacy', 1, 4, 'x', 'claude', '/nowhere')")
+    conn.commit()
+    conn.close()
+
+
+def test_connect_self_heals_registry_behind_the_code():
+    """After a `git pull`, the Stop hook and watcher upsert BEFORE the nightly
+    refresh has migrated — and the upsert SQL now names archived_reason, so
+    they'd fail until 01:00. connect() reads PRAGMA user_version (one integer)
+    and migrates only when the registry is behind."""
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "old.db"
+        _old_schema_db(db)
+        raw = sqlite3.connect(str(db))
+        assert "archived_reason" not in {r[1] for r in raw.execute("PRAGMA table_info(sessions)")}
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 0
+        raw.close()
+        conn = indexer.connect(db)
+        try:
+            indexer.upsert(_header("fresh"), conn=conn)          # the hook's hot path
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == indexer.SCHEMA_VERSION
+            assert conn.execute("SELECT archived_reason FROM sessions WHERE session_id='legacy'"
+                                ).fetchone()[0] == indexer.TRANSCRIPT_MISSING
+        finally:
+            conn.close()
+    print("  ok  connect() migrates a registry the code is ahead of (PRAGMA user_version)")
+
+
+def test_restore_cli_plans_on_unmigrated_registry():
+    """`restore-session.py --all` is the first command to run on a laptop that
+    lost sessions — before any refresh has migrated its registry. It must
+    print the plan, not crash on a missing column."""
+    import os
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "old.db"
+        _old_schema_db(db)
+        out = subprocess.run([sys.executable, str(_REPO / "scripts" / "restore-session.py"), "--all"],
+                             capture_output=True, text=True, cwd=str(_REPO),
+                             env={**os.environ, "SB_DB": str(db)})
+        assert out.returncode == 0, out.stderr
+        assert "legacy" in out.stdout and "1 archived session" in out.stdout, out.stdout
+    print("  ok  restore-session.py --all plans on a not-yet-migrated registry")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-import common  # noqa: E402  (same dir)
+import common  # noqa: E402  (same dir — also puts the repo root on sys.path)
+import indexer  # noqa: E402
 
 mcp = FastMCP("session-memory")
 
@@ -114,7 +115,7 @@ def list_recent(folder: str = "", days: int = 7) -> list[dict]:
     conn = common.connect()
     try:
         sql = ("SELECT session_id, title, summary, folder_name, last_activity, cli_source "
-               "FROM sessions WHERE archived = 0 AND last_activity >= datetime('now', ?)")
+               f"FROM sessions WHERE {indexer.VISIBLE} AND last_activity >= datetime('now', ?)")
         params = [f"-{int(days)} days"]
         if folder:
             sql += " AND folder_name = ?"

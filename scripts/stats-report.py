@@ -37,7 +37,7 @@ def _bold(s):  # noqa: ANN001
 def _window(conn, label: str, sql_filter: str):
     row = conn.execute(
         f"SELECT COUNT(*) c, COALESCE(SUM({_TOK}),0) t, COALESCE(SUM(cost_usd),0) cost "
-        f"FROM sessions WHERE archived=0 {sql_filter}"
+        f"FROM sessions WHERE {indexer.VISIBLE} {sql_filter}"
     ).fetchone()
     return f"  {label:<8} {row['c']:>4} sessions   {_h(row['t']):>7} tok   {PFX}${row['cost']:>10,.2f}"
 
@@ -45,7 +45,7 @@ def _window(conn, label: str, sql_filter: str):
 def _table(conn, title: str, col: str, expr: str, limit: int):
     rows = conn.execute(
         f"SELECT {expr} AS k, COUNT(*) c, COALESCE(SUM({_TOK}),0) t, COALESCE(SUM(cost_usd),0) cost "
-        f"FROM sessions WHERE archived=0 GROUP BY k ORDER BY cost DESC LIMIT {limit}"
+        f"FROM sessions WHERE {indexer.VISIBLE} GROUP BY k ORDER BY cost DESC LIMIT {limit}"
     ).fetchall()
     print(f"\n{_bold(title)}")
     for r in rows:

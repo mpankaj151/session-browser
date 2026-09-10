@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import indexer  # noqa: E402
+import reasoning  # noqa: E402
 import redact as _redact  # noqa: E402
 from sources.registry import build_source_registry  # noqa: E402
 
@@ -30,6 +31,33 @@ def _body(parsed) -> str:
                 parts.append(tc["input"])
     text = "\n".join(parts)
     return _redact.redact(text[:MAX_BODY])
+
+
+def index_archived(conn, registry) -> int:
+    """Aged-out sessions have no live transcript for discover() to find — but
+    the raw copy refresh-all put in the reasoning archive is byte-identical.
+    Index their body from there so full-text search keeps finding them."""
+    raw = reasoning.archived_raw_index()
+    rows = conn.execute(
+        f"SELECT session_id, cli_source FROM sessions WHERE {indexer.ARCHIVED_VISIBLE}"
+    ).fetchall()
+    n = 0
+    for sid, source in rows:
+        path, adapter = raw.get(sid), registry.get(source)
+        if path is None or adapter is None:
+            continue
+        try:
+            parsed = adapter.parse_full(path)
+            if parsed is None or not parsed.turns:
+                continue
+            conn.execute("DELETE FROM sessions_fts WHERE session_id = ?", (sid,))
+            conn.execute("INSERT INTO sessions_fts (session_id, body) VALUES (?, ?)",
+                         (sid, _body(parsed)))
+            n += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! {path.name}: {e}", file=sys.stderr)
+    conn.commit()
+    return n
 
 
 def main() -> None:
@@ -73,8 +101,9 @@ def main() -> None:
             if i % 20 == 0:
                 conn.commit()
         conn.commit()
+    m = index_archived(conn, registry)
     conn.close()
-    print(f"Indexed full text for {n} sessions.")
+    print(f"Indexed full text for {n} sessions (+{m} archived, from the raw archive).")
 
 
 if __name__ == "__main__":

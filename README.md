@@ -115,6 +115,24 @@ ports the session's memory to wherever you are, then resumes — Claude (symlink
 into the encoded project dir), Copilot (repoint workspace cwd), Codex (resume in
 place). The UI's **Resume** button copies exactly this command.
 
+### Archived sessions — nothing ages out of the browser
+
+Claude Code deletes transcripts older than `cleanupPeriodDays` (default 30).
+Session Browser never deletes a row: when a transcript vanishes, the session
+moves to the **Archived** tab with everything the index already knew — title,
+summary, topics, cost, reasoning trail — and it still counts in the usage
+dashboard. Because the nightly refresh copies every transcript into the
+reasoning archive *before* extracting from it, most archived sessions come back
+with one click (**♻ Restore**), after which `cr <id>` and `--resume` work again.
+
+```bash
+scripts/restore-session.py --all          # which archived sessions can come back?
+scripts/restore-session.py --all --apply  # restore every one that can
+```
+
+Raise `cleanupPeriodDays` in `~/.claude/settings.json` to stop the deletions at
+the source; Archived is the safety net for the ones that already happened.
+
 ### The reasoning / decision trail
 
 For each session, a turn-by-turn reconstruction of the **visible reasoning** and
