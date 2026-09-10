@@ -115,7 +115,10 @@ def list_recent(folder: str = "", days: int = 7) -> list[dict]:
     conn = common.connect()
     try:
         sql = ("SELECT session_id, title, summary, folder_name, last_activity, cli_source "
-               f"FROM sessions WHERE {indexer.VISIBLE} AND last_activity >= datetime('now', ?)")
+               # strftime with the column's own 'T' spelling: datetime('now', ...) yields
+               # 'YYYY-MM-DD HH:MM:SS', which sorts below every row of the cutoff day.
+               f"FROM sessions WHERE {indexer.VISIBLE} AND "
+               "last_activity >= strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now', ?)")
         params = [f"-{int(days)} days"]
         if folder:
             sql += " AND folder_name = ?"

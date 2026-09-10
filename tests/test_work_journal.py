@@ -648,6 +648,62 @@ def test_enrich_driver_skips_cleanly_when_auto_finds_no_cli():
     print("  ok  enrich driver: auto with no CLI exits 0 (skip); explicit missing binary exits 1")
 
 
+# --- empty transcripts are not enrichment candidates -------------------------
+def test_select_sessions_skips_rows_with_no_turns():
+    """A live row with turn_count = 0 (a session opened and closed at once) has
+    nothing to summarise. Selecting it every night and then skipping it in the
+    loop made the nightly log read "4 sessions to enrich ... Enriched 0/4" with
+    no reason, forever."""
+    es = _load_script("enrich-sessions")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="empty", turn_count=0, first_message=""), conn=conn)
+        indexer.upsert(_header(sid="real", turn_count=3), conn=conn)
+        got = [r["session_id"] for r in es._select_sessions(conn, None, False)]
+        assert got == ["real"], got
+        # the hook fast path on the empty row is a no-op too
+        assert es._select_sessions(conn, "empty", force=False) == []
+        # --force still respects it: there is nothing to summarise either way
+        assert [r["session_id"] for r in es._select_sessions(conn, None, True)] == ["real"]
+    finally:
+        conn.close()
+    print("  ok  enrichment never selects a row with no turns")
+
+
+# --- MCP list_recent: window cutoff uses the transcript timestamp spelling ---
+def test_mcp_list_recent_window_does_not_leak_the_cutoff_day():
+    """last_activity is stored as 'YYYY-MM-DDTHH:MM:SS.mmmZ'. SQLite's
+    datetime('now', '-7 days') yields 'YYYY-MM-DD HH:MM:SS', and 'T' sorts
+    above ' ', so every row from the cutoff DAY compared >= the cutoff even
+    when it was hours earlier — the same leak app.py's days filter fixed."""
+    import os
+    tmp = tempfile.mkdtemp(prefix="sb-mcp-")
+    db = str(Path(tmp) / "r.db")
+    os.environ["SESSION_MEMORY_DB"] = db
+    try:
+        conn = indexer.connect(db)
+        try:
+            row = conn.execute(
+                "SELECT strftime('%Y-%m-%dT00:00:00.000Z','now','-7 days') AS edge, "
+                "strftime('%Y-%m-%dT%H:%M:%S.000Z','now','-6 days') AS inside").fetchone()
+            indexer.upsert(_header(sid="edge", last_activity=row["edge"]), conn=conn)
+            indexer.upsert(_header(sid="inside", last_activity=row["inside"]), conn=conn)
+            conn.commit()
+        finally:
+            conn.close()
+        srv_dir = _REPO / "mcp" / "session-memory"
+        sys.path.insert(0, str(srv_dir))
+        spec = _ilu.spec_from_file_location("sb_mcp_server", srv_dir / "server.py")
+        srv = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(srv)
+        srv.common.DB_PATH = db
+        got = [r["session_id"] for r in srv.list_recent(days=7)]
+        assert got == ["inside"], got
+    finally:
+        os.environ.pop("SESSION_MEMORY_DB", None)
+    print("  ok  MCP list_recent: the cutoff day is not leaked into the window")
+
+
 if __name__ == "__main__":
     print("Work-journal tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

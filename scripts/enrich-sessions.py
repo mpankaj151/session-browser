@@ -50,12 +50,14 @@ def _select_sessions(conn, session_id: str | None, force: bool) -> list:
     """Which sessions this run enriches. --session is the hook fast path and
     still honors staleness (a SessionEnd with no new activity must cost $0);
     --force bypasses it either way."""
+    # turn_count > 0: a session opened and closed at once has nothing to
+    # summarise; selecting it every night and skipping it in the loop made the
+    # log read "N sessions to enrich ... Enriched 0/N" with no reason, forever.
+    base = f"SELECT * FROM sessions WHERE {indexer.LIVE} AND turn_count > 0"
     if session_id:
         pred = "" if force else f" AND {STALE_PREDICATE}"
-        return conn.execute(
-            f"SELECT * FROM sessions WHERE {indexer.LIVE} AND session_id = ?" + pred,
-            (session_id,)).fetchall()
-    sel = f"SELECT * FROM sessions WHERE {indexer.LIVE}"
+        return conn.execute(base + " AND session_id = ?" + pred, (session_id,)).fetchall()
+    sel = base
     if not force:
         sel += f" AND {STALE_PREDICATE}"
     sel += " ORDER BY last_activity DESC"
@@ -201,6 +203,7 @@ def main() -> None:
         try:
             parsed = adapter.parse_full(path)
             if parsed is None or not parsed.turns:
+                print(f"  skip {s['session_id'][:8]} (no turns in transcript)")
                 continue
             prior, prior_seen = _load_prior(s, args.force)
             turns_for_llm, prior = _slice_turns(parsed.turns, prior, prior_seen)

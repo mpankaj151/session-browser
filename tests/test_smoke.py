@@ -282,13 +282,14 @@ def test_to_iso_utc_hardening():
 # --- costs ----------------------------------------------------------------------
 def test_cost_mapping():
     pricing = costs.load_pricing()
-    assert costs.tier_for_model("claude-opus-4-8", pricing) == "opus"
-    assert costs.tier_for_model("claude-sonnet-4-6", pricing) == "sonnet"
+    assert costs.tier_for_model("claude-opus-4-8", pricing) == "opus-4.5"
+    assert costs.tier_for_model("claude-opus-4-1", pricing) == "opus-4"      # retired rate kept
+    assert costs.tier_for_model("claude-sonnet-4-6", pricing) == "sonnet-4"
     assert costs.tier_for_model("gpt-5-mini", pricing) == "gpt-5-mini"  # longest-alias-first
     assert costs.tier_for_model("some-future-model-9", pricing) is None  # unknown -> None, not a guess
     c = costs.cost_usd("claude-opus-4-8", {"input": 1_000_000, "output": 0,
                                            "cache_read": 0, "cache_write": 0}, pricing)
-    assert abs(c - 15.0) < 1e-6
+    assert abs(c - 5.0) < 1e-6
     assert costs.coerce_cache_write({"ephemeral_5m_input_tokens": 10,
                                      "ephemeral_1h_input_tokens": 5}) == 15
     print("  ok  cost mapping (tiers, unknown->None, cache dict coercion)")
@@ -3026,6 +3027,79 @@ def test_opencode_reimport_empty_directory_falls_back_to_home():
         assert ok is True and seen["cwd"] == Path.home(), (seen, detail)
         assert "directory" in detail and str(Path.home()) in detail, detail
     print("  ok  opencode re-import: empty directory -> $HOME, and the note says so")
+
+
+# --- stats-report windows: cutoff day is not leaked --------------------------
+def test_stats_report_windows_do_not_leak_the_cutoff_day():
+    """`sb stats` 7-day / 30-day windows must agree with the UI's days filter:
+    a row at 00:00 on the cutoff day is OUTSIDE a window that starts later
+    that day. datetime('now', '-N days') spells the cutoff with a space, which
+    sorts below the stored 'T' and pulled the whole day in."""
+    mod = _load_script("stats-report")
+    conn = _temp_db()
+    try:
+        row = conn.execute(
+            "SELECT strftime('%Y-%m-%dT00:00:00.000Z','now','-7 days') AS edge, "
+            "strftime('%Y-%m-%dT%H:%M:%S.000Z','now','-6 days') AS inside").fetchone()
+        indexer.upsert(_header(sid="edge", last_activity=row["edge"]), conn=conn)
+        indexer.upsert(_header(sid="inside", last_activity=row["inside"]), conn=conn)
+        line = mod._window(conn, "7 days", "AND " + mod.since_sql(7))
+        assert "   1 sessions" in line, line
+        assert mod.since_sql(7).count("'T'") == 0 and "T%H" in mod.since_sql(7), mod.since_sql(7)
+    finally:
+        conn.close()
+    print("  ok  stats-report windows use the transcript timestamp spelling")
+
+
+# --- pricing.json tracks the published Claude list prices --------------------
+def test_pricing_matches_published_claude_list_prices():
+    """Per-million list prices as published on platform.claude.com/docs/en/about-claude/pricing
+    (checked 2026-09-11). The old table priced every Opus at the retired Opus 4.1
+    rate ($15/$75), tripling the Usage tab for Opus 4.5+ / Opus 5, priced Sonnet 5
+    at the Sonnet 4.x rate, Haiku 4.5 at the Haiku 3.5 rate, and had no Fable /
+    Mythos tier at all (cost counted as $0 with a nightly warning)."""
+    pricing = costs.load_pricing()
+    M = 1_000_000
+
+    def usd(model, **tok):
+        return round(costs.cost_usd(model, dict(tok), pricing), 4)
+
+    # Opus 4.5 .. Opus 5 (both '4-7' and '4.7' spellings occur in transcripts)
+    for m in ("claude-opus-5", "claude-opus-4-8", "claude-opus-4.7", "claude-opus-4-6", "claude-opus-4-5"):
+        assert usd(m, input=M) == 5.0, (m, usd(m, input=M))
+        assert usd(m, output=M) == 25.0, m
+        assert usd(m, cache_read=M) == 0.5 and usd(m, cache_write=M) == 6.25, m
+    # retired Opus 4 / 4.1 keep the old rate
+    for m in ("claude-opus-4-1", "claude-opus-4"):
+        assert usd(m, input=M) == 15.0 and usd(m, output=M) == 75.0, m
+    # Sonnet 5 vs Sonnet 4.x
+    assert usd("claude-sonnet-5", input=M) == 2.0 and usd("claude-sonnet-5", output=M) == 10.0
+    assert usd("claude-sonnet-5", cache_read=M) == 0.2 and usd("claude-sonnet-5", cache_write=M) == 2.5
+    for m in ("claude-sonnet-4.6", "claude-sonnet-4-5", "claude-sonnet-4"):
+        assert usd(m, input=M) == 3.0 and usd(m, output=M) == 15.0, m
+    # Haiku 4.5 vs Haiku 3.5
+    assert usd("claude-haiku-4.5", input=M) == 1.0 and usd("claude-haiku-4.5", output=M) == 5.0
+    assert usd("claude-haiku-4-5", cache_read=M) == 0.1 and usd("claude-haiku-4-5", cache_write=M) == 1.25
+    assert usd("claude-3-5-haiku", input=M) == 0.8 and usd("claude-3-5-haiku", output=M) == 4.0
+    # Fable / Mythos 5.1: cache hits are 0.025x; Fable / Mythos 5: 0.1x
+    for m in ("claude-fable-5-1", "claude-mythos-5-1", "claude-fable-5.1"):
+        assert usd(m, input=M) == 10.0 and usd(m, output=M) == 50.0, m
+        assert usd(m, cache_read=M) == 0.25 and usd(m, cache_write=M) == 12.5, m
+    for m in ("claude-fable-5", "claude-mythos-5"):
+        assert usd(m, input=M) == 10.0 and usd(m, output=M) == 50.0, m
+        assert usd(m, cache_read=M) == 1.0 and usd(m, cache_write=M) == 12.5, m
+    # OpenAI (developers.openai.com/api/docs/pricing, 2026-09-11): each 5.x
+    # generation is priced on its own, not at the launch gpt-5 rate
+    for m, inp, out in (("gpt-5", 1.25, 10.0), ("gpt-5.1", 1.25, 10.0), ("gpt-5.2", 1.75, 14.0),
+                        ("gpt-5.3-codex", 1.75, 14.0), ("gpt-5.4", 2.5, 15.0), ("gpt-5.5", 5.0, 30.0),
+                        ("gpt-5-mini", 0.25, 2.0), ("gpt-5.4-mini", 0.75, 4.5),
+                        ("gpt-5-nano", 0.05, 0.4), ("gpt-5.4-nano", 0.2, 1.25)):
+        assert usd(m, input=M) == inp, (m, usd(m, input=M))
+        assert usd(m, output=M) == out, (m, usd(m, output=M))
+        assert usd(m, cache_read=M) == round(inp / 10, 4), m   # cached input = 0.1x
+    # unknown stays unknown (loud $0), never a guess
+    assert costs.tier_for_model("claude-nova-9", pricing) is None
+    print("  ok  pricing.json matches the published Claude + OpenAI list prices")
 
 
 if __name__ == "__main__":

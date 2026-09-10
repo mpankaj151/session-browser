@@ -34,6 +34,15 @@ def _bold(s):  # noqa: ANN001
     return f"\033[1m{s}\033[0m"
 
 
+def since_sql(days: int) -> str:
+    """`last_activity` cutoff for a rolling window, spelled like the column
+    ('YYYY-MM-DDTHH:MM:SS.mmmZ'). datetime('now', '-N days') would yield
+    'YYYY-MM-DD HH:MM:SS' — and 'T' sorts above ' ', so every row of the cutoff
+    day compared >= the cutoff and the window leaked up to 24 h."""
+    return (f"last_activity >= strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now', "
+            f"'-{int(days)} days')")
+
+
 def _window(conn, label: str, sql_filter: str):
     row = conn.execute(
         f"SELECT COUNT(*) c, COALESCE(SUM({_TOK}),0) t, COALESCE(SUM(cost_usd),0) cost "
@@ -65,10 +74,10 @@ def main() -> None:
 
     print(f"\n{_bold('By window')}")
     print(_window(conn, "today", "AND last_activity >= date('now')"))
-    print(_window(conn, "7 days", "AND last_activity >= datetime('now','-7 days')"))
-    print(_window(conn, "30 days", "AND last_activity >= datetime('now','-30 days')"))
+    print(_window(conn, "7 days", "AND " + since_sql(7)))
+    print(_window(conn, "30 days", "AND " + since_sql(30)))
     if args.days:
-        print(_window(conn, f"{args.days}d", f"AND last_activity >= datetime('now','-{args.days} days')"))
+        print(_window(conn, f"{args.days}d", "AND " + since_sql(args.days)))
     print(_window(conn, "all", ""))
 
     _table(conn, "By model", "model", "COALESCE(model_used,'unknown')", 10)
