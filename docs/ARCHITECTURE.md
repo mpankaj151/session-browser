@@ -30,7 +30,7 @@ flowchart TD
       REAS --> ARCH[~/claude-reasoning-archive]
       FTS[build-fts.py] --> DB
       EMB[embed-sessions.py] --> DB
-      ENR[enrich-sessions.py<br/>claude --print] --> DB
+      ENR[enrich-sessions.py<br/>claude --print | opencode run] --> DB
     end
     DB --> COST & REAS & FTS & EMB & ENR
 

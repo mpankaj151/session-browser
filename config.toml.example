@@ -39,7 +39,10 @@ binary       = "codex"
 
 # --- Enrichment --------------------------------------------------------------
 [enrichment]
-provider = "claude-headless"   # claude-headless | copilot-headless | none
+# Which CLI does the summarising. Per machine: keep claude-headless where Claude
+# Code is the daily driver; use opencode-headless where OpenCode is the harness
+# (any provider it is authenticated for — Anthropic, OpenAI, gateways).
+provider = "claude-headless"   # claude-headless | copilot-headless | opencode-headless | none
 
 [enrichment.claude_headless]
 binary          = "claude"
@@ -50,6 +53,21 @@ model           = "claude-sonnet-5"
 exec_args       = ["--print"]
 prompt_template = "summarize-multi-source.md"
 timeout_secs    = 180
+
+[enrichment.opencode_headless]
+binary          = "opencode"
+# provider/model in OpenCode's own spelling. Needs a credential for that provider
+# (`opencode auth login`; check with `opencode models anthropic`). Also reachable
+# as opencode/claude-sonnet-5 (Zen) or github-copilot/claude-sonnet-5. "" = the
+# model OpenCode's config defaults to.
+model           = "anthropic/claude-sonnet-5"
+# Optional PRIMARY agent (e.g. a no-tools summariser in ~/.config/opencode/agents/)
+# and reasoning-effort variant. Runs are always plugin-free (--pure), tool-free
+# (permissions denied, never --auto) and leave no session rows (OPENCODE_DB=:memory:).
+agent           = ""
+variant         = ""
+prompt_template = "summarize-multi-source.md"
+timeout_secs    = 300
 
 # --- Daily digest --------------------------------------------------------------
 # The nightly refresh assembles daily-logs/YYYY-MM-DD.md from enriched sessions

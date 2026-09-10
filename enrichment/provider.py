@@ -27,7 +27,8 @@ class FacetValidationError(ValueError):
 class EnrichmentProvider(Protocol):
     name: str
     def is_available(self) -> bool: ...
-    def summarize(self, turns: list, cli_source: str, model: str = "", cwd: str = "") -> dict: ...
+    def summarize(self, turns: list, cli_source: str, model: str = "", cwd: str = "",
+                  prior: dict | None = None) -> dict: ...
 
 
 def _finalize_summary(text: str) -> str:
@@ -147,5 +148,13 @@ def get_provider(config: dict):
     if name == "copilot-headless":
         from .copilot_headless import CopilotHeadless
         return CopilotHeadless(sub)
+    if name == "opencode-headless":
+        from .opencode_headless import OpenCodeHeadless
+        return OpenCodeHeadless(sub)
+    # A typo here used to degrade silently to the null provider: every nightly
+    # run "succeeded" with empty facets and nothing said why. Say so.
+    print(f"[enrichment] unknown provider {name!r} in config.toml — falling back to the "
+          f"null provider (no LLM). Valid: claude-headless | copilot-headless | "
+          f"opencode-headless | none", file=sys.stderr)
     from .null_provider import NullProvider
     return NullProvider()

@@ -71,6 +71,12 @@ COST_IS_NOTIONAL = BILLING_MODE != "api"
 
 PRICING_PATH = _REPO_ROOT / "pricing.json"
 
+# Title given to every headless `opencode run` the enricher spawns. Shared with
+# the OpenCode source adapter, which must never index our own enrichment runs
+# (they normally never persist — OPENCODE_DB=:memory: — but a title is the one
+# field we control end to end, so it is the belt-and-braces marker).
+OPENCODE_ENRICHMENT_TITLE = "session-browser-enrichment"
+
 
 def ensure_dirs() -> None:
     """Create the runtime directories if missing (safe to call repeatedly)."""
