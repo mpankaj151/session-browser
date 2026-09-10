@@ -57,7 +57,15 @@ class MyCliSource:
         return f"mycli resume {session_id}"
 
     def is_available(self) -> bool:
-        return shutil.which("mycli") is not None and self.sessions_dir.exists()
+        # Transcripts on disk — NEVER the binary. Indexing, search, archive and
+        # restore all work on a laptop where the CLI was uninstalled (or is
+        # simply missing from the launchd/systemd job's PATH); gating on the
+        # binary silently drops the source and prune then archives its rows.
+        return self.sessions_dir.exists()
+
+    def has_binary(self) -> bool:
+        # Optional: only resume / bridge need the CLI itself (`sb doctor` shows it).
+        return shutil.which("mycli") is not None
 ```
 
 Tips:
@@ -77,7 +85,11 @@ def _make_mycli():
 _FACTORIES = { ..., "mycli": _make_mycli }
 ```
 
-## 3. Add a config block to `config.toml`
+## 3. Add a config block to `config.toml.example`
+
+`config.toml.example` holds the committed defaults; `config.toml` is a
+git-ignored per-machine override layered on top of it. A block added only to
+your own `config.toml` works locally and ships dead for everyone else.
 
 ```toml
 [sources.mycli]

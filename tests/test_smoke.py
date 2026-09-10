@@ -1063,7 +1063,7 @@ def test_api_archived_state_and_visible_stats():
     sb = _load_app()
     conn = _temp_db()
     db_path = conn.execute("PRAGMA database_list").fetchone()[2]
-    orig_connect, old_archive = indexer.connect, reasoning.ARCHIVE
+    orig_connect, old_archive, old_sources = indexer.connect, reasoning.ARCHIVE, sb.SOURCES
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1071,10 +1071,15 @@ def test_api_archived_state_and_visible_stats():
             raw = root / "raw" / "2026" / "05"
             raw.mkdir(parents=True)
             (raw / "aged-has-copy.jsonl").write_text(_cl_transcript("x"))
-            indexer.upsert(_header("live"), conn=conn)
+            # restorable is decided per ROW: the recorded project_path must be
+            # inside the adapter's tree, as it is for a session indexed here.
+            from sources.claude import ClaudeSource
+            proj = root / "claude" / "-Users-x-proj"
+            sb.SOURCES = {"claude": ClaudeSource(root / "claude")}
+            indexer.upsert(_header("live", project_path=str(proj)), conn=conn)
             conn.execute("UPDATE sessions SET cost_usd=1.0 WHERE session_id='live'")
             for sid in ("aged-has-copy", "aged-no-copy"):
-                indexer.upsert(_header(sid), conn=conn)
+                indexer.upsert(_header(sid, project_path=str(proj)), conn=conn)
                 indexer.archive(sid, indexer.TRANSCRIPT_MISSING, conn=conn)
                 conn.execute("UPDATE sessions SET cost_usd=2.0 WHERE session_id=?", (sid,))
             indexer.upsert(_header("agent-noise", turn_count=0, first_message=""), conn=conn)
@@ -1103,7 +1108,7 @@ def test_api_archived_state_and_visible_stats():
             totals = c.get("/api/stats/timeseries").get_json()["totals"]
             assert totals["sessions"] == 3 and abs(totals["cost"] - 5.0) < 1e-9, totals
     finally:
-        indexer.connect, reasoning.ARCHIVE = orig_connect, old_archive
+        indexer.connect, reasoning.ARCHIVE, sb.SOURCES = orig_connect, old_archive, old_sources
         conn.close()
     print("  ok  /api/sessions?state=archived + stats count aged-out, never noise")
 
@@ -4189,6 +4194,118 @@ def test_mcp_descriptors_flag_archived_rows_and_tolerate_odd_bytes():
     finally:
         os.environ.pop("SESSION_MEMORY_DB", None)
     print("  ok  MCP: archived flag on descriptors, lenient trail decoding")
+
+
+# ===== final review: installer, jobs, CI, docs ===============================
+def test_render_job_passes_cli_home_env_through_to_the_jobs():
+    """The launchd/systemd jobs propagated only PATH, so CLAUDE_CONFIG_DIR /
+    CODEX_HOME / XDG_DATA_HOME / OPENCODE_DB set in the shell were unknown to
+    the watcher and the nightly refresh — which then indexed the default trees
+    (usually empty) or, worse, a different OpenCode DB."""
+    rj = _load_script("render-job")
+    env = {"SB_VENV_PY": "/v/bin/python", "SB_REPO": "/r", "SB_LOG_DIR": "/l", "SB_HOME_DIR": "/h",
+           "SB_JOB_PATH": "/usr/bin", "SB_JOB_ENV": "CLAUDE_CONFIG_DIR=/alt/claude\nCODEX_HOME=/x y/codex"}
+    plist = rj.render(_REPO / "launchd" / "watcher.plist.template", env, "plist")
+    assert "<key>CLAUDE_CONFIG_DIR</key><string>/alt/claude</string>" in plist, plist
+    assert "<key>CODEX_HOME</key><string>/x y/codex</string>" in plist, plist
+    unit = rj.render(_REPO / "systemd" / "session-browser-watcher.service.template", env, "systemd")
+    assert 'Environment="CLAUDE_CONFIG_DIR=/alt/claude"' in unit and 'Environment="CODEX_HOME=/x y/codex"' in unit, unit
+    # no extra env: the markers render to nothing, never a dangling key
+    plain = rj.render(_REPO / "launchd" / "refresh.plist.template", {k: v for k, v in env.items() if k != "SB_JOB_ENV"}, "plist")
+    assert "__JOB_ENV__" not in plain and "<key></key>" not in plain, plain
+    print("  ok  render-job passes the CLI-home env vars through to the background jobs")
+
+
+def test_installer_survives_a_failing_pipeline_step_and_uninstall_purge_exits_zero():
+    """install.sh ran refresh-all unguarded under set -e: one failing pipeline
+    step (FTS5 missing, a pinned provider absent) aborted BEFORE the hooks and
+    scheduler were installed, leaving a database nothing keeps fresh. And
+    uninstall.sh --purge always exited 1 (its last command was a false test)."""
+    import os
+    import shutil
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        clone = root / "repo"
+        clone.mkdir()
+        files = subprocess.run(["git", "ls-files"], cwd=_REPO, capture_output=True, text=True).stdout.split()
+        for f in files:
+            src = _REPO / f
+            if src.is_file():
+                dst = clone / f
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        os.symlink(_REPO / ".venv", clone / ".venv")            # no pip run: already satisfied
+        stub = clone / "scripts" / "refresh-all.py"
+        stub.write_text("#!/usr/bin/env python3\nimport sys\nprint('boom: simulated pipeline failure')\nsys.exit(1)\n")
+        home = root / "home"
+        home.mkdir()
+        env = {**os.environ, "HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "SHELL": "/bin/zsh"}
+        for k in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "OPENCODE_DB"):
+            env.pop(k, None)
+        p = subprocess.run(["bash", "install.sh", "--lite", "--no-scheduler"], cwd=clone, env=env,
+                           capture_output=True, text=True, timeout=600)
+        assert p.returncode == 0, (p.returncode, p.stdout[-1500:], p.stderr[-800:])
+        assert "Session Browser installed" in p.stdout, p.stdout[-800:]
+        assert "pipeline step" in p.stdout or "re-run" in p.stdout, p.stdout[-800:]
+        assert (clone / "config.toml").exists()
+        q = subprocess.run(["bash", "uninstall.sh", "--purge"], cwd=clone, env=env,
+                           capture_output=True, text=True, timeout=120)
+        assert q.returncode == 0, (q.returncode, q.stdout[-600:], q.stderr[-400:])
+        assert not (home / ".session-browser").exists()
+    print("  ok  install.sh continues past a failing pipeline step; uninstall --purge exits 0")
+
+
+def test_ci_runs_every_suite_the_docs_promise():
+    """tests/test_work_journal.py — the enrichment/journal suite — ran in
+    neither CI nor the CONTRIBUTING checklist, so a change to the journal path
+    could pass CI green."""
+    ci = (_REPO / ".github" / "workflows" / "ci.yml").read_text()
+    contributing = (_REPO / "CONTRIBUTING.md").read_text()
+    for suite in ("tests/test_smoke.py", "tests/test_work_journal.py", "tests/test_portability.py"):
+        assert suite in ci, f"{suite} missing from CI"
+        assert suite in contributing, f"{suite} missing from CONTRIBUTING"
+    print("  ok  CI and CONTRIBUTING run all three suites")
+
+
+def test_docs_reference_only_files_flags_and_keys_that_exist():
+    """Documentation drift, checked mechanically: every scripts/*.py and
+    bin/*.sh a doc or skill names must exist; every [ui] key documented in
+    config.toml.example must be read by app.py; the ADDING-A-CLI sample must
+    not gate availability on the binary; setup/README invoke repo scripts via
+    the venv; the Linux prerequisite names a 3.11+ Python; log names are the
+    real ones."""
+    import re
+    import tomllib
+    docs = [_REPO / "README.md", _REPO / "CONTRIBUTING.md", *(_REPO / "docs").glob("*.md"),
+            *(_REPO / "skills").glob("*/SKILL.md")]
+    for doc in docs:
+        text = doc.read_text()
+        for ref in set(re.findall(r"\b(?:scripts|bin)/[A-Za-z0-9_\-]+\.(?:py|sh)\b", text)):
+            assert (_REPO / ref).exists(), f"{doc.name} names {ref}, which does not exist"
+    example = tomllib.loads((_REPO / "config.toml.example").read_text())
+    app_src = (_REPO / "session-ui" / "app.py").read_text()
+    for key in example.get("ui", {}):
+        assert f'"{key}"' in app_src, f"[ui].{key} is documented but nothing reads it"
+    adding = (_REPO / "docs" / "ADDING-A-CLI.md").read_text()
+    sample = adding[adding.index("def is_available"):adding.index("def is_available") + 200]
+    assert "shutil.which" not in sample, "ADDING-A-CLI's is_available() sample gates on the binary"
+    assert "config.toml.example" in adding, "step 3 must point at the committed defaults"
+    setup = (_REPO / "docs" / "SETUP.md").read_text()
+    assert "python3.12" in setup and "sudo apt install python3 python3-venv" not in setup
+    assert "refresh.out.log" in setup and "`refresh.log`" not in setup
+    assert "claude mcp add" in setup.split("**Claude Code**")[1].split("**Codex")[0].split("\n")[0]
+    for doc in (setup, (_REPO / "README.md").read_text()):
+        assert not re.search(r"^\s*scripts/[a-z\-]+\.py", doc, re.M), "bare script invocation runs the system python3"
+    readme_head = (_REPO / "README.md").read_text()[:600]
+    assert "OpenCode" in readme_head, "README's pitch omits OpenCode"
+    for skill in ("checkpoint", "snapshot"):
+        head = (_REPO / "skills" / skill / "SKILL.md").read_text()[:400]
+        assert "scaffold" in head.lower() and "not implemented" in head.lower(), skill
+    for src in ("sources/base.py", "sources/registry.py"):
+        head = (_REPO / src).read_text()[:700]
+        assert "app.py and watcher.py" not in head and "config.toml.example" in head, src
+    print("  ok  docs, config example, skills and docstrings match the code")
 
 
 if __name__ == "__main__":

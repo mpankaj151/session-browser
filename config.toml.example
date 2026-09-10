@@ -13,11 +13,8 @@ hook_state  = "~/.session-browser/.hook-state.json"
 log_dir     = "~/.session-browser/logs"
 
 [ui]
-host             = "127.0.0.1"
-port             = 7655
-default_filter   = "all"
-bridge_max_chars = 3000
-show_onboarding  = "auto"
+host = "127.0.0.1"
+port = 7655          # `sb ui|stop|open` and doctor read this too
 
 # --- Sources -----------------------------------------------------------------
 # Each enabled source maps to an adapter in sources/. Adding a new CLI

@@ -1,8 +1,9 @@
 """Data model + adapter Protocol shared by every CLI source.
 
 Adding a new CLI (codex, opencode, ollama, ...) means writing one module that
-implements SessionSource and registering it in app.py and watcher.py. Nothing
-else in the system needs to change — the indexer, DB, UI, and MCP server are all
+implements SessionSource and adding it to _FACTORIES in sources/registry.py
+(plus a [sources.<cli>] block in config.toml.example). Nothing else in the
+system needs to change — the indexer, DB, UI, watcher and MCP server are all
 source-agnostic and speak only SessionHeader / Turn / ParsedSession.
 """
 from __future__ import annotations

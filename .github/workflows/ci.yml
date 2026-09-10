@@ -30,6 +30,11 @@ jobs:
           HOME: ${{ runner.temp }}
         run: python tests/test_smoke.py
 
+      - name: Work-journal / enrichment suite
+        env:
+          HOME: ${{ runner.temp }}
+        run: python tests/test_work_journal.py
+
       - name: Single-CLI laptop scenarios (real pipeline, stub binaries, one CLI at a time)
         env:
           HOME: ${{ runner.temp }}

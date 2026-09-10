@@ -14,7 +14,9 @@ cd session-browser
 ## Before you open a PR
 
 ```bash
-python tests/test_smoke.py       # must pass (isolated temp DB; no real data touched)
+python tests/test_smoke.py         # must pass (isolated temp DB; no real data touched)
+python tests/test_work_journal.py  # enrichment / work-journal suite
+python tests/test_portability.py   # one-CLI laptop scenarios (stub binaries, real pipeline)
 python -m compileall -q sources scripts session-ui mcp enrichment *.py
 for f in install.sh uninstall.sh bootstrap.sh bin/*.sh; do bash -n "$f"; done
 ```

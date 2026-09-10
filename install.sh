@@ -54,6 +54,12 @@ fi
 # 1. venv + dependencies (idempotent — pip skips what's already satisfied).
 #    --system-site-packages reuses an existing torch/sentence-transformers
 #    install when one is present; harmless otherwise.
+if [ -x "$PY" ] && ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+  # An existing venv on an interpreter older than 3.11 was detected as too old
+  # and then used anyway (tomllib missing at the first script). Rebuild it.
+  echo "==> existing venv is older than Python 3.11 — recreating it with $PYBOOT"
+  rm -rf "$REPO/.venv"
+fi
 if [ ! -x "$PY" ]; then
   echo "==> creating venv ($PYBOOT)"
   "$PYBOOT" -m venv --system-site-packages "$REPO/.venv"
@@ -104,10 +110,13 @@ mkdir -p "$LOG_DIR"
 # 4. backfill + full processing pipeline (idempotent)
 if [ "$NO_BACKFILL" -eq 0 ]; then
   echo "==> running full pipeline (backfill, cost, reasoning, full-text, embeddings)"
+  # Never abort here: a failing pipeline step (no FTS5 in this sqlite, a pinned
+  # provider missing) used to stop the installer BEFORE the hooks and the
+  # scheduler were installed, leaving a database nothing keeps fresh.
   if [ "$NO_ENRICH" -eq 0 ]; then
-    "$PY" "$REPO/scripts/refresh-all.py" --enrich
+    "$PY" "$REPO/scripts/refresh-all.py" --enrich || echo "   ! a pipeline step failed (see above) — continuing; re-run 'sb refresh' after fixing it"
   else
-    "$PY" "$REPO/scripts/refresh-all.py"
+    "$PY" "$REPO/scripts/refresh-all.py" || echo "   ! a pipeline step failed (see above) — continuing; re-run 'sb refresh' after fixing it"
   fi
 fi
 
@@ -183,6 +192,9 @@ if [ "$NO_HOOK" -eq 0 ] && [ "$HAVE_CLAUDE" -eq 1 ]; then
   mkdir -p "$CLAUDE_DIR/skills"
   for d in "$REPO"/skills/*/; do
     name="$(basename "$d")"
+    # Scaffold skills document a future feature; linking them made the agent run
+    # scripts that do not exist yet.
+    if grep -qi "^description:.*scaffold" "$d/SKILL.md" 2>/dev/null; then continue; fi
     target="$CLAUDE_DIR/skills/$name"
     if [ -L "$target" ]; then
       # repoint after a repo move; no-op when already correct
@@ -208,7 +220,15 @@ if [ "$NO_LAUNCHD" -eq 0 ]; then
     B="$(command -v "$c" 2>/dev/null || true)"
     if [ -n "$B" ]; then D="$(dirname "$B")"; case ":$JOB_PATH:" in *":$D:"*) ;; *) JOB_PATH="$JOB_PATH:$D";; esac; fi
   done
-  export SB_VENV_PY="$PY" SB_REPO="$REPO" SB_LOG_DIR="$LOG_DIR" SB_HOME_DIR="$HOME_DIR" SB_JOB_PATH="$JOB_PATH"
+  # CLI homes relocated in this shell must reach the jobs too, or they index
+  # the default (usually empty) trees — or a different OpenCode DB.
+  JOB_ENV=""
+  for v in CLAUDE_CONFIG_DIR CODEX_HOME XDG_DATA_HOME OPENCODE_DB; do
+    eval "val=\${$v:-}"
+    [ -n "$val" ] && JOB_ENV="${JOB_ENV}${v}=${val}
+"
+  done
+  export SB_VENV_PY="$PY" SB_REPO="$REPO" SB_LOG_DIR="$LOG_DIR" SB_HOME_DIR="$HOME_DIR" SB_JOB_PATH="$JOB_PATH" SB_JOB_ENV="$JOB_ENV"
   if [ "$(uname)" = "Darwin" ]; then
     echo "==> installing launchd jobs"
     AGENTS="$HOME/Library/LaunchAgents"; mkdir -p "$AGENTS"
@@ -216,7 +236,8 @@ if [ "$NO_LAUNCHD" -eq 0 ]; then
       "$PY" "$REPO/scripts/render-job.py" "$REPO/launchd/$job.plist.template" \
         "$AGENTS/com.sessionbrowser.$job.plist" --format plist
       launchctl unload "$AGENTS/com.sessionbrowser.$job.plist" 2>/dev/null || true
-      launchctl load "$AGENTS/com.sessionbrowser.$job.plist"
+      launchctl load "$AGENTS/com.sessionbrowser.$job.plist" \
+        || echo "   ! could not load $job — check: launchctl list | grep sessionbrowser"
     done
   elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
     echo "==> installing systemd --user units"
@@ -227,6 +248,9 @@ if [ "$NO_LAUNCHD" -eq 0 ]; then
     systemctl --user daemon-reload
     systemctl --user enable --now session-browser-watcher.service session-browser-refresh.timer \
       || echo "   ! could not enable the units — check: systemctl --user status session-browser-watcher"
+    # --now starts a unit only if it is not already active: after a repo move the
+    # OLD watcher process kept running from the previous path.
+    systemctl --user try-restart session-browser-watcher.service 2>/dev/null || true
     echo "   (units run while you are logged in; to keep them after logout: loginctl enable-linger $USER)"
   else
     echo "==> no launchd / systemd --user session here. Schedule these yourself (docs/SETUP.md §5):"
@@ -239,6 +263,6 @@ printf '\n\033[1;32m✓ Session Browser installed.\033[0m\n\n'
 echo "Next:"
 echo "  ./bin/install-cr.sh      # once — adds the cr / sb shell commands"
 echo "  source ~/.zshrc          # or open a new terminal (installer prints which rc)"
-echo "  sb ui                    # start the web UI  ->  http://127.0.0.1:7655"
+echo "  sb ui                    # start the web UI  ->  http://127.0.0.1:<[ui].port, default 7655>"
 echo "  sb demo                  # or try it on synthetic data first"
 echo "  sb doctor                # health check"
