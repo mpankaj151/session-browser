@@ -30,6 +30,9 @@ class RestoreResult:
     status: str
     path: Path | None = None
     detail: str = ""
+    # Sources whose CLI keeps sessions elsewhere (OpenCode: a database) also
+    # re-import after the file copy: True/False = it ran; None = not applicable.
+    reimported: bool | None = None
 
 
 def _dest_for(row, registry) -> Path | None:
@@ -78,8 +81,20 @@ def restore_session(session_id: str, conn: sqlite3.Connection | None = None,
         _reindex(adapter, dest, conn)
         if own:
             conn.commit()
-        return RestoreResult(session_id, "restored", path=dest,
-                             detail=f"copied {src.name} from the reasoning archive")
+        result = RestoreResult(session_id, "restored", path=dest,
+                               detail=f"copied {src.name} from the reasoning archive")
+        # The row is live and browsable regardless of what follows; the
+        # re-import only decides whether the CLI itself can resume it.
+        hook = getattr(adapter, "reimport", None)
+        if callable(hook):
+            try:
+                ok, detail = hook(dest)
+            except Exception as e:  # noqa: BLE001
+                ok, detail = False, f"re-import raised: {e}"
+            result.reimported = ok
+            if detail:
+                result.detail += f"; {detail}"
+        return result
     finally:
         if own:
             conn.close()

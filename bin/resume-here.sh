@@ -33,14 +33,16 @@ encode_path() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
 
 # Auto-detect which CLI owns this session id.
 if [ "$CLI" = "auto" ]; then
-  if find "$HOME/.claude/projects" -maxdepth 2 -name "$SID.jsonl" 2>/dev/null | grep -q .; then
+  if [[ "$SID" == ses_* ]]; then
+    CLI=opencode          # OpenCode ids are prefixed; nothing else looks like this
+  elif find "$HOME/.claude/projects" -maxdepth 2 -name "$SID.jsonl" 2>/dev/null | grep -q .; then
     CLI=claude
   elif [ -d "$HOME/.copilot/session-state/$SID" ]; then
     CLI=copilot
   elif find "$HOME/.codex/sessions" -name "rollout-*$SID.jsonl" 2>/dev/null | grep -q .; then
     CLI=codex
   else
-    echo "cr: session '$SID' not found for claude, copilot, or codex" >&2
+    echo "cr: session '$SID' not found for claude, copilot, codex, or opencode" >&2
     exit 1
   fi
 fi
@@ -92,6 +94,11 @@ case "$CLI" in
       echo "cr: pointed copilot session cwd -> $CUR (backup: workspace.yaml.bak)"
     fi
     exec copilot --resume="$SID"
+    ;;
+  opencode)
+    # `opencode --session` is a global lookup by id that runs in the CURRENT
+    # directory — exactly what "resume here" means. No memory to port.
+    exec opencode --session "$SID"
     ;;
   codex)
     # Codex stores sessions by date, not by an encoded cwd, so `codex resume`

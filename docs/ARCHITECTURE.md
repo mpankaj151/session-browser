@@ -12,9 +12,10 @@ flowchart TD
       C[~/.claude/projects/*.jsonl]
       P[~/.copilot/session-state/*/events.jsonl]
       X[~/.codex/sessions/**/rollout-*.jsonl]
+      O[~/.local/share/opencode/opencode.db<br/>→ opencode-mirror/ses_*.jsonl]
     end
 
-    C & P & X --> AD[sources/*.py adapters<br/>SessionSource protocol]
+    C & P & X & O --> AD[sources/*.py adapters<br/>SessionSource protocol]
 
     subgraph Indexing
       HOOK[session-hook.py<br/>Claude Stop hook] --> IDX
@@ -51,6 +52,19 @@ flowchart TD
 `resume_command`, `is_available`. The indexer, DB, UI, watcher, and MCP server
 never mention a specific CLI — adding one is a new file + one registry line.
 
+**DB-backed sources: the mirror pattern (`sources/opencode.py`).** Every
+consumer — the watcher's delete handler, `archive_raw`, restore, FTS, the cost
+and reasoning extractors — assumes one plain-text file per session at the path
+`discover()` yields. OpenCode keeps everything in one SQLite DB, so its adapter
+*projects* the DB (opened read-only; the binary is never invoked on this path
+because even `opencode db path` rewrote the WAL) into one JSONL per root
+session: line 1 is the export-shaped `Session.Info` + children + the stats every
+consumer reads, then one line per message with its parts. Children roll their
+cost into the root. A manifest of per-tree fingerprints limits rewrites to
+changed sessions; a session gone from the DB is archived to the raw vault
+before its mirror file is unlinked, so the ordinary delete path archives the
+row as transcript-missing and Restore can bring it back.
+
 **COALESCE upsert (`indexer.py`).** Re-indexing a session must never clobber
 enrichment (summary, topics, cost, reasoning_path). The upsert updates cheap
 fields (last_activity, turn_count) but `COALESCE(NULLIF(old,''), NULLIF(new,''))`
@@ -75,12 +89,15 @@ makes the reasoning archive a durable transcript vault. Restore uses
 `copyfile`, not `copy2`: the restored file needs a fresh mtime or an age-based
 cleanup would delete it again on its next pass.
 
-**Two-tier live indexing.** The Claude **Stop hook** indexes a session the
-instant it ends (tens of ms) and detaches reasoning extraction. The **watcher**
-(a launchd daemon, singleton-locked) catches everything else — Copilot, Codex,
-and anything the hook missed — via filesystem events, with a 30s race-guard so
-the two paths never double-process. The hook is contractually exit-0 so a broken
-config can never block Claude Code's session end.
+**Two-tier live indexing.** The Claude **Stop hook** (and, opt-in, the
+**OpenCode plugin** — `scripts/opencode-hook.py` spawned on `session.idle` /
+`session.deleted`) indexes a session the instant it ends (tens of ms) and
+detaches reasoning extraction. The **watcher** (a launchd daemon,
+singleton-locked) catches everything else — Copilot, Codex, OpenCode DB writes
+via `sync_trigger()`, and anything a hook missed — via filesystem events, with
+a 30s race-guard (`hookstate.py`, shared by every hook) so the two paths never
+double-process. Hooks are contractually exit-0 so a broken config can never
+block a CLI's session end.
 
 **Timestamps.** `to_iso_utc()` normalizes every source to one canonical,
 lexicographically-sortable UTC form, so mixed Claude/Copilot/Codex lists order
@@ -114,11 +131,12 @@ billed.
 | Registry (sessions, artifacts, embeddings, FTS) | `~/.session-browser/registry.db` (WAL) |
 | Enrichment facets / bridge primers | `~/.session-browser/{facets,bridges}/` |
 | Raw transcripts + readable reasoning trails | `~/claude-reasoning-archive/{raw,readable}/YYYY/MM/` |
+| OpenCode mirror (one JSONL per root session; also the backup) | `~/.session-browser/opencode-mirror/` |
 
 ## Module map
 
 ```
-sources/{base,claude,copilot,codex,registry}.py   adapters + protocol
+sources/{base,claude,copilot,codex,opencode,registry}.py   adapters + protocol
 indexer.py                                         upsert / archive
 watcher.py + scripts/session-hook.py               two-tier live indexing
 reasoning.py + scripts/extract-reasoning.py        decision trails

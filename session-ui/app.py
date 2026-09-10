@@ -262,7 +262,7 @@ def api_restore(sid: str):
     else:
         code = 409
     return jsonify({"status": res.status, "path": str(res.path) if res.path else None,
-                    "detail": res.detail}), code
+                    "detail": res.detail, "reimported": res.reimported}), code
 
 
 def _build_context(conn, sid: str) -> tuple[str, str] | None:
@@ -311,10 +311,13 @@ def _build_context(conn, sid: str) -> tuple[str, str] | None:
         L += ["", "## Recent reasoning (visible)"]
         for content, turn in reasoning:
             L.append(f"- _turn {turn}:_ {content[:400].strip()}")
-    # project_path is the session dir for copilot (transcript = events.jsonl
-    # inside it) and the project dir for claude (transcript = <sid>.jsonl).
-    transcript = (f"{d.get('project_path')}/events.jsonl" if d["cli_source"] == "copilot"
-                  else f"{d.get('project_path')}/{sid}.jsonl")
+    # An adapter's restore_path() doubles as "where this row's transcript
+    # lives"; the old two-branch guess remains for sources without it.
+    locate = getattr(SOURCES.get(d["cli_source"]), "restore_path", None)
+    located = locate(r) if callable(locate) else None
+    transcript = str(located) if located else (
+        f"{d.get('project_path')}/events.jsonl" if d["cli_source"] == "copilot"
+        else f"{d.get('project_path')}/{sid}.jsonl")
     L += [
         "",
         "## Pointers",
@@ -358,6 +361,7 @@ _BRIDGE_CMD = {
     "claude":  'cd {cwd} && claude "$(cat {file})"',
     "copilot": 'cd {cwd} && copilot -p "$(cat {file})"',
     "codex":   'cd {cwd} && codex "$(cat {file})"',
+    "opencode": 'cd {cwd} && opencode --prompt "$(cat {file})"',
 }
 
 

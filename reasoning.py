@@ -188,6 +188,58 @@ def extract_codex(rollout_path: Path | str) -> list[ReasoningStep]:
     return steps
 
 
+def extract_opencode(mirror_path: Path | str) -> list[ReasoningStep]:
+    """OpenCode decision trail — from the adapter's mirror file. Unlike Claude,
+    OpenCode persists reasoning text (`reasoning` parts), so the trail carries
+    the real chain of thought where the provider returned one, plus the visible
+    response and the exact tool sequence. Root session only: a child (task tool)
+    is a separate agent and shows up as the `subtask` action that spawned it."""
+    from sources.opencode import _loads as _oc_loads, _tool_calls, _user_text
+    from sources.base import to_iso_utc
+    path = Path(mirror_path)
+    steps: list[ReasoningStep] = []
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return steps
+    with fh:
+        head = _oc_loads(fh.readline().strip())
+        root = (head.get("info") or {}).get("id") if head.get("type") == "session" else None
+        if not root:
+            return steps
+        turn = 0
+        for line in fh:
+            rec = _oc_loads(line.strip())
+            if rec.get("type") != "message" or rec.get("session") != root:
+                continue
+            info = rec.get("info") if isinstance(rec.get("info"), dict) else {}
+            if info.get("role") != "assistant" or info.get("summary"):
+                continue
+            parts = [pd for pd in (rec.get("parts") or []) if isinstance(pd, dict)]
+            thinking = "\n\n".join(
+                (pd.get("text") or "").strip() for pd in parts
+                if pd.get("type") == "reasoning" and isinstance(pd.get("text"), str) and pd.get("text").strip())
+            signed = any(pd.get("type") == "reasoning" and _has_signature(pd.get("metadata")) for pd in parts)
+            decision = _user_text(parts)
+            actions = [{"tool": c["name"], "input": c["input"]} for c in _tool_calls(parts)]
+            if not (thinking or decision or actions):
+                continue          # aborted / part-less turn
+            turn += 1
+            steps.append(ReasoningStep(
+                turn_index=turn, thinking=thinking, decision=decision, actions=actions,
+                signature_present=bool(thinking) or signed,
+                timestamp=to_iso_utc((info.get("time") or {}).get("created")) or None,
+            ))
+    return steps
+
+
+def _has_signature(meta) -> bool:
+    """Provider reasoning metadata (e.g. {"anthropic": {"signature": ...}})."""
+    if not isinstance(meta, dict):
+        return False
+    return any(isinstance(v, dict) and "signature" in v for v in meta.values()) or "signature" in meta
+
+
 def _summarize_input_str(inp) -> str:
     """Codex tool args arrive as a JSON string or a dict; summarize either."""
     if isinstance(inp, str):
@@ -213,13 +265,19 @@ def render_markdown(steps: list[ReasoningStep], header: dict) -> str:
     has_thinking_text = any(s.thinking for s in steps)
     n_reasoning = sum(1 for s in steps if s.thinking)
     n_visible = sum(1 for s in steps if s.decision)
+    source = header.get("cli_source", "claude")
     if has_thinking_text:
         note = ("> This trail includes the reasoning text the CLI persisted, plus the "
                 "stated response and exact action sequence for each turn.")
-    else:
+    elif source == "claude":
         note = ("> **Note:** Claude Code stores extended-thinking blocks without their text "
                 "(only a cryptographic signature), so the *internal* chain-of-thought is not "
                 "recoverable. This trail reconstructs the **visible** reasoning plus the exact "
+                "action sequence; turns marked 🔒 had hidden thinking whose text was not persisted.")
+    else:
+        note = (f"> **Note:** {source} did not persist reasoning text for these turns (a "
+                "signature or nothing at all), so the *internal* chain-of-thought is not "
+                "recoverable here. This trail reconstructs the **visible** reasoning plus the exact "
                 "action sequence; turns marked 🔒 had hidden thinking whose text was not persisted.")
     lines = [
         f"# Decision trail — {title}",

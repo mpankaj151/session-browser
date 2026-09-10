@@ -25,7 +25,17 @@ from sources.claude import ClaudeSource  # noqa: E402
 from sources.registry import build_source_registry  # noqa: E402
 
 _EXTRACTORS = {"claude": reasoning.extract, "copilot": reasoning.extract_copilot,
-               "codex": reasoning.extract_codex}
+               "codex": reasoning.extract_codex, "opencode": reasoning.extract_opencode}
+
+
+def _adapter_for(name: str):
+    """The adapter for --session/--session-id (was hardwired to Claude)."""
+    if name == "claude":
+        return ClaudeSource()
+    adapter = build_source_registry().get(name)
+    if adapter is None:
+        sys.exit(f"unknown --source {name!r}; one of {sorted(_EXTRACTORS)}")
+    return adapter
 
 
 def _header_dict(adapter, path: Path) -> dict | None:
@@ -65,10 +75,11 @@ def main() -> None:
     ap.add_argument("--session-id", help="session_id to look up")
     ap.add_argument("--backfill", action="store_true")
     ap.add_argument("--archive", action="store_true")
+    ap.add_argument("--source", default="claude", help="adapter for --session/--session-id")
     args = ap.parse_args()
 
     sbconfig.ensure_dirs()
-    adapter = ClaudeSource()
+    adapter = _adapter_for(args.source)
 
     if args.session:
         ok = process_one(adapter, Path(args.session), args.archive)
@@ -78,13 +89,16 @@ def main() -> None:
     if args.session_id:
         conn = indexer.connect()
         row = conn.execute(
-            "SELECT project_path FROM sessions WHERE session_id = ?", (args.session_id,)
+            "SELECT * FROM sessions WHERE session_id = ?", (args.session_id,)
         ).fetchone()
         conn.close()
         if not row:
             print("unknown session_id", file=sys.stderr)
             sys.exit(1)
-        path = Path(row["project_path"]) / f"{args.session_id}.jsonl"
+        # restore_path() doubles as "where this row's transcript lives"
+        locate = getattr(adapter, "restore_path", None)
+        path = (locate(row) if callable(locate) else None) or \
+            Path(row["project_path"]) / f"{args.session_id}.jsonl"
         ok = process_one(adapter, path, args.archive)
         print("reasoning:", "ok" if ok else "no-steps", args.session_id)
         return

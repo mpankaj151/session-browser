@@ -351,7 +351,18 @@ def test_find_transcript_uses_adapter_mapping():
     _, missing = es._find_transcript({"codex": FakeCodex()},
                                      {"cli_source": "codex", "session_id": "nope"})
     assert missing is None
-    print("  ok  _find_transcript matches via adapter.session_id_for_path (codex)")
+    # opencode: the mirror file's stem IS the id, and discover() serves the
+    # mirror even when the DB is unreachable
+    from sources.opencode import OpenCodeSource
+    with tempfile.TemporaryDirectory() as td:
+        mirror = Path(td) / "mirror"
+        mirror.mkdir()
+        sid = "ses_fd7037a16ffeRyoMOVVyFqv3xY"
+        (mirror / f"{sid}.jsonl").write_text("{}\n")
+        oc = OpenCodeSource(data_dir=Path(td) / "no-data", mirror_dir=mirror)
+        _, path = es._find_transcript({"opencode": oc}, {"cli_source": "opencode", "session_id": sid})
+        assert path == mirror / f"{sid}.jsonl"
+    print("  ok  _find_transcript matches via adapter.session_id_for_path (codex, opencode)")
 
 
 # --- incremental slicing --------------------------------------------------------
