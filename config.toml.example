@@ -48,6 +48,9 @@ data_dir   = "~/.local/share/opencode"     # honours $XDG_DATA_HOME when unset h
 # db       = "~/.local/share/opencode/opencode-beta.db"
 mirror_dir = "~/.session-browser/opencode-mirror"
 reimport_on_restore = true                 # Restore also runs `opencode import`
+# Weekly whole-DB copies (VACUUM INTO) beside the mirror, rotated to keep N.
+db_snapshot_dir  = "~/claude-reasoning-archive/opencode-db"
+db_snapshot_keep = 8
 binary     = "opencode"
 
 # --- Enrichment --------------------------------------------------------------

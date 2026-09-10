@@ -101,6 +101,21 @@ def _loads(blob) -> dict:
     return v if isinstance(v, dict) else {}
 
 
+def _loads_any(blob):
+    """A JSON column as-is — dict OR list (session.permission is a
+    PermissionRuleset list; coercing it to {} made `opencode import` reject
+    every re-import). None when empty or unparseable."""
+    if isinstance(blob, (dict, list)):
+        return blob or None
+    if not isinstance(blob, (str, bytes)) or not blob:
+        return None
+    try:
+        v = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return v if isinstance(v, (dict, list)) and v else None
+
+
 @dataclass
 class SyncReport:
     written: list[str] = field(default_factory=list)
@@ -258,16 +273,17 @@ class OpenCodeSource:
             if _get(row, col):
                 info[key] = row[col]
         for col in ("model", "revert", "permission", "metadata"):
-            v = _get(row, col)
-            if v:
-                info[col] = _loads(v) if isinstance(v, str) else v
+            v = _loads_any(_get(row, col))
+            if v is not None:
+                info[col] = v
         if _get(row, "share_url"):
             info["share"] = {"url": row["share_url"]}
         summary = {k: _get(row, f"summary_{k}") for k in ("additions", "deletions", "files")}
         if any(v is not None for v in summary.values()):
             info["summary"] = {k: v for k, v in summary.items() if v is not None}
-            if _get(row, "summary_diffs"):
-                info["summary"]["diffs"] = _loads(row["summary_diffs"]) or []
+            diffs = _loads_any(_get(row, "summary_diffs"))
+            if diffs is not None:
+                info["summary"]["diffs"] = diffs
         for col, key in (("time_archived", "archived"), ("time_compacting", "compacting")):
             if _get(row, col):
                 info["time"][key] = row[col]
@@ -602,6 +618,100 @@ class OpenCodeSource:
             return True
         return self.mirror_dir.is_dir() and any(self.mirror_dir.glob("ses_*.jsonl"))
 
+    # -- watcher hooks -------------------------------------------------------------
+    def watch_roots(self) -> list[Path]:
+        """The mirror (session files → the ordinary handler) and the data dir
+        (DB/WAL writes → sync_trigger)."""
+        return [self.mirror_dir, self.data_dir]
+
+    def sync_trigger(self, path: Path) -> bool:
+        """A write to opencode*.db or its WAL means sessions changed. Never the
+        -shm, log/, tool-output/, auth.json — those churn constantly."""
+        name = path.name
+        return name.startswith("opencode") and (name.endswith(".db") or name.endswith(".db-wal"))
+
+    # -- restore -------------------------------------------------------------------
+    def restore_path(self, row) -> Optional[Path]:
+        """Where this row's mirror file lives; restoring the raw copy here makes
+        the row live again. Contained to the mirror dir so a corrupted row can
+        never make restore write elsewhere."""
+        dest = self.mirror_dir / f"{row['session_id']}.jsonl"
+        try:
+            dest.resolve().relative_to(self.mirror_dir.resolve())
+        except ValueError:
+            return None
+        return dest
+
+    def reimport(self, path: Path) -> tuple[bool | None, str]:
+        """Second half of a restore: put the session back into OpenCode itself
+        with `opencode import`, root first, then each child. Import re-homes a
+        session to the directory it runs in, so it runs in the session's own
+        directory ($HOME when that is gone). Idempotent upstream, but sessions
+        still present are skipped. None = disabled by config."""
+        if not self.reimport_on_restore:
+            return None, "re-import into OpenCode disabled ([sources.opencode] reimport_on_restore = false)"
+        docs = to_export_docs(path)
+        if not docs:
+            return False, "mirror file holds no session document"
+        existing = self._existing_ids([d["info"]["id"] for d in docs])
+        todo = [d for d in docs if d["info"]["id"] not in existing]
+        if not todo:
+            return True, "already present in OpenCode — nothing to re-import"
+        directory = Path(docs[0]["info"].get("directory") or "")
+        cwd = directory if directory.is_dir() else Path.home()
+        note = "" if cwd == directory else f" (original directory {directory} is gone; imported from {cwd})"
+        import tempfile
+        done = 0
+        with tempfile.TemporaryDirectory() as td:
+            for doc in todo:
+                f = Path(td) / f"{doc['info']['id']}.json"
+                f.write_text(json.dumps(doc), encoding="utf-8")
+                ok, detail = self._run_import(f, cwd)
+                if not ok:
+                    return False, (f"opencode import failed for {doc['info']['id']} "
+                                   f"({done} of {len(todo)} imported): {detail}")
+                done += 1
+        return True, f"re-imported {done} session(s) into OpenCode{note}"
+
+    def _run_import(self, file: Path, cwd: Path) -> tuple[bool, str]:
+        """The only place this adapter runs the binary — user-initiated Restore."""
+        if not self.has_binary():
+            return False, f"`opencode` is not on PATH — run manually: opencode import {file}"
+        import subprocess
+        try:
+            sid = json.loads(Path(file).read_text(encoding="utf-8"))["info"]["id"]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            return False, f"not an export document: {e}"
+        try:
+            proc = subprocess.run(["opencode", "import", str(file)], cwd=str(cwd),
+                                  capture_output=True, text=True, timeout=120,
+                                  env={**os.environ, "OPENCODE_DISABLE_AUTOUPDATE": "1"})
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, str(e)
+        err = (proc.stderr or "").strip()
+        tail = (err + "\n" + (proc.stdout or "")).strip()[-300:]
+        if proc.returncode != 0:
+            return False, f"exit {proc.returncode}: {tail}"
+        # A schema-decode failure prints "Error: Unexpected error" and STILL
+        # exits 0 (a Bun defect): the session landing in the DB is the proof.
+        if "Error:" in err:
+            return False, tail
+        if sid not in self._existing_ids([sid]):
+            return False, f"{sid} did not appear in {self.db_path} after import (exit 0): {tail}"
+        return True, tail
+
+    def _existing_ids(self, ids: list[str]) -> set[str]:
+        conn = self._open_ro()
+        if conn is None:
+            return set()
+        try:
+            marks = ",".join("?" * len(ids))
+            return {r[0] for r in conn.execute(f"SELECT id FROM session WHERE id IN ({marks})", ids)}
+        except sqlite3.Error:
+            return set()
+        finally:
+            conn.close()
+
     # -- discovery ---------------------------------------------------------------
     def discover(self) -> Iterator[Path]:
         if time.time() - self._last_sync >= self.sync_interval:
@@ -612,6 +722,30 @@ class OpenCodeSource:
         for p in sorted(self.mirror_dir.glob("ses_*.jsonl")):
             if not p.is_symlink() and _SID.match(p.stem):
                 yield p
+
+
+def to_export_docs(path: Path | str) -> list[dict]:
+    """The mirror file as `opencode export` documents — {info, messages:[{info,
+    parts}]} — root first, then each embedded child, for `opencode import`."""
+    path = Path(path)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            head = _loads(fh.readline().strip())
+            if head.get("type") != "session" or not isinstance(head.get("info"), dict):
+                return []
+            order = [head["info"]["id"]] + [c["id"] for c in head.get("children") or [] if isinstance(c, dict)]
+            infos = {head["info"]["id"]: head["info"], **{c["id"]: c for c in head.get("children") or []}}
+            messages: dict[str, list] = {sid: [] for sid in order}
+            for line in fh:
+                rec = _loads(line.strip())
+                if rec.get("type") != "message":
+                    continue
+                sid = rec.get("session")
+                if sid in messages:
+                    messages[sid].append({"info": rec.get("info") or {}, "parts": rec.get("parts") or []})
+    except OSError:
+        return []
+    return [{"info": infos[sid], "messages": messages[sid]} for sid in order]
 
 
 def _user_text(parts: list[dict]) -> str:

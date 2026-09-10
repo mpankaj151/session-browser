@@ -9,7 +9,6 @@ two indexing paths never double-process the same file.
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
 import threading
@@ -23,12 +22,16 @@ from watchdog.observers import Observer
 _REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO))
 
+import hookstate  # noqa: E402
 import indexer  # noqa: E402
 import sbconfig  # noqa: E402
 from sources.registry import build_source_registry  # noqa: E402
 
 DEBOUNCE_S = 0.5
-RACE_GUARD_S = 30
+# A DB-backed source (OpenCode) reports a change trigger per WAL write, which
+# is many times a second while a session is active; one re-sync per burst.
+SYNC_DEBOUNCE_S = 2.0
+_SYNC_KEY = "__sync__"
 LOG = sbconfig.LOG_DIR / "watcher.log"
 
 
@@ -83,21 +86,6 @@ def _is_representation_change(path: Path) -> bool:
     return Path(twin).exists()
 
 
-def _recently_hooked(session_id: str) -> bool:
-    try:
-        state = json.loads(sbconfig.HOOK_STATE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return False
-    ts = state.get(session_id)
-    if not ts:
-        return False
-    try:
-        when = datetime.fromisoformat(ts)
-        return (datetime.now(timezone.utc) - when).total_seconds() < RACE_GUARD_S
-    except ValueError:
-        return False
-
-
 class _Handler(FileSystemEventHandler):
     def __init__(self, adapter):
         self.adapter = adapter
@@ -126,18 +114,46 @@ class _Handler(FileSystemEventHandler):
         # Let the adapter decide whether this path is a session transcript at all
         # (e.g. only <sid>/events.jsonl counts for copilot, not future siblings).
         if self.adapter.session_id_for_path(path) is None:
+            # Not a session — but maybe the SOURCE changed (a write to OpenCode's
+            # DB/WAL): let the adapter re-project, and the resulting mirror
+            # events flow through this same handler.
+            trigger = getattr(self.adapter, "sync_trigger", None)
+            if callable(trigger) and trigger(path):
+                self._schedule_sync()
             return
         try:
             header = self.adapter.parse_header(path)
             if header is None:
                 return
-            if self.adapter.name == "claude" and _recently_hooked(header.session_id):
+            # Any hook (Claude Stop hook, OpenCode plugin) that just indexed this
+            # session wins; ids never collide across CLIs.
+            if hookstate.recently(header.session_id):
                 _log(f"skip (hook race-guard) {header.session_id}")
                 return
             indexer.upsert(header)
             _log(f"index [{self.adapter.name}] {header.session_id} ({header.turn_count} turns)")
         except Exception as e:  # noqa: BLE001
             _log(f"error {path.name}: {e}")
+
+    def _schedule_sync(self):
+        with self._lock:
+            t = self._timers.get(_SYNC_KEY)
+            if t:
+                t.cancel()
+            timer = threading.Timer(SYNC_DEBOUNCE_S, self._run_sync)
+            self._timers[_SYNC_KEY] = timer
+            timer.start()
+
+    def _run_sync(self):
+        with self._lock:
+            self._timers.pop(_SYNC_KEY, None)
+        try:
+            report = self.adapter.sync()
+            if report.written or report.removed or report.warnings:
+                _log(f"sync [{self.adapter.name}] written={len(report.written)} "
+                     f"removed={len(report.removed)} warnings={len(report.warnings)}")
+        except Exception as e:  # noqa: BLE001
+            _log(f"sync error [{self.adapter.name}]: {e}")
 
     def on_created(self, event):
         if not event.is_directory:
@@ -163,6 +179,13 @@ class _Handler(FileSystemEventHandler):
         path = Path(event.src_path)
         sid = self.adapter.session_id_for_path(path)
         if sid is None:
+            return
+        # An atomic rewrite (tmp + os.replace — how the OpenCode mirror is
+        # written) surfaces on macOS as a delete of the overwritten inode. A
+        # path that still exists was replaced, not deleted; the create/modify
+        # event that follows re-indexes it.
+        if path.exists():
+            _log(f"skip archive (replaced in place) {sid}")
             return
         if _is_representation_change(path):
             _log(f"skip archive (compression/materialization) {sid}")

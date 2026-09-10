@@ -42,6 +42,8 @@ def main() -> None:
         ("classify topics", [str(SCRIPTS / "classify-topics.py")]),
         ("compute costs", [str(SCRIPTS / "compute-costs.py")]),
         ("reasoning trails", [str(SCRIPTS / "extract-reasoning.py"), "--backfill", "--archive"]),
+        # weekly whole-DB copy of OpenCode's store; exits 0 when disabled / not due
+        ("opencode db snapshot", [str(SCRIPTS / "backup-opencode.py"), "--if-due", "7"]),
         ("full-text index", [str(SCRIPTS / "build-fts.py")]),
         ("embeddings", [str(SCRIPTS / "embed-sessions.py")]),
     ]

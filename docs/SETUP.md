@@ -60,6 +60,7 @@ Install flags:
 | `--lite` | Skip the ~2 GB semantic-search ML stack; search falls back to keyword + full-text |
 | `--enrich` | Also LLM-journal your **existing** history during install (spends your plan's quota; the hooks + nightly job cover *new* sessions regardless). Later: `sb refresh --enrich`. Enrichment runs on `claude-sonnet-5` by default — change or clear it via `[enrichment.claude_headless] model` in `config.toml` |
 | `--no-hook` | Don't register the Claude hooks or link the skills |
+| `--opencode-plugin` | Install the OpenCode plugin (`~/.config/opencode/plugins/session-browser.js`): indexes a session the moment a turn settles, re-syncs on deletion. Optional — the watcher already picks OpenCode changes up within seconds |
 | `--no-launchd` | Don't install macOS launchd jobs |
 | `--no-backfill` | Don't index existing sessions now |
 
