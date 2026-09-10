@@ -52,15 +52,22 @@ def _log(msg: str) -> None:
     print(line, end="")
 
 
+# How often the watcher re-checks for source directories that did not exist
+# when it started (a CLI installed or first run after us).
+ROOT_POLL_S = 30
+
+
 def _build_watch_pairs() -> list[tuple[Path, object]]:
-    """(directory, adapter) pairs for every available source.
+    """(directory, adapter) pairs for every ENABLED source — existing or not.
 
     An adapter may own more than one root — codex spreads live and archived
     rollouts across two sibling trees — so it gets to declare them via an
     optional watch_roots(). Sources without one keep the single configured dir.
+    Existence is not checked here: _RootScheduler subscribes each root the
+    moment it appears, so a CLI first run after the watcher started is covered.
     """
     pairs = []
-    for name, adapter in build_source_registry(only_available=True).items():
+    for name, adapter in build_source_registry().items():
         roots = getattr(adapter, "watch_roots", None)
         if callable(roots):
             pairs.extend((Path(d).expanduser(), adapter) for d in roots())
@@ -84,6 +91,32 @@ def _is_representation_change(path: Path) -> bool:
     name = str(path)
     twin = name[:-4] if name.endswith(".zst") else name + ".zst"
     return Path(twin).exists()
+
+
+class _RootScheduler:
+    """Subscribes each (root, adapter) pair once its directory exists and keeps
+    retrying the rest. Missing roots used to be skipped for the life of the
+    process, and a watcher that found none exited 0 — which launchd (KeepAlive
+    on failure only) never restarts, so a laptop that installed Session Browser
+    before its first CLI session watched nothing until the next login."""
+
+    def __init__(self, observer, pairs, log=None):
+        self.observer = observer
+        self.pending = list(pairs)
+        self.scheduled: list[tuple[Path, object]] = []
+        self._log = log or _log
+
+    def poll(self) -> list[Path]:
+        newly: list[Path] = []
+        for directory, adapter in list(self.pending):
+            if not directory.is_dir():
+                continue
+            self.observer.schedule(_Handler(adapter), str(directory), recursive=True)
+            self.pending.remove((directory, adapter))
+            self.scheduled.append((directory, adapter))
+            newly.append(directory)
+            self._log(f"watching [{adapter.name}] {directory}")
+        return newly
 
 
 class _Handler(FileSystemEventHandler):
@@ -239,17 +272,22 @@ def main() -> None:
         return
     pairs = _build_watch_pairs()
     if not pairs:
-        _log("no available sources to watch; exiting")
+        _log("no sources enabled in config; exiting")
         return
     observer = Observer()
-    for directory, adapter in pairs:
-        if directory.exists():
-            observer.schedule(_Handler(adapter), str(directory), recursive=True)
-            _log(f"watching [{adapter.name}] {directory}")
+    roots = _RootScheduler(observer, pairs)
+    roots.poll()
+    if not roots.scheduled:
+        _log(f"no source directory exists yet ({len(roots.pending)} pending) — "
+             f"waiting for the first one to appear, re-checking every {ROOT_POLL_S}s")
     observer.start()
     try:
+        tick = 0
         while True:
             time.sleep(1)
+            tick += 1
+            if roots.pending and tick % ROOT_POLL_S == 0:
+                roots.poll()
     except KeyboardInterrupt:
         observer.stop()
     observer.join()

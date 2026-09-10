@@ -29,12 +29,42 @@ def _source_text(row) -> str:
     return "  ".join(p for p in parts if p).strip()
 
 
+def _load_model():
+    """The SentenceTransformer, or None when embeddings are simply not part of
+    this install. Two skips and one failure:
+      - sentence-transformers not importable  -> --lite install: skip, exit 0
+      - model not cached, downloads disallowed -> offline by choice: skip, exit 0
+      - download attempted and failed          -> a real problem: exit 1
+    refresh-all reports a nonzero step as a nightly FAILURE, so the two modes
+    must never look like one."""
+    try:
+        return semsearch.get_model()
+    except ImportError as e:
+        print(f"! semantic search not installed ({e.__class__.__name__}: {e}) — skipping embeddings")
+        print("  (--lite install: search falls back to keyword + full-text; re-run install.sh without --lite to enable)")
+        return None
+    except Exception as e:  # noqa: BLE001
+        msg = str(e).strip().splitlines()
+        tail = msg[-1] if msg else str(e)
+        if os.environ.get("SB_ALLOW_MODEL_DOWNLOAD") != "1":
+            print(f"! embedding model not cached and downloads are disallowed — skipping embeddings ({tail})")
+            return None
+        print(f"! embedding model unavailable: {type(e).__name__}: {tail}")
+        print("  Semantic search falls back to keyword + full-text until the model is cached.")
+        print("  Check access to huggingface.co (proxy/firewall?), then re-run: sb refresh")
+        sys.exit(1)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--force", action="store_true", help="re-embed all sessions")
     args = ap.parse_args()
 
+    # Resolve the model BEFORE touching the DB: a skip must leave no trace.
+    model = _load_model()
+    if model is None:
+        return
     conn = indexer.connect()
     rows = conn.execute(
         f"SELECT session_id, title, summary, first_message FROM sessions WHERE {indexer.VISIBLE}"
@@ -48,14 +78,6 @@ def main() -> None:
     # A config [embeddings].model change means a new dimensionality — stored
     # rows at the old dim are unusable and must be re-embedded even if their
     # source_text is unchanged.
-    try:
-        model = semsearch.get_model()
-    except Exception as e:
-        msg = str(e).strip().splitlines()
-        print(f"! embedding model unavailable: {type(e).__name__}: {msg[-1] if msg else e}")
-        print("  Semantic search falls back to keyword + full-text until the model is cached.")
-        print("  Check access to huggingface.co (proxy/firewall?), then re-run: sb refresh")
-        sys.exit(1)
     model_dim = model.get_sentence_embedding_dimension()
 
     todo = []
@@ -72,7 +94,6 @@ def main() -> None:
         print("Embeddings up to date.")
         return
 
-    model = semsearch.get_model()
     t0 = time.time()
     for i in range(0, len(todo), args.batch):
         chunk = todo[i:i + args.batch]

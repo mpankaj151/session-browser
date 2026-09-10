@@ -621,7 +621,13 @@ class OpenCodeSource:
     # -- watcher hooks -------------------------------------------------------------
     def watch_roots(self) -> list[Path]:
         """The mirror (session files → the ordinary handler) and the data dir
-        (DB/WAL writes → sync_trigger)."""
+        (DB/WAL writes → sync_trigger). The mirror is our own directory, so it
+        is created here: a watcher started before the first sync must be able
+        to subscribe to it, or the files that sync writes go unseen."""
+        try:
+            self.mirror_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         return [self.mirror_dir, self.data_dir]
 
     def sync_trigger(self, path: Path) -> bool:

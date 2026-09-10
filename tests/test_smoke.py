@@ -1903,7 +1903,8 @@ def test_watcher_sync_trigger_resyncs_mirror():
             watcher._log = lambda msg: None
             watcher.SYNC_DEBOUNCE_S = 0.05
             h = watcher._Handler(src)
-            assert not src.mirror_dir.exists()
+            # watch_roots() above created the (empty) mirror dir; the file is what sync writes
+            assert not (src.mirror_dir / f"{_OC_ROOT}.jsonl").exists()
             h._process(str(wal))                       # trigger, not a session
             _time.sleep(0.4)
             assert (src.mirror_dir / f"{_OC_ROOT}.jsonl").exists()
@@ -2285,6 +2286,89 @@ def test_claude_and_copilot_available_without_binary_on_path():
         assert ClaudeSource(tmp / "absent").is_available() is False
         assert CopilotSource(tmp / "absent").is_available() is False
     print("  ok  claude/copilot availability = transcripts on disk, not the binary on PATH")
+
+
+# --- portability: nightly pipeline + watcher on partial machines --------------------
+def test_embed_step_skips_instead_of_failing_without_semantic_stack():
+    """refresh-all marked EVERY nightly run failed on a --lite install (no
+    sentence-transformers) and on any machine whose model is not cached while
+    downloads are disallowed — both are modes the user chose, not failures.
+    Only an attempted download that fails deserves a nonzero exit."""
+    import os
+    import semsearch
+    emb = _load_script("embed-sessions")
+    saved_mod = sys.modules.get("sentence_transformers")
+    saved_get = semsearch.get_model
+    saved_env = os.environ.get("SB_ALLOW_MODEL_DOWNLOAD")
+    try:
+        semsearch.get_model.cache_clear()
+        sys.modules["sentence_transformers"] = None          # `import` now raises ImportError
+        assert emb._load_model() is None, "lite install must be a skip"
+
+        def not_cached():
+            raise RuntimeError("embedding model 'x' is not cached locally; set SB_ALLOW_MODEL_DOWNLOAD=1")
+        semsearch.get_model = not_cached
+        os.environ["SB_ALLOW_MODEL_DOWNLOAD"] = "0"
+        assert emb._load_model() is None, "offline by choice must be a skip"
+        os.environ["SB_ALLOW_MODEL_DOWNLOAD"] = "1"
+        try:
+            emb._load_model()
+            raise AssertionError("a failed download must exit nonzero")
+        except SystemExit as e:
+            assert e.code == 1
+    finally:
+        semsearch.get_model = saved_get
+        if saved_mod is None:
+            sys.modules.pop("sentence_transformers", None)
+        else:
+            sys.modules["sentence_transformers"] = saved_mod
+        if saved_env is None:
+            os.environ.pop("SB_ALLOW_MODEL_DOWNLOAD", None)
+        else:
+            os.environ["SB_ALLOW_MODEL_DOWNLOAD"] = saved_env
+    print("  ok  embed step: lite / offline-by-choice skip with exit 0; failed download exits 1")
+
+
+def test_watcher_subscribes_roots_that_appear_later():
+    """A fresh laptop may install Session Browser before the CLI has written
+    its first session directory (or before OpenCode's mirror exists). The
+    watcher used to skip missing roots forever and exit when none existed —
+    launchd never restarts a clean exit, so nothing was watched until reboot."""
+    import watcher
+
+    class FakeObserver:
+        def __init__(self):
+            self.scheduled = []
+
+        def schedule(self, handler, path, recursive=True):
+            self.scheduled.append(path)
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        adapter = _cx_source(tmp)
+        obs = FakeObserver()
+        sched = watcher._RootScheduler(obs, [(tmp / "sessions", adapter), (tmp / "archived", adapter)],
+                                       log=lambda m: None)
+        assert sched.poll() == [] and obs.scheduled == []
+        (tmp / "sessions").mkdir()
+        assert sched.poll() == [tmp / "sessions"] and obs.scheduled == [str(tmp / "sessions")]
+        assert sched.poll() == [] and len(obs.scheduled) == 1, "must not subscribe twice"
+        assert sched.pending == [(tmp / "archived", adapter)]
+        (tmp / "archived").mkdir()
+        sched.poll()
+        assert sched.pending == [] and len(obs.scheduled) == 2
+    print("  ok  watcher subscribes to source dirs that appear after start, once each")
+
+
+def test_opencode_watch_roots_creates_mirror_dir():
+    """The mirror is OUR directory. If the watcher starts before the first sync
+    (install --no-backfill), the root must exist to be subscribed — otherwise
+    every mirror file the WAL-triggered sync writes is invisible until a restart."""
+    from sources.opencode import OpenCodeSource
+    with tempfile.TemporaryDirectory() as td:
+        mirror = Path(td) / "mirror"
+        roots = OpenCodeSource(data_dir=Path(td) / "data", mirror_dir=mirror).watch_roots()
+        assert mirror.is_dir() and mirror in roots, (mirror.exists(), roots)
+    print("  ok  opencode watch_roots() materialises the mirror dir")
 
 
 if __name__ == "__main__":
