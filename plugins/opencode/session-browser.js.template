@@ -4,25 +4,90 @@
 // Claude Stop hook: index a session the moment a turn settles, re-sync on
 // deletion so the row lands in the Archived tab.
 //
+// What an OpenCode plugin is, for anyone who has never written one: OpenCode
+// is a terminal AI coding assistant. At start-up it loads every JavaScript
+// file in its plugins directory and calls the function each one exports. That
+// call returns an object of callbacks; the only one used here is `event`,
+// which OpenCode invokes for each internal event it emits. So a plugin is a
+// listener living inside the CLI's own process — hence the paranoia below:
+// anything this file throws, or blocks on, happens inside that process.
+//
+// The two events handled here (everything else is ignored):
+//   session.idle     a turn finished and the session went quiet. Fires once
+//                    per turn, and separately for each child session, so it
+//                    arrives in bursts rather than once per conversation.
+//   session.deleted  a session was removed from OpenCode's database. Re-running
+//                    the hook re-projects the mirror, which archives the row so
+//                    it appears under the browser's Archived tab instead of
+//                    silently disappearing.
+//
+// No work is done in-process: both events just start scripts/opencode-hook.py
+// with this repo's own virtualenv python. Those two paths, plus the directory
+// for the log file, are the three placeholders the installer fills in when it
+// renders this template (see scripts/install-opencode-plugin.py) — the file
+// OpenCode actually loads has real absolute paths in their place.
+//
 // OpenCode void-s the event hook (never awaited) and does not catch its
 // rejections, so everything here is try/catch-ed and nothing is awaited. The
 // hook process is detached (unref) and always exits 0. session.idle fires per
 // turn and per child session: the FIRST event spawns immediately (a one-shot
 // `opencode run` may exit before any timer fires) and a burst coalesces into
 // one trailing spawn. Runs under Bun or Node; failures are logged, not swallowed.
+// Concretely: a rejected promise nobody awaits is an unhandled rejection, which
+// under Node can kill the whole CLI, and an await here would make the user wait
+// for our indexing before their session closes. Never throw, never block, log.
+//
+// ESM: OpenCode loads this file as an ES module, where the bare `require` of
+// classic Node scripts does not exist. createRequire rebuilds one bound to this
+// file's URL so the two built-in modules below (node:fs, node:child_process)
+// can be pulled in lazily, inside the try/catch that needs them.
 import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);   // ES module: no bare `require` under Node
+// The three install-time placeholders: the repo's virtualenv python, the hook
+// script it runs, and the directory this plugin appends its own log lines to.
+// They are plain string constants after rendering; nothing here reads config.
 const PY = "__VENV_PY__";
 const HOOK = "__HOOK__";
 const LOG = "__LOG_DIR__/opencode-plugin.log";
+// In-flight debounce bookkeeping, one entry per session id: the timer that is
+// currently running, whether more events arrived while it ran ("again"), and
+// the newest argument list to use if they did. Lives only in memory, so a
+// restart of OpenCode simply starts the debounce over — nothing is lost,
+// because the watcher daemon indexes anything a hook misses anyway.
 const pending = new Map();   // session id -> { timer, again }
 
+// Append one timestamped line to the plugin's log file, which the installer
+// points at the tool's log directory (the rendered path ends in
+// opencode-plugin.log). This is the ONLY way a failure in here becomes
+// visible: OpenCode shows nothing, and stdout/stderr of the child are dropped.
+// The write is synchronous on purpose — an event handler that returns before
+// its own log line is flushed can lose it when the process exits right after.
+// Its own failure (unwritable directory, full disk) is swallowed: a logger
+// that throws would take the CLI down over a diagnostic.
 function note(msg) {
   try {
     _require("node:fs").appendFileSync(LOG, new Date().toISOString() + "  " + msg + "\n");
   } catch (_) { /* logging must never throw into OpenCode */ }
 }
 
+// Start the indexing hook in a child process and immediately forget about it.
+// `args` is what follows the script path — the session id, plus "--deleted"
+// for a removal.
+//
+// Two runtimes have to work. OpenCode normally runs on Bun, which exposes its
+// own Bun.spawn and no classic child_process; some builds run it on plain
+// Node, which has child_process and no Bun. Testing for Bun inside one big
+// try/catch used to hide the Node case entirely (a ReferenceError was caught
+// and the session was never indexed), so the Bun branch returns explicitly and
+// Node's spawn is the fall-through.
+//
+// Both branches do the same three things:
+//   * stdio ignored — nothing is piped back, so a chatty child can never fill
+//     a pipe buffer and hang, and its output can never corrupt OpenCode's TUI;
+//   * detached / unref'd — the child is cut loose from this process's event
+//     loop, so OpenCode can exit while indexing is still running;
+//   * autoupdate disabled in the child's environment — the hook may invoke
+//     OpenCode tooling, and an update check there would be slow and surprising.
 function spawn(args) {
   try {
     const env = { ...process.env, OPENCODE_DISABLE_AUTOUPDATE: "1" };
@@ -40,9 +105,23 @@ function spawn(args) {
   }
 }
 
+// Debounce the spawns for one session id, at most one hook process in flight
+// plus one queued. A chatty session can emit several idle events per second and
+// each hook run re-reads OpenCode's database, so firing on every event would be
+// pure waste.
+//
 // Leading + trailing edge: spawn now if nothing is pending for this id; while
 // the timer runs, remember that more events arrived and spawn once more when it
 // fires — so the last turn of a burst is indexed too.
+//
+// Leading edge matters because of one-shot runs: `opencode run "..."` emits a
+// single idle event and exits. A purely trailing debounce would still be
+// holding its timer when the process died, and that session would never be
+// indexed at all. Hence: fire first, coalesce the rest.
+//
+// The timer itself is unref'd (when the runtime supports it) so a pending
+// debounce never keeps OpenCode alive after the user quits; the final spawn is
+// simply skipped, and the watcher daemon picks that session up later.
 function schedule(id, args, delayMs) {
   try {
     const entry = pending.get(id);
@@ -62,6 +141,21 @@ function schedule(id, args, delayMs) {
   }
 }
 
+// The plugin entry point. OpenCode imports this file, calls the exported
+// factory once at start-up (it is passed a context object this plugin does not
+// need) and keeps the returned callbacks for the life of the process.
+//
+// `event` receives every internal event; the two we act on carry the session id
+// in different places — session.idle puts it in properties.sessionID, while
+// session.deleted nests the whole record under properties.info. Anything else
+// falls through and is ignored.
+//
+// The delays differ on purpose: an idle burst is worth waiting 1.5s to
+// coalesce, while a deletion is a single event where 200ms is only there to
+// merge the duplicate that a cascading child delete can produce.
+//
+// The whole body is inside a try/catch: a malformed event must never surface as
+// an exception in OpenCode's event loop.
 export const SessionBrowser = async () => ({
   event: async ({ event }) => {
     try {

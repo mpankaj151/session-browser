@@ -267,6 +267,7 @@ Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 - [SETUP.md](docs/SETUP.md) — install, Linux scheduling, MCP, troubleshooting
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — data flow + design decisions
 - [ADDING-A-CLI.md](docs/ADDING-A-CLI.md) — write an adapter in one file
+- [GLOSSARY.md](docs/GLOSSARY.md) — every AI and pipeline term in plain language, for readers new to coding assistants
 
 ## License
 

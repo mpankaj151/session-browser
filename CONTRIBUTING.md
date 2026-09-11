@@ -35,6 +35,10 @@ CI runs these on Ubuntu + macOS across Python 3.11 and 3.12.
 - **Adapters:** adding a CLI should stay a one-file change. See
   [docs/ADDING-A-CLI.md](docs/ADDING-A-CLI.md).
 - Match the surrounding style; keep comments about *why*, not *what*.
+- **Write for a reader who has never used an AI coding assistant.** Every module has a
+  docstring saying what it does and where it sits in the pipeline; every function has one;
+  define an AI term (token, embedding, headless run ...) in a few words the first time a
+  module leans on it, or point at [docs/GLOSSARY.md](docs/GLOSSARY.md).
 
 ## Good first issues
 

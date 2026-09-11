@@ -1,4 +1,8 @@
 <!doctype html>
+<!-- Session Browser — the entire user interface is this one file: markup, a small -->
+<!-- local stylesheet, and one inline script of plain JavaScript. session-ui/app.py -->
+<!-- serves it at "/" and answers every request it makes under /api/. -->
+<!-- The page opens in the dark theme; the 🌓 button flips this class on the root element. -->
 <html lang="en" class="dark">
 <head>
 <meta charset="utf-8"/>
@@ -9,6 +13,10 @@
      -> `npx tailwindcss -m`). No CDN, no fonts, no network: the UI must render
      fully offline and never phone home. -->
 <link rel="stylesheet" href="/static/tailwind.css">
+<!-- Hand-written rules for the few things utility classes cannot express: the five -->
+<!-- heatmap intensity fills (hm0 = no activity … hm4 = busiest, one pair per theme so -->
+<!-- the toggle needs no re-render), the two-line clamp on card summaries, and the -->
+<!-- outline the j/k keyboard cursor draws around the selected card. -->
 <style>
     .hm0{fill:#e5e7eb} .dark .hm0{fill:#1e293b}
     .hm1{fill:#bbf7d0} .dark .hm1{fill:#14532d}
@@ -26,6 +34,9 @@
 <body class="bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 min-h-screen">
 <div class="max-w-6xl mx-auto px-4 py-6">
 
+  <!-- Header: the counts line (#stats, filled by loadMeta), the three tab buttons -->
+  <!-- Sessions / Archived / Usage, and the theme toggle. #tabArchived also shows the -->
+  <!-- number of archived rows, so a session that aged out is never invisible. -->
   <!-- Header -->
   <header class="flex items-center justify-between mb-5">
     <div class="flex items-center gap-3">
@@ -43,6 +54,12 @@
     </div>
   </header>
 
+  <!-- Filters. Every control here is read by applyFilters(), turned into a query -->
+  <!-- string and sent to GET /api/sessions: the filtering happens in SQL, never in -->
+  <!-- the browser, so the header counts and the list below can never disagree. -->
+  <!-- #mode picks HOW the search box matches: Keyword (SQL LIKE over title, summary, -->
+  <!-- first message and topics), Semantic (search by meaning, via embeddings), or -->
+  <!-- Full-text (exact words anywhere in the transcript, via SQLite's FTS index). -->
   <!-- Filters -->
   <div class="flex flex-wrap items-center gap-2 mb-3">
     <input id="search" type="text" placeholder="Search sessions…  (press /)"
@@ -60,22 +77,39 @@
     <button id="refresh" class="text-sm px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white">Refresh</button>
   </div>
 
+  <!-- Source pills: one per AI coding CLI plus "all", each with its row count for the -->
+  <!-- current tab. Built by loadMeta() from /api/stats, so only CLIs that actually -->
+  <!-- have sessions on this machine appear. -->
   <!-- Source pills -->
   <div id="pills" class="flex gap-2 mb-5"></div>
 
+  <!-- Session list. #list is filled by render() with one card per session, grouped -->
+  <!-- Today / Yesterday / This week / Older; #empty replaces it when nothing matches -->
+  <!-- and its wording depends on whether a filter is hiding rows. Shown for both the -->
+  <!-- Sessions and the Archived tab — they are the same view at a different scope. -->
   <!-- Session list -->
   <div id="sessionsView">
     <div id="list" class="space-y-6"></div>
     <div id="empty" class="hidden text-center text-slate-500 py-16">No sessions match.</div>
   </div>
 
+  <!-- Usage dashboard: token and cost totals, the activity heatmap and the per-model / -->
+  <!-- per-project / per-CLI bars. Empty until the Usage tab is opened; renderStats() -->
+  <!-- writes the whole thing in one go from /api/stats/timeseries. -->
   <!-- Usage dashboard -->
   <div id="statsView" class="hidden"></div>
 </div>
 
+<!-- Toast: the one-line notice strip at the bottom of the window. toast() puts text in -->
+<!-- it, fades it in and hides it again after ~1.6s. Used for every confirmation and -->
+<!-- every error, so a failed request always says something instead of doing nothing. -->
 <!-- Toast -->
 <div id="toast" class="fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg bg-slate-900 text-white text-sm shadow-lg opacity-0 transition-opacity pointer-events-none"></div>
 
+<!-- Modal: one reusable dialog, reused for the reasoning trail (the assistant's own -->
+<!-- recorded thinking, rendered from Markdown) and for the Bridge handoff panel. -->
+<!-- The onclick below closes it only when the dark backdrop itself is clicked, so a -->
+<!-- click inside the white panel does not dismiss it. Escape closes it too. -->
 <!-- Modal (reasoning, etc.) -->
 <div id="modal" class="hidden fixed inset-0 bg-black/50 z-40 flex items-center justify-center p-4" onclick="if(event.target===this)closeModal()">
   <div class="bg-white dark:bg-slate-900 rounded-2xl max-w-3xl w-full max-h-[85vh] overflow-auto p-6 shadow-2xl">
@@ -88,17 +122,137 @@
 </div>
 
 <script>
+// ===========================================================================
+// Session Browser — the whole front end. Plain JavaScript, no framework and no
+// build step: the file you are reading is the file the browser runs.
+//
+// What the page is FOR. A "session" is one conversation with an AI coding
+// assistant in the terminal — Claude Code, GitHub Copilot CLI, OpenAI Codex
+// CLI or OpenCode. Each of those writes a transcript file as you work; the
+// Python side of this project indexes those transcripts into one SQLite
+// registry (one row per session, plus derived extras like a summary, topics,
+// token counts and a cost estimate). This page is a reader for that registry.
+// docs/GLOSSARY.md defines the vocabulary, docs/ARCHITECTURE.md draws the map.
+//
+// Layout of the page, top to bottom:
+//   header      counts line, the three tab buttons, the light/dark toggle
+//   filters     search box, folder, topic, age, search mode, Refresh
+//   pills       one per CLI plus "all" — a source filter with live counts
+//   list        session cards, grouped Today / Yesterday / This week / Older
+//   statsView   the Usage dashboard, drawn only while its tab is open
+//   toast       a one-line notice strip; modal — one reusable dialog
+//
+// THE THREE TABS are two different things. Sessions and Archived are the SAME
+// list at a different scope: live rows (the transcript file still exists on
+// disk) versus archived rows (the CLI deleted the transcript — Claude Code
+// removes files after 30 days — but the row and all its metadata survive, and
+// can often be restored). Usage is a separate view. showTab() is the only
+// place that switches between the three.
+//
+// ALL STATE lives in one object, STATE:
+//   source     the selected CLI pill, or 'all'
+//   state      'live' or 'archived' — sent to the API as the state parameter
+//   sessions   the rows currently on screen, i.e. the last API answer
+//   kbIndex    which card the j/k keyboard cursor sits on, -1 for none
+//   sources    the answer from /api/sources — which CLIs exist on THIS machine
+//   truncated  true when the server capped the page (X-Result-Truncated)
+//   total      how many rows matched in total (X-Result-Total)
+// There is no other store and no client-side cache of rows: every filter
+// change re-asks the server, so the counts and the list can never drift apart.
+//
+// FILTERS AND SEARCH. applyFilters() reads the five controls plus the source
+// pill and the current tab, builds one query string and re-renders. The mode
+// select decides how the search text is matched, and all three modes run on
+// the server:
+//   Keyword    (default) SQL LIKE over first message, summary, title, topics
+//   Semantic   search by MEANING: the server turns the query into a vector of
+//              numbers and ranks sessions by how close their vectors are, so
+//              "the flaky checkout tests" finds the session even when those
+//              words never appear. Order of results is significance, not time.
+//   Full-text  exact words anywhere in the transcript body, via SQLite's FTS
+//              word index — the grep-like option.
+// Semantic and full-text degrade to keyword server-side if their index is not
+// built, so the UI never has to know whether they are available.
+//
+// FETCH HELPERS. fetchJson() is the one used everywhere: it throws an Error
+// carrying the SERVER's message rather than a bare status code, because those
+// messages are the honest explanation the user needs ("codex is not installed
+// on this machine"). The two list loaders, applyFilters() and loadMeta(), do
+// their own fetch so they can read response headers and keep the page usable
+// after a failure. The two endpoints that WRITE are POSTs carrying an
+// X-Requested-With header — a plain HTML form or an image tag cannot send
+// either, which is what stops another page in your browser from triggering a
+// write to your session files.
+//
+// EVERY endpoint this page uses, all on the local Flask server:
+//   GET  /api/sessions            the list; honours search, folder, topic,
+//                                 days, mode, source, state; answers with an
+//                                 array and may set X-Result-Truncated/Total
+//   GET  /api/sessions/folders    distinct project folders, for the select
+//   GET  /api/sessions/topics     distinct topic tags, for the select
+//   GET  /api/stats               header counts and per-source pill counts,
+//                                 scoped by the state parameter
+//   GET  /api/stats/timeseries    everything the Usage dashboard draws
+//   GET  /api/sources             per-CLI enabled / installed / has_data
+//   GET  /api/sessions/<id>/resume     the command that reopens the session
+//   GET  /api/sessions/<id>/reasoning  the recorded decision trail, Markdown
+//   GET  /api/sessions/<id>/context    a Markdown briefing, to copy or download
+//   GET  /api/sessions/<id>/thread     sibling sessions in the same project
+//   POST /api/sessions/<id>/restore    put a deleted transcript back
+//   POST /api/sessions/<id>/bridge     write a handoff primer for another CLI
+//
+// RENDERING is string-building plus innerHTML, which is fast enough for a few
+// hundred cards and keeps the code readable. Two rules make that safe:
+//  * every dynamic value passes through esc() first — titles, summaries,
+//    folder names and topics come out of transcripts and are untrusted;
+//  * cards carry data-act / data-sid attributes and ONE delegated click
+//    listener dispatches them, instead of inline handlers built by string
+//    interpolation (which was an injection hole).
+//
+// KEYBOARD: "/" focuses the search box, j and k move the card cursor, "r"
+// resumes the selected card, Escape closes the modal or leaves an input.
+//
+// THEME: the toggle flips the "dark" class on the root element. Colours are
+// Tailwind's dark variants, so nothing needs re-rendering — which is exactly
+// why the heatmap uses CSS classes for its cell fills rather than inline ones.
+//
+// THE HEATMAP is the GitHub-style year of activity on the Usage tab: 53 weeks
+// across, 7 days down, one square per day shaded by how many sessions ran.
+// Built by heatmap() as inline SVG; see the notes there about UTC and classes.
+// ===========================================================================
+// Per-CLI badge colours. The key is the value stored in the row's cli_source
+// column; the value is the Tailwind class string for its pill. A source with
+// no entry here falls back to neutral slate, so a newly added CLI still
+// renders — it just is not colour-coded until someone picks a colour.
 const SOURCE_COLORS = {
   claude: 'bg-orange-500/15 text-orange-600 dark:text-orange-300 border-orange-500/30',
   copilot: 'bg-sky-500/15 text-sky-600 dark:text-sky-300 border-sky-500/30',
   codex: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border-emerald-500/30',
   opencode: 'bg-violet-500/15 text-violet-600 dark:text-violet-300 border-violet-500/30',
 };
+// The single source of truth for the whole page — see the header block above
+// for what each field means. truncated and total are added later, by the list
+// loader, straight from the response headers.
 // state: 'live' (Sessions tab) | 'archived' (Archived tab — transcript aged out)
 let STATE = { source: 'all', state: 'live', sessions: [], kbIndex: -1, sources: null };
+// Amber badge worn by anything archived: the card badge on the Sessions-style
+// list and the small marker on a sibling row inside an expanded thread.
 const ARCHIVED_CLS = 'bg-amber-500/10 text-amber-600 dark:text-amber-300 border-amber-500/30';
 
+// One-character shorthand for document.querySelector, used for the handful of
+// fixed elements the page owns by id.
 const $ = s => document.querySelector(s);
+// The workhorse request helper: fetch a URL and hand back its parsed JSON.
+// `opts` is passed straight to fetch, so callers can make it a POST with
+// headers. Throws an Error on any non-2xx answer.
+//
+// Why it digs the message out of the error body instead of throwing the status
+// code: this server answers a refusal with a sentence meant for the user —
+// "codex is not installed on this machine", "transcript missing — restore the
+// session first" — and that sentence is the whole value of the failure. Losing
+// it left the UI saying "HTTP 409", which explains nothing. The body is tried
+// as JSON and any of error / detail / status is accepted; if the body is not
+// JSON at all the status-code message survives as the fallback.
 async function fetchJson(url, opts){
   const r = await fetch(url, opts);
   if(!r.ok){
@@ -109,14 +263,47 @@ async function fetchJson(url, opts){
   }
   return r.json();
 }
+// Flash one line in the strip at the bottom of the window for ~1.6 seconds.
+// Used for every confirmation and every failure, so no action is ever silent.
+// Writes textContent, never innerHTML: server messages are shown verbatim.
 function toast(msg){ const t=$('#toast'); t.textContent=msg; t.style.opacity='1'; setTimeout(()=>t.style.opacity='0',1600); }
+// Hide the shared dialog. Also reachable from the backdrop click and Escape.
 function closeModal(){ $('#modal').classList.add('hidden'); }
+// Show the shared dialog with plain text in the body. textContent, so the text
+// is displayed exactly as it came, markup and all. Currently unused by the
+// page itself but kept as the safe counterpart to the Markdown version below.
 function openModal(title, body){ $('#modalTitle').textContent=title; $('#modalBody').textContent=body; $('#modal').classList.remove('hidden'); }
+// Show the shared dialog with a Markdown body — the reasoning trail. The text
+// goes through mdToHtml(), which escapes everything before adding any markup.
+// Scroll is reset to the top so a second, shorter trail does not open midway.
 function openModalMd(title, md){ $('#modalTitle').textContent=title; $('#modalBody').innerHTML=mdToHtml(md); $('#modal').classList.remove('hidden'); $('#modalBody').scrollTop=0; }
 
+// esc(): turn an arbitrary string into something safe to drop into HTML.
+// The five replacements cover both places a value can land: between tags
+// (& < >) and inside a quoted attribute (" and '), which is why single quotes
+// are escaped too — several card attributes use double quotes around values
+// that could themselves contain quotes. A null or undefined becomes ''.
 // Escapes for BOTH text and attribute contexts — every dynamic string that goes
 // through innerHTML must pass through here (transcript content is untrusted).
 function esc(s){ return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+// A deliberately tiny Markdown renderer for the reasoning trails and handoff
+// primers written by the Python side. It handles exactly what those files use:
+// "# " and "## " headings, "> " blockquotes, "- " bullet lists, "---" rules,
+// and inline code / bold / italic. Anything else becomes a paragraph.
+//
+// It is line-based: each line is classified by one small regular expression,
+// and `inList` tracks whether a list is currently open so it can be closed the
+// moment a non-bullet line arrives (flush() does that). Returns an HTML string.
+//
+// Reading the tests below: /^## / means "starts with two hashes and a space",
+// /^>( |$)/ means "starts with a greater-than sign followed by a space or by
+// nothing at all" (a bare '>' is the blank line of a blockquote), and
+// /^---/ means "starts with three hyphens".
+//
+// The inline pass runs esc() FIRST and only then looks for backticks and
+// asterisks, so a literal '<' in the prose can never become a tag, while the
+// markup this function itself adds is never escaped. See the note inside about
+// why the raw line is sliced before escaping.
 function mdToHtml(md){
   const out=[]; let inList=false;
   // Slice the RAW line by the marker, escape AFTERWARDS: slicing the escaped
@@ -139,6 +326,11 @@ function mdToHtml(md){
   return out.join('');
 }
 
+// Short form for a token count: 1234 -> '1.2K', 3400000 -> '3.4M'. A "token"
+// is the unit models read and write text in — roughly four characters of
+// English — and every request is billed per token, so these counts are the raw
+// measure of how much work a session did. Raw numbers below 1000 are shown
+// as-is; the exact figure is always available in the tooltip built by fmtCost().
 function humanTokens(n){
   n = n||0;
   if(n>=1e9) return (n/1e9).toFixed(1)+'B';
@@ -146,6 +338,21 @@ function humanTokens(n){
   if(n>=1e3) return (n/1e3).toFixed(1)+'K';
   return ''+n;
 }
+// Build the small grey "12.3K tok  $0.42" line in a card's top-right corner
+// from the row's cost object, and return it as an HTML fragment.
+//
+// The object has four token counts and an optional usd figure. The four are
+// added together for display: input (what was sent to the model), output (what
+// it wrote), and the two cache counters — vendors let a CLI re-send the
+// unchanged start of a long conversation from their own cache, which is far
+// cheaper than sending it again. The tooltip breaks the four out.
+//
+// The dollar amount is colour-coded by size (red over $1, amber over 10 cents)
+// and shown to four decimals when it is under a cent, so a tiny session does
+// not read as "$0.00". `notional` is the important flag: under a flat-rate
+// subscription nothing is billed per session, so the figure is the public
+// list-price equivalent and is prefixed with ≈ and a tooltip that says so.
+// Returns '' when the row has no cost data at all.
 function fmtCost(c){
   if(c==null || typeof c !== 'object') return '';
   const v = c.usd;
@@ -168,6 +375,15 @@ function fmtCost(c){
   return out;
 }
 
+// Bucket the rows the server returned into the four date headings the list
+// shows. The server already sorted them newest first, so each bucket stays
+// sorted and the four are emitted in their fixed order.
+//
+// The Today test is deliberately two-part: less than 24 hours old AND the same
+// calendar day number as now. Age alone would call 23:00 yesterday "Today"
+// when it is 09:00; the day check keeps the heading honest, and the plain age
+// comparison then handles Yesterday and This week. Times are the browser's
+// local clock here — this is a human-readable grouping, not a query.
 function group(sessions){
   const now=new Date(), groups={Today:[],Yesterday:[],'This week':[],Older:[]};
   for(const s of sessions){
@@ -180,12 +396,51 @@ function group(sessions){
   return groups;
 }
 
+// One small pill of text. `cls` is a Tailwind class string chosen by the
+// caller (SOURCE_COLORS, ARCHIVED_CLS, or a literal) and is trusted; `text` is
+// data and is escaped.
 function badge(text, cls){ return `<span class="px-2 py-0.5 rounded-md text-xs border ${cls}">${esc(text)}</span>`; }
 
+// Build the HTML for one session card. `s` is a row as /api/sessions returns
+// it; `idx` is its position in the flat, top-to-bottom order, stored in
+// data-idx so the j/k keyboard cursor can address cards by number.
+//
+// What a card shows: a status dot (amber = archived, green = still running,
+// indigo = has an enrichment summary, grey = plain), the title or the opening
+// words of the first message, the token/cost line, the CLI badge, then a row of
+// small facts (project folder, session type, outcome, turn count, model, time),
+// a two-line summary, clickable topic tags, and the action buttons.
+//
+// The primary button is the interesting part, and it has three shapes:
+//  * live session, its CLI installed here -> Resume, which copies the command
+//    that reopens the conversation;
+//  * live session, CLI NOT installed here -> the same button, disabled, saying
+//    so. The registry is often carried between machines, so a row can name a
+//    CLI this laptop does not have; handing back a command that dies with
+//    "command not found" after the user has switched terminals is worse than
+//    refusing up front. Whether a CLI is installed comes from /api/sources,
+//    cached in STATE.sources; if that call failed everything is treated as
+//    installed, so a hiccup never disables the whole UI.
+//  * archived session -> there is no transcript file for Resume to open, so
+//    Restore takes its place when a raw copy of the transcript still exists in
+//    the reasoning archive. Restorability is decided per ROW by the server, not
+//    per source: an adapter refuses a recorded path that is outside its own
+//    tree, so a row copied from another machine shows the truth instead of a
+//    Restore button that fails. When it is not restorable the button is
+//    disabled and restore_blocker says which of the two reasons applies —
+//    no raw copy at all, or a copy that this source cannot put back.
+//
+// Everything interpolated goes through esc(), and every button carries
+// data-act / data-sid for the single delegated click listener further down.
 function renderCard(s, idx){
+  // Status dot, first match wins: archived, still running right now, has an
+  // enrichment summary, plain. It is the only at-a-glance signal on the card.
   const dot = s.archived ? 'bg-amber-500' : s.is_active ? 'bg-emerald-500' : (s.summary ? 'bg-indigo-500' : 'bg-slate-400');
   const srcCls = SOURCE_COLORS[s.cli_source] || 'bg-slate-500/15 text-slate-400 border-slate-500/30';
   const sid = esc(s.session_id);
+  // At most four topic tags, each a button that jumps to that topic filter.
+  // Both the label and the data attribute are escaped: topics are derived from
+  // the conversation, so they are data, not markup this page authored.
   const topics = (s.topics||[]).slice(0,4).map(t=>`<button data-act="topic" data-topic="${esc(t)}" class="px-2 py-0.5 rounded-md text-xs bg-slate-200 dark:bg-slate-800 hover:bg-indigo-500/20">#${esc(t)}</button>`).join(' ');
   const reasoningBtn = s.has_reasoning
     ? `<button data-act="reasoning" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-violet-600/90 hover:bg-violet-500 text-white">🧠 Reasoning</button>` : '';
@@ -233,6 +488,13 @@ function renderCard(s, idx){
   </div>`;
 }
 
+// ONE click listener for the whole document, rather than a handler attached to
+// each button. Cards are rebuilt from scratch on every filter change, so
+// per-button listeners would have to be re-attached constantly; a single
+// listener on the document survives every re-render. closest() walks up from
+// whatever was actually clicked (often an emoji or a span inside the button)
+// to the nearest element carrying data-act, and that attribute names the
+// action while data-sid carries the session id.
 // Single delegated handler for every dynamically-rendered button. Inline
 // onclick="...(‘${data}’)" string-building was an XSS vector — session titles,
 // topics, and folder names come from transcripts and are untrusted.
@@ -255,9 +517,26 @@ document.addEventListener('click', e => {
   }
 });
 
+// How many filters are currently narrowing the list — the four inputs that
+// have a value, plus the source pill when it is not 'all'. Used only to word
+// the empty-state message correctly. The search MODE select is not counted:
+// it changes how matching works, not whether anything is excluded.
 function activeFilters(){
   return ['search','folder','topic','days'].filter(id => $('#'+id).value).length + (STATE.source!=='all' ? 1 : 0);
 }
+// Redraw the session list from STATE.sessions. Called after every successful
+// load; touches #list and #empty only.
+//
+// Order of business: reset the keyboard cursor, bucket the rows by date, warn
+// if the server capped the page, then emit one section per non-empty bucket
+// with its heading and count. Cards are numbered across ALL sections so the
+// j/k cursor walks the visible order rather than restarting per group.
+//
+// The truncation notice comes from the X-Result-Truncated header the list
+// loader stored: the server returns at most one page of rows, and without a
+// visible marker the header could claim 602 sessions while the list held 500,
+// leaving the oldest 102 — exactly the ones the archive exists to protect —
+// unreachable from the UI.
 function render(){
   STATE.kbIndex = -1;                       // DOM order changed; a stale index resumed the wrong card
   const groups = group(STATE.sessions);
@@ -284,6 +563,16 @@ function render(){
   empty.classList.toggle('hidden', STATE.sessions.length>0);
 }
 
+// Resume: ask GET /api/sessions/<id>/resume for the command that reopens this
+// conversation in its own CLI, and copy it to the clipboard.
+//
+// The command is not run here — the browser cannot start a terminal program,
+// and should not. The server answers with `cr <id>`, a small shell helper this
+// project installs, which carries the session's memory into whatever directory
+// you paste it in and then resumes. A refusal (archived row, CLI not installed,
+// source disabled in config) comes back as a 409 with an explanatory message,
+// which is shown as-is. fetch is used directly rather than fetchJson() because
+// both outcomes need the parsed body.
 async function resume(id){
   const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/resume`);
   const r = await res.json().catch(()=>({}));
@@ -291,6 +580,18 @@ async function resume(id){
   await navigator.clipboard.writeText(r.command);
   toast(`Copied "${r.command}" — run it in the directory where you want to resume`);
 }
+// Restore an archived session: POST /api/sessions/<id>/restore copies the
+// newest raw copy of the transcript out of the reasoning archive back to where
+// the CLI expects to find it, then re-indexes the row.
+//
+// Three outcomes are reported distinctly, because they mean different things
+// to the user: fully restored (Resume works again); restored in the browser but
+// the CLI refused to re-import it (OpenCode keeps sessions in a database, so a
+// file on disk is not enough there); or the row was already live and only
+// needed re-indexing.
+//
+// Afterwards both loaders are re-run: the row has just moved from the Archived
+// scope to the live one, so the counts, the pills and the list all change.
 async function restoreSession(id){
   // POST + custom header, like bridge: this writes into the CLI's session tree.
   const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/restore`,
@@ -302,12 +603,23 @@ async function restoreSession(id){
                               : 'Already live — re-indexed');
   await loadMeta(); await applyFilters();          // the card moves to Sessions
 }
+// Open the session's decision trail in the modal. GET
+// /api/sessions/<id>/reasoning answers with a Markdown document extracted from
+// the transcript: the assistant's own recorded thinking, i.e. WHY it made each
+// call, not just what it did. Not every session has one (the extractor runs
+// nightly, and some CLIs record no thinking at all), so a 404 here is normal
+// and is reported as a toast rather than an error.
 async function showReasoning(id){
   try{
     const r = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/reasoning`);
     openModalMd('🧠 Decision trail', r.markdown || '(no reasoning captured)');
   }catch(e){ toast('No reasoning available'); }
 }
+// Copy Context: GET /api/sessions/<id>/context builds a Markdown briefing
+// about the session (what it was for, what was decided, what is still open)
+// and this puts it on the clipboard, ready to paste as the opening message of
+// a fresh conversation anywhere. The server redacts secrets while building it,
+// because this text is about to leave the tool.
 async function copyContext(id){
   try{
     const r = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/context`);
@@ -315,13 +627,28 @@ async function copyContext(id){
     toast('Context copied — paste into another session to carry it over');
   }catch(e){ toast('Could not build context'); }
 }
+// Export: the same briefing as Copy Context, but saved as a file. The download
+// flag makes the server answer with an attachment header instead of JSON, and
+// navigating to that URL is all it takes — no fetch, no Blob, and the server
+// gets to choose the filename.
 function exportContext(id){
   // triggers a browser download of the context .md
   window.location = `/api/sessions/${encodeURIComponent(id)}/context?download=1`;
   toast('Downloading context file…');
 }
 
+// "Bridging" means continuing a session in a DIFFERENT CLI. No CLI can resume
+// another's session, so instead the server writes a primer file — a briefing
+// with the goal, decisions and open threads — and hands back the command that
+// opens a fresh session in the target CLI seeded with it.
+//
+// BRIDGE_TARGETS is every CLI this page knows how to bridge to, in a fixed
+// order. It is only the fallback list: normally the targets come from
+// /api/sources so that only CLIs actually present on this machine are offered.
 const BRIDGE_TARGETS = ['claude','copilot','codex','opencode'];   // fallback when /api/sources is unavailable
+// The bridge targets to offer for a card: every installed CLI except the one
+// the session already belongs to (bridging a session to its own CLI would just
+// be a worse Resume).
 function bridgeTargets(source){
   // Only CLIs installed on THIS machine: a handoff command for an absent one
   // dies with "command not found" after the user has already switched terminals.
@@ -330,6 +657,10 @@ function bridgeTargets(source){
     : BRIDGE_TARGETS;
   return known.filter(t => t !== source);
 }
+// Show or hide the little "→ claude codex opencode" chooser next to a card's
+// Bridge button. The menu lives in a per-card span with the id brmenu-<sid>;
+// non-empty markup means it is open, so clicking Bridge again just clears it.
+// When no other CLI is installed the menu says so rather than appearing empty.
 function toggleBridge(id, source){
   const menu = document.getElementById('brmenu-'+id);
   if(menu.innerHTML){ menu.innerHTML=''; return; }   // toggle off
@@ -339,6 +670,19 @@ function toggleBridge(id, source){
       ? targets.map(t => `<button data-act="bridge-to" data-sid="${esc(id)}" data-target="${esc(t)}" class="text-xs px-2 py-1 rounded-md border border-teal-500/40 hover:bg-teal-500/20">${esc(t)}</button>`).join('')
       : `<span class="text-xs text-slate-400 self-center">no other CLI installed here</span>`);
 }
+// Build the handoff: POST /api/sessions/<id>/bridge with the chosen target.
+// The server writes the primer file, redacts it and answers with the command
+// to run, the primer text and the path it was written to.
+//
+// The result is stashed on the window object because the modal's two buttons
+// (copy the command, download the primer) are dispatched by the same delegated
+// click listener as everything else and therefore receive no arguments — the
+// stash is how they find the current bridge. Only one bridge panel can be open
+// at a time, so a single slot is enough.
+//
+// The modal is filled here rather than through openModalMd() because the body
+// is mixed content: an explanatory line, the command in a preformatted block,
+// two buttons, and the rendered primer folded away inside a details element.
 async function doBridge(id, target){
   const menu = document.getElementById('brmenu-'+id);
   menu.innerHTML='';
@@ -363,10 +707,16 @@ async function doBridge(id, target){
      </details>`;
   $('#modal').classList.remove('hidden'); $('#modalBody').scrollTop=0;
 }
+// Copy the handoff command from the open bridge panel to the clipboard.
 async function bridgeCopy(){
   await navigator.clipboard.writeText(window.__bridge.command);
   toast(`Command copied — paste in a terminal to continue in ${window.__bridge.target}`);
 }
+// Save the primer as a Markdown file. The text is already in hand from the
+// bridge response, so the download is assembled in the browser (a temporary
+// link pointing at an in-memory Blob, clicked programmatically) instead of
+// asking the server for it a second time. The object URL is released straight
+// after the click so the blob is not held for the life of the page.
 function bridgeDownload(){
   const b = window.__bridge;
   // client-side Blob: the primer is already in hand, no second request needed
@@ -375,8 +725,20 @@ function bridgeDownload(){
   a.download = b.fname; a.click(); URL.revokeObjectURL(a.href);
   toast('Downloading handoff primer…');
 }
+// Clicking a #topic tag on a card selects that topic in the filter select and
+// reloads — the tags are a shortcut into the same filter, not a second path.
 function filterTopic(t){ $('#topic').value=t; applyFilters(); }
 
+// Expand or collapse the "Thread" panel under a card: the other sessions that
+// ran in the same project directory, newest first, from GET
+// /api/sessions/<id>/thread. Useful because a single piece of work usually
+// spans several sessions across several days and CLIs.
+//
+// The panel and the button are per-card elements (thread-<sid>, thbtn-<sid>).
+// State is read from the panel's own hidden class rather than kept in STATE,
+// so several panels can be open at once and a re-render simply closes them
+// all. The button label doubles as the progress indicator: "🧵 Thread …" while
+// the request is in flight, then the sibling count once it lands.
 async function toggleThread(id){
   const box = document.getElementById('thread-'+id);
   const btn = document.getElementById('thbtn-'+id);
@@ -399,6 +761,12 @@ async function toggleThread(id){
   btn.textContent=`🧵 Thread (${sibs.length}) ▲`;
 }
 
+// One compact row inside an expanded Thread panel — a slimmed-down card: the
+// best description available (summary, else title, else the first message,
+// truncated to ~110 characters), the CLI badge, the time and turn count, and a
+// Resume button. Archived siblings get the amber badge instead of the button,
+// because their transcript is gone; restoring them is done from the Archived
+// tab, where the reason and the raw-copy check are shown.
 function renderSibling(s){
   const desc = s.summary || s.title || s.first_message || '(no description)';
   const one = desc.length>110 ? desc.slice(0,110)+'…' : desc;
@@ -417,6 +785,22 @@ function renderSibling(s){
   </div>`;
 }
 
+// Reload the session list for the current filters and tab, then re-render.
+// This is THE list loader — every control, every tab switch and the boot
+// sequence end up here.
+//
+// Only non-empty controls are added to the query string, so an untouched page
+// asks for a bare /api/sessions. The source pill and the tab are folded in the
+// same way: 'all' and 'live' are the server defaults and are simply omitted.
+//
+// It calls fetch directly rather than fetchJson() for one reason: the two
+// truncation facts arrive as RESPONSE HEADERS, not in the JSON body. The
+// server returns at most one page of rows and sets X-Result-Truncated with
+// X-Result-Total when there were more, which render() turns into the "showing
+// the N most recent of M" notice. The error path here mirrors fetchJson()'s
+// so the server's own message still reaches the user, and it leaves the page
+// in a usable state — an empty list plus a visible reason — rather than
+// throwing into the caller.
 async function applyFilters(){
   const p = new URLSearchParams();
   if($('#search').value) p.set('search',$('#search').value);
@@ -441,10 +825,31 @@ async function applyFilters(){
   render();
 }
 
+// Refresh everything AROUND the list: the counts line, the archived count on
+// its tab button, the source pills and the two filter selects.
+//
+// Split in two so that the error handling lives in one place: the inner
+// function makes four or five requests in sequence and any of them may fail,
+// and a failure must degrade the chrome (a message in the counts line) rather
+// than abort the page load — the list itself can still be perfectly usable.
 async function loadMeta(){
   try { await loadMetaInner(); }
   catch(e){ $('#stats').textContent = `Could not load stats: ${e.message}`; toast(`Could not load stats: ${e.message}`); }
 }
+// The actual work of loadMeta(). In order:
+//  * /api/sources once per page load and cached in STATE, since which CLIs are
+//    installed cannot change while the page is open. A failure leaves it null,
+//    which every reader treats as "assume everything is available".
+//  * /api/stats scoped to the current tab, so the pills count the rows the
+//    list beneath them will actually show. The archived total is separate and
+//    always global — that is what the tab button displays.
+//  * the billing note, appended only under a flat-rate plan, so the costs shown
+//    elsewhere are never mistaken for money actually charged.
+//  * the pills, rebuilt from scratch with 'All' first; each one sets the source
+//    and reloads both halves of the page.
+//  * the folder and topic selects, from their own endpoints. Both are rebuilt
+//    wholesale, which resets the select to "All …" — this is why a tab switch
+//    that clears the filters also calls this.
 async function loadMetaInner(){
   if(!STATE.sources){ try { STATE.sources = await fetchJson('/api/sources'); } catch(e) { STATE.sources = null; } }
   const stats = await fetchJson('/api/stats?state='+STATE.state);
@@ -455,6 +860,9 @@ async function loadMetaInner(){
   }
   $('#stats').textContent = line;
   const pills=$('#pills'); pills.innerHTML='';
+  // 'All' first with the grand total, then one pill per CLI that actually has
+  // rows in this scope — a CLI you have never used simply never appears. Each
+  // entry is key, label, count; for a CLI the key doubles as the label.
   const sources = [['all','All',stats.total], ...Object.entries(stats.by_source).map(([k,v])=>[k,k,v])];
   for(const [key,label,count] of sources){
     const b=document.createElement('button');
@@ -470,10 +878,43 @@ async function loadMetaInner(){
 }
 
 // ---- Usage dashboard --------------------------------------------------------
+// Everything below draws the Usage tab from one request to
+// /api/stats/timeseries: headline totals, the year-long activity heatmap, and
+// bar breakdowns by model, by project and by CLI.
+// The same four CLI colours as SOURCE_COLORS, but as raw hex values instead of
+// Tailwind classes, because the legend swatches set them as an inline
+// background on a plain span. Unknown sources fall back to neutral slate.
 const SRC_HEX = { claude:'#f97316', copilot:'#0ea5e9', codex:'#10b981', opencode:'#8b5cf6' };
+// Dollars for display: cents matter on small numbers, but "1,234.56" is noise
+// next to a bar chart, so anything from 100 up is rounded to whole dollars.
 function money(v){ return (v>=100? v.toFixed(0) : v.toFixed(2)); }
+// Tooltip text for an abbreviated token count — the exact number with thousands
+// separators, since humanTokens() has already thrown the precision away.
 function tokTip(n){ return (n||0).toLocaleString()+' tokens'; }
 
+// The GitHub-style activity chart: one small square per day for the last year,
+// 53 columns of 7 rows, shaded by how many sessions ran that day. `perDay` is
+// the server's per-day array — one entry per day that had activity, with the
+// date as a plain 'YYYY-MM-DD' string. Returns an SVG element as a string.
+//
+// Intensity is relative, not absolute: the busiest day in the window defines
+// the darkest shade and everything else is scaled against it, so the chart
+// stays readable whether you run two sessions a week or fifty. Days with no
+// activity get level 0; any day with at least one session gets at least level
+// 1, because rounding a quiet day down to "empty" would hide it entirely.
+//
+// Each square carries a title element, which browsers show as a tooltip —
+// that is the whole interaction model here, no JavaScript hover handling.
+//
+// Colour is applied as a CSS class (hm0 … hm4) and never as an inline fill
+// attribute. The class carries a light and a dark rule from the stylesheet in
+// the page head, so the theme toggle recolours the whole chart instantly; an
+// inline fill would be baked into the SVG at render time, and since the toggle
+// never re-renders anything, the empty squares stayed dark navy in light mode.
+// A test asserts that no inline dark fill comes back from here.
+//
+// The two notes inside are the load-bearing ones: read them before changing
+// the date arithmetic or the way the cells are coloured.
 function heatmap(perDay){
   // GitHub-style: 53 weeks x 7 days, colored by session count.
   const byDay = {}; let max = 1;
@@ -500,6 +941,13 @@ function heatmap(perDay){
   return `<svg viewBox="0 0 690 95" class="w-full" style="max-width:690px">${cells.join('')}</svg>`;
 }
 
+// A list of horizontal bars, used for both the by-model and the by-project
+// breakdowns. `rows` are the server's aggregates, `keyName` says which field
+// holds the label ('model' or 'project'), and `max` is the largest cost in the
+// set — bars are scaled against it, with a 2% floor so a near-zero row is still
+// a visible sliver rather than nothing at all. The bar length tracks cost while
+// the number on the right is the token count, so an expensive-but-short session
+// stands out from a long cheap one.
 function barRows(rows, keyName, max){
   return rows.map(r => {
     const pct = max? Math.max(2, (r.cost/max)*100) : 2;
@@ -514,7 +962,25 @@ function barRows(rows, keyName, max){
   }).join('');
 }
 
+// Are the dollar figures notional? Under a flat-rate subscription the tokens
+// are real but nothing is billed per session, so every amount is the public
+// list-price equivalent and is printed with a ≈ in front. Set from the API
+// answer before anything is drawn, and read by the small builders above, which
+// run too deep in the string-building to be handed it as an argument.
+// It starts true so that an unanswered request can only ever understate a
+// claim about your money.
 let NOTIONAL = true;
+// Draw the whole Usage tab in one pass. GET /api/stats/timeseries returns every
+// aggregate at once — per-day counts, per-model, per-project and per-source
+// rollups, all-time totals and this calendar month's cost — so the dashboard is
+// a single request and a single innerHTML assignment into #statsView.
+//
+// A "Loading usage…" placeholder goes in first, because the aggregation can
+// take a moment on a large registry. A failure replaces it with a plain line
+// rather than throwing, so the tab is never left showing a stale dashboard.
+//
+// The wording of the headline note changes with NOTIONAL: on a flat plan it
+// says outright that the number is an intensity signal and not money paid.
 async function renderStats(){
   const v = $('#statsView');
   v.innerHTML = '<div class="text-center text-slate-500 py-16">Loading usage…</div>';
@@ -560,12 +1026,31 @@ async function renderStats(){
         </div>`).join('')}</div>
     </div>`;
 }
+// One of the four summary boxes at the top of the Usage tab: a large value and
+// a small caption underneath. `accent` paints the big number amber, which the
+// two money tiles use — their caption is what identifies them, since the
+// figure itself is already the headline.
 function statTile(big, small, accent){
   return `<div class="rounded-xl border border-slate-200 dark:border-slate-800 p-4 bg-white dark:bg-slate-900">
     <div class="text-2xl font-bold ${accent?'text-amber-500':''}">${esc(big)}</div>
     <div class="text-xs text-slate-500 mt-1">${esc(small)}</div>
   </div>`;
 }
+// Switch tabs. `which` is 'sessions', 'archived' or 'stats' — the only place
+// STATE.state changes, and the only place the two views are shown or hidden.
+//
+// Sessions and Archived share one view and differ only in scope, so moving
+// between them also resets the filters and the source pill. That is deliberate:
+// a tab switch is a change of scope, not a refinement. A folder or a CLI that
+// exists among live sessions may have no archived rows at all, and an
+// invisible leftover filter produced the worst possible result — a tab button
+// advertising 40 archived sessions above a page saying there were none.
+//
+// Usage looks like a third tab but is a different view; it leaves
+// STATE.state alone, and both branches call the meta loader. Usage needs it
+// too: the counts line and the source pills stay on screen above the
+// dashboard, and without the refresh they would still show the previous tab's
+// scope — archived counts sitting next to all-time usage totals.
 function showTab(which){
   const stats = which==='stats';
   const next = which==='archived' ? 'archived' : 'live';
@@ -588,16 +1073,40 @@ function showTab(which){
   // keep showing the previous tab's (e.g. Archived) scope next to live totals.
   if(stats){ loadMeta(); renderStats(); } else { loadMeta(); applyFilters(); }
 }
+// ---- wiring: the fixed controls in the header and the filter bar ------------
+// The three tab buttons. Their highlighted/plain styling is set inside
+// showTab(), so these only have to name the tab.
 $('#tabSessions').onclick = ()=>showTab('sessions');
 $('#tabArchived').onclick = ()=>showTab('archived');
 $('#tabStats').onclick = ()=>showTab('stats');
 
+// Typing in the search box reloads the list, but only once the user pauses for
+// 280ms: every keystroke would otherwise fire a query, and in semantic mode
+// each one costs a vector search. Each keystroke cancels the previous timer.
 // debounced search
 let deb; $('#search').addEventListener('input',()=>{ clearTimeout(deb); deb=setTimeout(applyFilters,280); });
+// The four select boxes have nothing to debounce — one change, one reload.
+// Note 'mode' is here too: switching between keyword, semantic and full-text
+// re-runs the current search text under the new matcher.
 ['folder','topic','days','mode'].forEach(id=>$('#'+id).addEventListener('change',applyFilters));
+// Refresh re-reads both halves of the page: the surrounding counts and the
+// list. Nothing on this page polls, so this is how a session that has just
+// ended in a terminal appears.
 $('#refresh').onclick=()=>{ loadMeta(); applyFilters(); };
+// Theme: one class on the root element, which every dark: utility keys off.
+// Nothing is persisted, so a reload returns to the dark default the markup
+// ships with, and nothing has to be re-rendered for the switch to take effect.
 $('#darkToggle').onclick=()=>document.documentElement.classList.toggle('dark');
 
+// Keyboard shortcuts, on the document so they work wherever focus is:
+//   /         focus the search box
+//   j / k     move the card cursor down / up, scrolling it into view
+//   r         resume the card the cursor is on
+//   Escape    close the modal, or step out of a focused input
+// The first test bails out while an input or select has focus, so typing a "j"
+// into the search box does not move the list underneath — except for Escape,
+// which is how you leave the field. The cursor is a class on the card plus an
+// index in STATE, reset by every re-render because the DOM order changed.
 // keyboard nav
 document.addEventListener('keydown',e=>{
   if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)){ if(e.key==='Escape')e.target.blur(); return; }
@@ -611,6 +1120,10 @@ document.addEventListener('keydown',e=>{
   else if(e.key==='Escape'){ closeModal(); }
 });
 
+// Boot. The order matters: the meta load fills the folder and topic selects and
+// caches /api/sources, and the list render needs that cache to decide whether
+// each card's Resume button should be enabled. If even this fails there is
+// nothing left to show, so it is reported as a toast and the page stops.
 loadMeta().then(applyFilters).catch(e => toast(`Could not start: ${e.message}`));
 </script>
 </body>
