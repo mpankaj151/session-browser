@@ -648,6 +648,300 @@ def test_enrich_driver_skips_cleanly_when_auto_finds_no_cli():
     print("  ok  enrich driver: auto with no CLI exits 0 (skip); explicit missing binary exits 1")
 
 
+# --- empty transcripts are not enrichment candidates -------------------------
+def test_select_sessions_skips_rows_with_no_turns():
+    """A live row with turn_count = 0 (a session opened and closed at once) has
+    nothing to summarise. Selecting it every night and then skipping it in the
+    loop made the nightly log read "4 sessions to enrich ... Enriched 0/4" with
+    no reason, forever."""
+    es = _load_script("enrich-sessions")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="empty", turn_count=0, first_message=""), conn=conn)
+        indexer.upsert(_header(sid="real", turn_count=3), conn=conn)
+        got = [r["session_id"] for r in es._select_sessions(conn, None, False)]
+        assert got == ["real"], got
+        # the hook fast path on the empty row is a no-op too
+        assert es._select_sessions(conn, "empty", force=False) == []
+        # --force still respects it: there is nothing to summarise either way
+        assert [r["session_id"] for r in es._select_sessions(conn, None, True)] == ["real"]
+    finally:
+        conn.close()
+    print("  ok  enrichment never selects a row with no turns")
+
+
+# --- MCP list_recent: window cutoff uses the transcript timestamp spelling ---
+def test_mcp_list_recent_window_does_not_leak_the_cutoff_day():
+    """last_activity is stored as 'YYYY-MM-DDTHH:MM:SS.mmmZ'. SQLite's
+    datetime('now', '-7 days') yields 'YYYY-MM-DD HH:MM:SS', and 'T' sorts
+    above ' ', so every row from the cutoff DAY compared >= the cutoff even
+    when it was hours earlier — the same leak app.py's days filter fixed."""
+    import os
+    tmp = tempfile.mkdtemp(prefix="sb-mcp-")
+    db = str(Path(tmp) / "r.db")
+    os.environ["SESSION_MEMORY_DB"] = db
+    try:
+        conn = indexer.connect(db)
+        try:
+            row = conn.execute(
+                "SELECT strftime('%Y-%m-%dT00:00:00.000Z','now','-7 days') AS edge, "
+                "strftime('%Y-%m-%dT%H:%M:%S.000Z','now','-6 days') AS inside").fetchone()
+            indexer.upsert(_header(sid="edge", last_activity=row["edge"]), conn=conn)
+            indexer.upsert(_header(sid="inside", last_activity=row["inside"]), conn=conn)
+            conn.commit()
+        finally:
+            conn.close()
+        srv_dir = _REPO / "mcp" / "session-memory"
+        sys.path.insert(0, str(srv_dir))
+        spec = _ilu.spec_from_file_location("sb_mcp_server", srv_dir / "server.py")
+        srv = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(srv)
+        srv.common.DB_PATH = db
+        got = [r["session_id"] for r in srv.list_recent(days=7)]
+        assert got == ["inside"], got
+    finally:
+        os.environ.pop("SESSION_MEMORY_DB", None)
+    print("  ok  MCP list_recent: the cutoff day is not leaked into the window")
+
+
+# ===== final review: enrichment pipeline =====================================
+def test_enrich_driver_exits_nonzero_when_the_provider_fails():
+    """A broken provider (expired credential, exhausted quota) tripped the
+    circuit breaker and the driver still exited 0 — refresh-all reported a
+    green night with zero summaries. Failures now count and the run exits 1;
+    the auto-with-no-CLI skip stays exit 0."""
+    import os
+    import subprocess
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import test_smoke as T
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        bins = tmp / "bins"
+        bins.mkdir()
+        (bins / "claude").write_text("#!/bin/sh\necho 'Credit balance too low' >&2\nexit 1\n")
+        (bins / "claude").chmod(0o755)
+        proj = tmp / ".claude" / "projects" / "-Users-x-proj"
+        proj.mkdir(parents=True)
+        sid = "aaaaaaaa-0000-4000-8000-00000000f001"
+        (proj / f"{sid}.jsonl").write_text(T._cl_transcript("summarise me", cwd="/Users/x/proj"))
+        db = tmp / "r.db"
+        conn = indexer.connect(db)
+        indexer.upsert(_header(sid=sid, project_path=str(proj), turn_count=2), conn=conn)
+        conn.commit()
+        conn.close()
+        (tmp / "auto.toml").write_text('[enrichment]\nprovider = "auto"\n')
+        env = {**os.environ, "PATH": f"{bins}:/usr/bin:/bin", "HOME": str(tmp), "SB_DB": str(db),
+               "SB_CONFIG": str(tmp / "auto.toml")}
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        p = subprocess.run([sys.executable, str(_REPO / "scripts" / "enrich-sessions.py"), "--rate-limit", "0"],
+                           env=env, capture_output=True, text=True, timeout=120)
+        assert p.returncode == 1, (p.returncode, p.stdout, p.stderr)
+        assert "1 failed" in p.stdout, p.stdout
+    print("  ok  enrich driver: provider failures make the run exit non-zero")
+
+
+def test_select_sessions_keeps_slash_command_only_sessions():
+    """turn_count counts TYPED user turns; a /init-only session has none yet
+    holds real assistant work (tokens, model). The 'nothing to summarise'
+    gate must use the indexer's own vocabulary — turns, a first message, or
+    output tokens — not turn_count alone."""
+    es = _load_script("enrich-sessions")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="empty", turn_count=0, first_message=""), conn=conn)
+        indexer.upsert(_header(sid="init-only", turn_count=0, first_message=""), conn=conn)
+        conn.execute("UPDATE sessions SET output_tokens=500, model_used='claude-sonnet-5' WHERE session_id='init-only'")
+        indexer.upsert(_header(sid="typed", turn_count=3), conn=conn)
+        got = sorted(r["session_id"] for r in es._select_sessions(conn, None, False))
+        assert got == ["init-only", "typed"], got
+    finally:
+        conn.close()
+    print("  ok  enrichment selects slash-command-only sessions that did real work")
+
+
+def test_stale_predicate_treats_an_empty_summary_as_unenriched():
+    """summary = '' (a facet whose brief_summary came back empty) was
+    'enriched' to the selector and 'unenriched' to report-data, so the work
+    journal's heal-then-recheck loop never converged."""
+    es = _load_script("enrich-sessions")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="blank"), conn=conn)
+        conn.execute("UPDATE sessions SET summary='', enriched_at='2026-06-02T00:00:00.000Z' WHERE session_id='blank'")
+        assert [r["session_id"] for r in es._select_sessions(conn, None, False)] == ["blank"]
+    finally:
+        conn.close()
+    print("  ok  stale predicate: an empty summary counts as not enriched")
+
+
+def test_parse_facet_json_tolerates_trailing_prose_and_coerces_enums():
+    """The single most common LLM output shape — the JSON object followed by a
+    sentence of prose, or a fence and then prose — was a FacetValidationError
+    (five of them trip the breaker). Off-enum session_type/outcome values
+    fragment every histogram; they are coerced to 'other' / 'unknown'."""
+    base = {"brief_summary": "Fixed it.", "goal_categories": ["python"],
+            "session_type": "bugfix", "outcome": "success"}
+    body = json.dumps(base)
+    shapes = {
+        "trailing prose": body + "\n\nLet me know if you want more detail.",
+        "fenced + prose": "```json\n" + body + "\n```\nHope this helps!",
+        "preamble with a brace": "Here is the {summary} you asked for:\n" + body,
+        "fence, then a non-fence tail": "```json\n" + body + "\n```\nDone.",
+    }
+    for label, raw in shapes.items():
+        facet = parse_facet_json(raw, "test", "m")
+        assert facet["brief_summary"] == "Fixed it.", (label, facet)
+        assert facet["session_type"] == "other" and facet["outcome"] == "unknown", (label, facet)
+    ok = parse_facet_json(json.dumps({**base, "session_type": "debugging", "outcome": "partial"}), "test")
+    assert ok["session_type"] == "debugging" and ok["outcome"] == "partial"
+    print("  ok  parse_facet_json: trailing prose tolerated, enums coerced")
+
+
+def test_incremental_slice_is_bounded_like_the_full_one():
+    """Re-enrichment returned turns[prior_seen:] unbounded while render_prompt
+    caps at 60: a session resumed for 200 turns showed the model the FIRST 60
+    new turns, dropped the tail (the outcome) and then marked all 200 seen."""
+    es = _load_script("enrich-sessions")
+    turns = [SimpleNamespace(role="user", content=f"t{i}") for i in range(300)]
+    sliced, prior = es._slice_turns(turns, {"brief_summary": "x"}, 100)
+    assert prior is not None and len(sliced) <= 60, len(sliced)
+    assert sliced[-1].content == "t299" and sliced[0].content == "t100", (sliced[0].content, sliced[-1].content)
+    print("  ok  incremental re-enrichment keeps head + tail of the new turns")
+
+
+def test_headless_providers_record_the_summariser_model():
+    """_meta.model recorded the ENRICHED session's model, so a session run on
+    Opus summarised by pinned Sonnet claimed Opus — enrichment spend was
+    unauditable on the two most common providers."""
+    import subprocess as sp
+    from enrichment.claude_headless import ClaudeHeadless
+    from enrichment.copilot_headless import CopilotHeadless
+    facet = json.dumps({"brief_summary": "Done.", "goal_categories": {}, "session_type": "other", "outcome": "unknown"})
+    real = sp.run
+    sp.run = lambda *a, **k: SimpleNamespace(returncode=0, stdout=facet, stderr="")
+    try:
+        c = ClaudeHeadless({"model": "claude-sonnet-5"}).summarize([SimpleNamespace(role="user", content="hi")], "claude", "claude-opus-5", "/x")
+        assert c["_meta"]["model"] == "claude-sonnet-5", c["_meta"]
+        assert "enrich_cost_usd" in c["_meta"] and c["_meta"]["enrich_cost_usd"] is None, c["_meta"]
+        p = CopilotHeadless({}).summarize([SimpleNamespace(role="user", content="hi")], "copilot", "gpt-5.4", "/x")
+        assert p["_meta"]["model"] in ("", None), p["_meta"]
+    finally:
+        sp.run = real
+    print("  ok  _meta.model is the summariser's model on every provider")
+
+
+def test_copilot_timeout_is_a_short_runtime_error():
+    """subprocess.TimeoutExpired.__str__ interpolates the argv — for Copilot
+    that is the whole prompt (~120 KB). One timed-out call appended the entire
+    transcript to refresh.err.log."""
+    import subprocess as sp
+    from enrichment.copilot_headless import CopilotHeadless
+    real = sp.run
+
+    def boom(argv, **kw):
+        raise sp.TimeoutExpired(cmd=argv, timeout=kw.get("timeout", 1))
+    sp.run = boom
+    try:
+        try:
+            CopilotHeadless({"timeout_secs": 1}).summarize(
+                [SimpleNamespace(role="user", content="x" * 20000)], "copilot", "m", "/x")
+            raise AssertionError("expected a failure")
+        except RuntimeError as e:
+            assert "timed out" in str(e) and len(str(e)) < 400, len(str(e))
+    finally:
+        sp.run = real
+    print("  ok  copilot timeout -> short RuntimeError, transcript never hits the error log")
+
+
+def test_claude_headless_runs_in_a_dedicated_cwd_that_is_never_indexed():
+    """Every headless enrichment call writes an sdk-cli transcript under the cwd
+    refresh-all ran from; the only guard against indexing it was one upstream
+    field name. The call now runs in <data>/enrichment-cwd, a project dir the
+    Claude adapter refuses to index by PATH — a filesystem marker upstream
+    renames cannot break."""
+    import sbconfig
+    from enrichment.claude_headless import ClaudeHeadless
+    from sources.claude import ClaudeSource
+    cwd = ClaudeHeadless({}).run_cwd()
+    assert Path(cwd).name == "enrichment-cwd" and Path(cwd).parent == sbconfig.FACETS_DIR.parent, cwd
+    with tempfile.TemporaryDirectory() as td:
+        projects = Path(td) / "projects"
+        enc = "-" + str(cwd).strip("/").replace("/", "-")          # Claude's project-dir encoding
+        proj = projects / enc
+        proj.mkdir(parents=True)
+        f = proj / "aaaaaaaa-0000-4000-8000-00000000c0de.jsonl"
+        f.write_text("{}\n")
+        cl = ClaudeSource(projects_dir=projects)
+        assert cl.session_id_for_path(f) is None
+        assert list(cl.discover()) == []
+    print("  ok  claude-headless runs in enrichment-cwd, which the adapter never indexes")
+
+
+def test_refresh_all_embeds_after_enrichment():
+    """Embeddings are built from title/summary/first_message; running them
+    BEFORE enrichment meant semantic search was always one night behind."""
+    ra = _load_script("refresh-all")
+    labels = [label for label, _ in ra.steps(enrich=True)]
+    assert labels.index("embeddings") > labels.index("enrichment"), labels
+    assert labels[-1] == "daily digest", labels
+    labels = [label for label, _ in ra.steps(enrich=False)]
+    assert "enrichment" not in labels and "embeddings" in labels
+    print("  ok  refresh-all: embeddings run after enrichment")
+
+
+def test_embed_sessions_silences_hf_progress_noise():
+    """Loading a cached model printed a tqdm 'Loading weights' bar and a
+    FutureWarning to stderr on every nightly run, so refresh.err.log was never
+    empty and stopped being a health signal."""
+    import os
+    for k in ("HF_HUB_DISABLE_PROGRESS_BARS", "TRANSFORMERS_VERBOSITY"):
+        os.environ.pop(k, None)
+    _load_script("embed-sessions")
+    assert os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS") == "1"
+    assert os.environ.get("TRANSFORMERS_VERBOSITY") == "error"
+    assert os.environ.get("PYTHONWARNINGS", "").startswith("ignore") or "warnings" in open(_REPO / "scripts" / "embed-sessions.py").read()
+    print("  ok  embed-sessions: HF progress bars and FutureWarnings are silenced")
+
+
+def test_prompt_marks_transcript_as_untrusted_data_and_redacts_before_truncating():
+    """(a) Nothing told the model that the fenced transcript is DATA, so
+    transcript text could steer the facet — which later becomes another
+    agent's opening prompt via the bridge. (b) Each turn was truncated to 1500
+    chars BEFORE redaction, so a credential straddling the cut leaked its
+    prefix."""
+    template = _REPO / "prompts" / "summarize-multi-source.md"
+    turns = [SimpleNamespace(role="user", content="x" * 1489 + " sk-ant-" + "A" * 40 + " tail")]
+    out = render_prompt(turns, "claude", "m", "/x", template)
+    assert "untrusted" in out.lower() and "data" in out.lower(), out[:600]
+    assert "never follow" in out.lower() or "do not follow" in out.lower(), out[:900]
+    assert "sk-ant-" not in out, "credential prefix leaked past the truncation"
+    print("  ok  prompt: transcript is fenced as untrusted data; redaction precedes truncation")
+
+
+def test_facet_file_is_written_atomically():
+    """A nightly killed mid-write left truncated JSON; _load_prior then swallowed
+    the decode error and silently re-paid for a full enrichment."""
+    import os
+    es = _load_script("enrich-sessions")
+    with tempfile.TemporaryDirectory() as td:
+        dest = Path(td) / "s1.json"
+        dest.write_text('{"brief_summary": "old"}')
+        real = os.replace
+        os.replace = lambda a, b: (_ for _ in ()).throw(OSError("ENOSPC"))
+        try:
+            try:
+                es._write_facet(dest, {"brief_summary": "new" * 1000})
+            except OSError:
+                pass
+        finally:
+            os.replace = real
+        assert json.loads(dest.read_text())["brief_summary"] == "old"
+        assert not list(Path(td).glob("*.tmp"))
+        es._write_facet(dest, {"brief_summary": "new"})
+        assert json.loads(dest.read_text())["brief_summary"] == "new"
+    print("  ok  facets are written atomically")
+
+
 if __name__ == "__main__":
     print("Work-journal tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

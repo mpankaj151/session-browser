@@ -43,33 +43,47 @@ def main() -> None:
     conn = indexer.connect()
     total = 0
     for name, adapter in registry.items():
-        files = list(adapter.discover())
-        print(f"[{name}] {len(files)} files")
-        ok = err = skipped = 0
-        t0 = time.time()
-        for i, path in enumerate(files, 1):
-            try:
-                header = adapter.parse_header(path)
-                if header is None:
-                    skipped += 1  # e.g. headless sdk-cli sessions — intentionally not indexed
-                    continue
-                # Seed summary from a free title when there's no summary yet.
-                indexer.upsert(header, conn=conn)
-                # Note: we intentionally do NOT seed `summary` from the title — the
-                # title is its own column and the UI falls back to it, so leaving
-                # summary NULL lets nightly enrichment populate a real summary.
-                ok += 1
-            except Exception as e:  # noqa: BLE001
-                err += 1
-                print(f"  ! {path.name}: {e}", file=sys.stderr)
-            if i % args.commit_every == 0:
-                conn.commit()
-                print(f"  ...{i}/{len(files)}")
-        conn.commit()
-        total += ok
-        print(f"[{name}] indexed {ok}, skipped {skipped}, errors {err}, {time.time()-t0:.1f}s")
+        total += index_source(conn, name, adapter, args.commit_every)
     conn.close()
     print(f"Backfill complete: {total} sessions.")
+
+
+def index_source(conn, name: str, adapter, commit_every: int = 200) -> int:
+    """Index every transcript of one source. Headers are parsed OUTSIDE the
+    write transaction and written in one short burst: parsing inside it held
+    the SQLite write lock for the whole batch (200 multi-MB transcripts ≈ 5+ s),
+    and the Stop hook's extract-reasoning died with 'database is locked'."""
+    files = list(adapter.discover())
+    print(f"[{name}] {len(files)} files")
+    ok = err = skipped = 0
+    t0 = time.time()
+    pending = []
+
+    def flush():
+        for h in pending:
+            indexer.upsert(h, conn=conn)
+        conn.commit()
+        pending.clear()
+    for i, path in enumerate(files, 1):
+        try:
+            header = adapter.parse_header(path)
+            if header is None:
+                skipped += 1  # e.g. headless sdk-cli sessions — intentionally not indexed
+                continue
+            # Note: we intentionally do NOT seed `summary` from the title — the
+            # title is its own column and the UI falls back to it, so leaving
+            # summary NULL lets nightly enrichment populate a real summary.
+            pending.append(header)
+            ok += 1
+        except Exception as e:  # noqa: BLE001
+            err += 1
+            print(f"  ! {path.name}: {e}", file=sys.stderr)
+        if len(pending) >= commit_every:
+            flush()
+            print(f"  ...{i}/{len(files)}")
+    flush()
+    print(f"[{name}] indexed {ok}, skipped {skipped}, errors {err}, {time.time()-t0:.1f}s")
+    return ok
 
 
 if __name__ == "__main__":

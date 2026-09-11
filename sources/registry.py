@@ -2,7 +2,9 @@
 
 To add a CLI (codex, opencode, ollama, ...): implement sources/<cli>.py with the
 SessionSource Protocol, add one line to _FACTORIES, and add a [sources.<cli>]
-block to config.toml. The indexer, DB, UI, watcher, and MCP server need no edits.
+block to config.toml.example (the committed defaults; config.toml is a
+git-ignored per-machine override). The indexer, DB, UI, watcher, and MCP server
+need no edits.
 """
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ def _make_claude() -> SessionSource:
 def _make_copilot() -> SessionSource:
     from sources.copilot import CopilotSource
     cfg = sbconfig.source_config("copilot")
-    return CopilotSource(cfg.get("state_dir", "~/.copilot/session-state"))
+    return CopilotSource(_cli_home(cfg.get("state_dir"), "~/.copilot/session-state", "", ""))
 
 
 def _make_codex() -> SessionSource:

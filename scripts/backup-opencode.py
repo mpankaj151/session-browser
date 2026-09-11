@@ -65,12 +65,21 @@ def snapshot(db: Path, out_dir: Path, keep: int = 8, now: datetime | None = None
     try:
         try:
             conn.execute("VACUUM INTO ?", (str(dest),))
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() or "busy" in str(e).lower():
+                raise                      # OpenCode is writing: try again next run
             # older SQLite without VACUUM INTO: the backup API, same guarantee
             copy = sqlite3.connect(str(dest))
-            with copy:
-                conn.backup(copy)
-            copy.close()
+            try:
+                with copy:
+                    conn.backup(copy)
+            finally:
+                copy.close()
+    except BaseException:
+        # Never leave a stub: a 0-byte opencode-<stamp>.db would satisfy
+        # is_due() for another week and pass as "the backup".
+        dest.unlink(missing_ok=True)
+        raise
     finally:
         conn.close()
     rotate(out_dir, keep)
@@ -102,7 +111,13 @@ def main() -> None:
     if args.if_due and not is_due(out, args.if_due):
         print(f"snapshot not due (newest < {args.if_due} days old) — {out}")
         return
-    dest = snapshot(db, out, keep)
+    try:
+        dest = snapshot(db, out, keep)
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower() or "busy" in str(e).lower():
+            print(f"snapshot skipped: {e} (OpenCode is writing; next run retries)")
+            return
+        raise
     print(f"snapshot {dest} ({dest.stat().st_size // 1024} KB); keeping {keep} in {out}")
 
 

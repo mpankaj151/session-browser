@@ -6,7 +6,7 @@ Step-by-step install for a fresh machine, plus a troubleshooting matrix.
 
 | Need | macOS | Linux |
 |------|-------|-------|
-| Python 3.11+ | `brew install python@3.12` | `sudo apt install python3 python3-venv` |
+| Python 3.11+ | `brew install python@3.12` | `sudo apt install python3.12 python3.12-venv` (Ubuntu 22.04 ships 3.10, which is too old) |
 | git | preinstalled / `brew install git` | `sudo apt install git` |
 | A supported CLI | [Claude Code](https://claude.com/claude-code) and/or [Copilot CLI](https://github.com/github/copilot-cli) / [Codex](https://github.com/openai/codex) / [OpenCode](https://opencode.ai) | same |
 
@@ -113,7 +113,11 @@ MCP-capable client can use it — register it with whichever CLI(s) you run.
 Everywhere below, `PY` = `/absolute/path/to/session-browser/.venv/bin/python`
 and `SERVER` = `/absolute/path/to/session-browser/mcp/session-memory/server.py`.
 
-**Claude Code** — `~/.claude/settings.json` (or `claude mcp add session-memory -- PY SERVER`):
+**Claude Code** — `claude mcp add session-memory -- PY SERVER` (user scope: add
+`--scope user`). Claude Code reads MCP servers from `~/.claude.json` or a
+project's `.mcp.json` — not from `~/.claude/settings.json`, which holds hooks
+and permissions (and which `install.sh` rewrites). The file-level equivalent,
+in `.mcp.json` at the project root:
 
 ```json
 { "mcpServers": { "session-memory": { "command": "PY", "args": ["SERVER"] } } }
@@ -154,7 +158,7 @@ The reasoning archive at `~/claude-reasoning-archive` is always left intact.
 |---------|-------------|
 | `cr` says `<cli> is not on PATH` | The session exists but that CLI is not installed in this shell (or a daemon PATH). Indexing, search and the Archived/Restore flow never need the binary; only resume and bridge do. |
 | Sessions of a relocated CLI are missing | `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` are followed when the source's path in `config.toml` is left at the default — export them in the shell that runs `sb`/the watcher, or set the path explicitly. |
-| `venv` creation fails | Missing `python3-venv` (Linux): `sudo apt install python3-venv`. |
+| `venv` creation fails | Missing the venv module for the interpreter the installer picked (Linux): `sudo apt install python3.12-venv` (match the version `install.sh` printed). |
 | Install aborts on `settings.json` | Your `~/.claude/settings.json` is malformed. The installer now warns and skips the hook — fix the JSON and re-run with `--no-backfill --no-scheduler`. |
 | No sessions shown | No history for enabled sources yet, or backfill was skipped. Run `sb refresh`, or `sb demo` to preview with synthetic data. |
 | Port 7655 busy | `sb stop`, or change `[ui].port` in `config.toml`. |
@@ -162,6 +166,7 @@ The reasoning archive at `~/claude-reasoning-archive` is always left intact.
 | Semantic search empty / errors | `--lite` install (no model) → it falls back to keyword/full-text automatically. To enable: `pip install sentence-transformers` then `sb refresh`. |
 | Enrichment summaries never appear | `[enrichment].provider` defaults to `auto` (first of `claude`/`opencode`/`copilot` on PATH; `sb doctor` → `[enrichment]` shows which one it picked, or that none was found). The nightly job needs that binary on PATH. On Intel Macs check `sb doctor` → sources; re-run `./install.sh` so the launchd PATH picks up your binary. `sb doctor` → `[enrichment]` shows the configured provider + model; a typo'd provider name is reported in `refresh.err.log`. |
 | OpenCode enrichment fails with a provider/auth error | `opencode-headless` needs a credential for the configured provider: `opencode auth login` (or the provider's API-key env var), then confirm with `opencode models anthropic \| grep claude-sonnet-5`. A machine without one should stay on `claude-headless`. |
-| Semantic search crashes after changing `[embeddings].model` | Run `sb refresh` (or `scripts/embed-sessions.py --force`) to re-embed at the new dimension. |
-| Something else — where are the logs? | `~/.session-browser/logs/`: `watcher.log` (live indexing), `refresh.log` + `refresh.err` (nightly pipeline), `ui.log` (`sb ui`). |
+| MCP server exits with `needs the mcp 1.x SDK` / `No module named mcp.server.fastmcp` | The `mcp` package on that Python is 2.x (FastMCP was renamed). `.venv/bin/pip install 'mcp>=1.0,<2'` — `requirements.txt` pins it; a hand-installed newer SDK does not. |
+| Semantic search crashes after changing `[embeddings].model` | Run `sb refresh` (or `.venv/bin/python scripts/embed-sessions.py --force`) to re-embed at the new dimension. |
+| Something else — where are the logs? | `~/.session-browser/logs/`: `watcher.log` (live indexing) plus `watcher.out.log` / `watcher.err.log` (the job's own streams), `refresh.out.log` / `refresh.err.log` (nightly pipeline), `ui.log` (`sb ui`), `reasoning-hook.log` / `enrich-hook.log` (Stop hook), `opencode-hook.log` / `opencode-plugin.log` (OpenCode plugin). |
 | Everything broke after moving the repo | The launchd jobs, Stop hook, and `cr`/`sb` functions bake in absolute paths. Re-run `./install.sh && ./bin/install-cr.sh` from the new location — both repoint stale entries automatically — then restart the UI (`sb stop; sb ui`) and confirm with `sb doctor`. |

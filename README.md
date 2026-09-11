@@ -1,7 +1,7 @@
 # Session Browser
 
 **One local, private home for every AI coding session** — across Claude Code,
-GitHub Copilot CLI, and Codex. Search everything, see what each session *would*
+GitHub Copilot CLI, Codex, and OpenCode. Search everything, see what each session *would*
 have cost on the API, resume any session from any directory, hand a session off
 between CLIs, and read a decision/reasoning trail for every one.
 
@@ -127,8 +127,8 @@ reasoning archive *before* extracting from it, most archived sessions come back
 with one click (**♻ Restore**), after which `cr <id>` and `--resume` work again.
 
 ```bash
-scripts/restore-session.py --all          # which archived sessions can come back?
-scripts/restore-session.py --all --apply  # restore every one that can
+.venv/bin/python scripts/restore-session.py --all          # which archived sessions can come back?
+.venv/bin/python scripts/restore-session.py --all --apply  # restore every one that can
 ```
 
 Raise `cleanupPeriodDays` in `~/.claude/settings.json` to stop the deletions at

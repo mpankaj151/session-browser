@@ -98,10 +98,10 @@ def seed():
 def main():
     seed()
     print(f"Demo DB seeded ({len(_DEMO)} synthetic sessions) at {_DB}")
-    print("Starting the UI at http://127.0.0.1:7655  (Ctrl-C to stop; your real data is untouched)")
     # Launch the Flask app in-process; SB_DB is already set so it uses the demo DB.
     sys.path.insert(0, str(_REPO / "session-ui"))
     import app as flask_app
+    print(f"Starting the UI at http://{flask_app.HOST}:{flask_app.PORT}  (Ctrl-C to stop; your real data is untouched)")
     flask_app.sbconfig.ensure_dirs()
     flask_app.app.run(host=flask_app.HOST, port=flask_app.PORT, debug=False, threaded=True)
 

@@ -78,5 +78,6 @@ if [ "$PURGE" -eq 1 ]; then
   echo "   (reasoning archive at ~/claude-reasoning-archive left intact)"
 fi
 echo "==> uninstalled. Also present if you want them gone:"
-echo "    $CLAUDE_DIR/settings.json.sb-backup   (pre-install settings backup)"
+[ -f "$CLAUDE_DIR/settings.json.sb-backup" ] && echo "    $CLAUDE_DIR/settings.json.sb-backup   (pre-install settings backup)"
 [ "$PURGE" -eq 0 ] && echo "    ~/.session-browser                  (data — rerun with --purge)"
+exit 0   # the last test above is false after --purge; the uninstall itself succeeded

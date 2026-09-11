@@ -93,7 +93,16 @@ let STATE = { source: 'all', state: 'live', sessions: [], kbIndex: -1, sources: 
 const ARCHIVED_CLS = 'bg-amber-500/10 text-amber-600 dark:text-amber-300 border-amber-500/30';
 
 const $ = s => document.querySelector(s);
-async function fetchJson(url, opts){ const r = await fetch(url, opts); if(!r.ok) throw new Error(r.status); return r.json(); }
+async function fetchJson(url, opts){
+  const r = await fetch(url, opts);
+  if(!r.ok){
+    // Keep the server's honest message ("codex is not installed on this machine…")
+    let msg = `HTTP ${r.status}`;
+    try { const b = await r.json(); msg = b.error || b.detail || (b.status ? `${b.status}` : msg); } catch(_) {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
 function toast(msg){ const t=$('#toast'); t.textContent=msg; t.style.opacity='1'; setTimeout(()=>t.style.opacity='0',1600); }
 function closeModal(){ $('#modal').classList.add('hidden'); }
 function openModal(title, body){ $('#modalTitle').textContent=title; $('#modalBody').textContent=body; $('#modal').classList.remove('hidden'); }
@@ -104,18 +113,21 @@ function openModalMd(title, md){ $('#modalTitle').textContent=title; $('#modalBo
 function esc(s){ return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function mdToHtml(md){
   const out=[]; let inList=false;
+  // Slice the RAW line by the marker, escape AFTERWARDS: slicing the escaped
+  // text by the raw marker length ate the '&g' of '&gt;' and rendered every
+  // blockquote (the whole reasoning trail) as 't; …'.
+  const inline = s => esc(s)
+    .replace(/`([^`]+)`/g,'<code class="px-1 rounded bg-slate-200 dark:bg-slate-800">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>');
   for(let raw of md.split('\n')){
-    let line=esc(raw);
-    line=line.replace(/`([^`]+)`/g,'<code class="px-1 rounded bg-slate-200 dark:bg-slate-800">$1</code>')
-             .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>');
     const flush=()=>{ if(inList){ out.push('</ul>'); inList=false; } };
-    if(/^## /.test(raw)){ flush(); out.push(`<h3 class="font-semibold mt-4 mb-1 text-indigo-500">${line.slice(3)}</h3>`); }
-    else if(/^# /.test(raw)){ flush(); out.push(`<h2 class="font-bold text-lg mb-2">${line.slice(2)}</h2>`); }
-    else if(/^> /.test(raw)){ flush(); out.push(`<blockquote class="border-l-2 border-indigo-400 pl-3 my-1 text-slate-600 dark:text-slate-300">${line.slice(2)}</blockquote>`); }
-    else if(/^- /.test(raw)){ if(!inList){ out.push('<ul class="list-disc ml-5 my-1">'); inList=true; } out.push(`<li>${line.slice(2)}</li>`); }
+    if(/^## /.test(raw)){ flush(); out.push(`<h3 class="font-semibold mt-4 mb-1 text-indigo-500">${inline(raw.slice(3))}</h3>`); }
+    else if(/^# /.test(raw)){ flush(); out.push(`<h2 class="font-bold text-lg mb-2">${inline(raw.slice(2))}</h2>`); }
+    else if(/^>( |$)/.test(raw)){ flush(); out.push(`<blockquote class="border-l-2 border-indigo-400 pl-3 my-1 text-slate-600 dark:text-slate-300">${inline(raw.slice(2))}</blockquote>`); }
+    else if(/^- /.test(raw)){ if(!inList){ out.push('<ul class="list-disc ml-5 my-1">'); inList=true; } out.push(`<li>${inline(raw.slice(2))}</li>`); }
     else if(/^---/.test(raw)){ flush(); out.push('<hr class="my-3 border-slate-200 dark:border-slate-800"/>'); }
-    else if(line.trim()===''){ flush(); }
-    else { flush(); out.push(`<p class="my-1">${line}</p>`); }
+    else if(raw.trim()===''){ flush(); }
+    else { flush(); out.push(`<p class="my-1">${inline(raw)}</p>`); }
   }
   if(inList) out.push('</ul>');
   return out.join('');
@@ -176,12 +188,15 @@ function renderCard(s, idx){
   const when = s.archived_at ? new Date(s.archived_at).toLocaleDateString() : '';
   const archivedBadge = s.archived
     ? badge(`⌛ Archived · transcript aged out${when?' · '+when:''}`, ARCHIVED_CLS) : '';
+  const installed = STATE.sources && STATE.sources[s.cli_source] ? STATE.sources[s.cli_source].installed !== false : true;
   const primaryBtn = !s.archived
-    ? `<button data-act="resume" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>`
+    ? (installed
+        ? `<button data-act="resume" data-sid="${sid}" class="text-xs px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white">▶ Resume</button>`
+        : `<button disabled title="${esc(s.cli_source)} is not installed on this machine — resume it where that CLI is" class="text-xs px-2.5 py-1 rounded-md bg-slate-300 dark:bg-slate-700 text-slate-500 cursor-not-allowed">▶ Resume</button>`)
     : s.restorable
       ? `<button data-act="restore" data-sid="${sid}" title="Copy the raw transcript back from the reasoning archive; Resume works again afterwards" class="text-xs px-2.5 py-1 rounded-md bg-amber-600 hover:bg-amber-500 text-white">♻ Restore</button>`
       : `<button disabled title="${s.restore_blocker==='unsupported' ? 'Transcript deleted; a raw copy exists but this source\'s adapter cannot place it back — metadata only' : 'Transcript deleted and no raw copy in the reasoning archive — metadata only'}" class="text-xs px-2.5 py-1 rounded-md bg-slate-300 dark:bg-slate-700 text-slate-500 cursor-not-allowed">▶ Resume</button>`;
-  return `<div class="card border border-slate-200 dark:border-slate-800 rounded-xl p-4 bg-white dark:bg-slate-900 hover:border-indigo-400/50 transition" data-idx="${idx}">
+  return `<div class="card border border-slate-200 dark:border-slate-800 rounded-xl p-4 bg-white dark:bg-slate-900 hover:border-indigo-400/50 transition" data-idx="${idx}" data-sid="${sid}">
     <div class="flex items-start justify-between gap-3">
       <div class="flex items-center gap-2 min-w-0">
         <span class="w-2 h-2 rounded-full ${dot} shrink-0"></span>
@@ -234,9 +249,16 @@ document.addEventListener('click', e => {
   }
 });
 
+function activeFilters(){
+  return ['search','folder','topic','days'].filter(id => $('#'+id).value).length + (STATE.source!=='all' ? 1 : 0);
+}
 function render(){
+  STATE.kbIndex = -1;                       // DOM order changed; a stale index resumed the wrong card
   const groups = group(STATE.sessions);
   const list = $('#list'); list.innerHTML='';
+  if(STATE.truncated){
+    list.insertAdjacentHTML('beforeend', `<p class="text-xs text-amber-600 dark:text-amber-300">Showing the ${STATE.sessions.length} most recent of ${STATE.total} sessions — narrow the filters to reach the rest.</p>`);
+  }
   let idx=0;
   for(const [name, items] of Object.entries(groups)){
     if(!items.length) continue;
@@ -246,7 +268,14 @@ function render(){
     for(const s of items){ wrap.insertAdjacentHTML('beforeend', renderCard(s, idx++)); }
     sec.appendChild(wrap); list.appendChild(sec);
   }
-  $('#empty').classList.toggle('hidden', STATE.sessions.length>0);
+  const empty = $('#empty');
+  const n = activeFilters();
+  // Never claim "nothing has aged out" while a filter is hiding rows: the
+  // Archived tab counted 40 and the body said none existed.
+  empty.textContent = STATE.sessions.length ? '' : n
+    ? `No ${STATE.state==='archived' ? 'archived ' : ''}sessions match the current filters — clear them to see everything.`
+    : (STATE.state==='archived' ? 'No archived sessions — nothing has aged out of the browser.' : 'No sessions yet.');
+  empty.classList.toggle('hidden', STATE.sessions.length>0);
 }
 
 async function resume(id){
@@ -312,7 +341,7 @@ async function doBridge(id, target){
   // can't send either — a drive-by page can no longer trigger the write.
   try{ r = await fetchJson(`/api/sessions/${encodeURIComponent(id)}/bridge?target=${encodeURIComponent(target)}`,
                            {method:'POST', headers:{'X-Requested-With':'session-browser'}}); }
-  catch(e){ toast('Could not build bridge'); return; }
+  catch(e){ toast(`Could not build bridge: ${e.message}`); return; }
   // stash for the modal buttons
   window.__bridge = { id, target, command: r.command, primer: r.primer, fname: (r.path||'primer.md').split('/').pop() };
   $('#modalTitle').textContent = `🌉 Bridge → ${target}`;
@@ -391,11 +420,26 @@ async function applyFilters(){
   if($('#mode').value) p.set('mode',$('#mode').value);
   if(STATE.source!=='all') p.set('source',STATE.source);
   if(STATE.state==='archived') p.set('state','archived');
-  STATE.sessions = await fetchJson('/api/sessions?'+p.toString());
+  try{
+    const r = await fetch('/api/sessions?'+p.toString());
+    if(!r.ok){ let m=`HTTP ${r.status}`; try{ const b=await r.json(); m=b.error||b.detail||m; }catch(_){} throw new Error(m); }
+    STATE.sessions = await r.json();
+    STATE.truncated = r.headers.get('X-Result-Truncated')==='1';
+    STATE.total = r.headers.get('X-Result-Total');
+  }catch(e){
+    STATE.sessions = []; STATE.truncated = false;
+    $('#list').innerHTML = `<p class="text-sm text-rose-500">Could not load sessions: ${esc(e.message)}</p>`;
+    toast(`Could not load sessions: ${e.message}`);
+    return;
+  }
   render();
 }
 
 async function loadMeta(){
+  try { await loadMetaInner(); }
+  catch(e){ $('#stats').textContent = `Could not load stats: ${e.message}`; toast(`Could not load stats: ${e.message}`); }
+}
+async function loadMetaInner(){
   if(!STATE.sources){ try { STATE.sources = await fetchJson('/api/sources'); } catch(e) { STATE.sources = null; } }
   const stats = await fetchJson('/api/stats?state='+STATE.state);
   let line = `${stats.total} ${STATE.state==='archived'?'archived ':''}sessions · ${stats.enriched} enriched · ${stats.folders} folders`;
@@ -428,15 +472,18 @@ function heatmap(perDay){
   // GitHub-style: 53 weeks x 7 days, colored by session count.
   const byDay = {}; let max = 1;
   perDay.forEach(d => { byDay[d.day] = d.sessions; max = Math.max(max, d.sessions); });
-  const today = new Date(); const cells = [];
-  const start = new Date(today); start.setDate(start.getDate() - 363);
-  // align to Sunday
-  start.setDate(start.getDate() - start.getDay());
+  // The API buckets by the UTC date (substr(last_activity,1,10)); iterate UTC
+  // midnights so the key matches — local-clock arithmetic shifted every cell by
+  // a day for part of each day (today's square went blank after ~17:00 PDT).
+  const DAY = 86400000; const now = new Date(); const cells = [];
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  let start = today - 363*DAY;
+  start -= new Date(start).getUTCDay()*DAY;   // align to Sunday
   for(let w=0; w<53; w++){
     for(let d=0; d<7; d++){
-      const dt = new Date(start); dt.setDate(start.getDate() + w*7 + d);
-      if(dt > today) continue;
-      const key = dt.toISOString().slice(0,10);
+      const t = start + (w*7 + d)*DAY;
+      if(t > today) continue;
+      const key = new Date(t).toISOString().slice(0,10);
       const n = byDay[key] || 0;
       const lvl = n===0?0 : Math.ceil((n/max)*4);
       const c = ['#1e293b','#14532d','#166534','#15803d','#22c55e'][lvl] || '#1e293b';
@@ -518,7 +565,10 @@ function showTab(which){
   // A tab switch is a change of scope, not a refinement: a source pill picked
   // on Sessions may not exist among archived rows, and an invisible filter
   // would show "No archived sessions" under a tab that counts some.
-  if(next !== STATE.state) STATE.source = 'all';
+  if(next !== STATE.state){
+    STATE.source = 'all';
+    ['search','folder','topic','days'].forEach(id => { $('#'+id).value = ''; });
+  }
   STATE.state = next;
   $('#sessionsView').classList.toggle('hidden', stats);
   $('#statsView').classList.toggle('hidden', !stats);
@@ -527,8 +577,6 @@ function showTab(which){
   $('#tabSessions').className = which==='sessions' ? on : off;
   $('#tabArchived').className = which==='archived' ? on : off;
   $('#tabStats').className    = stats ? on : off;
-  $('#empty').textContent = which==='archived'
-    ? 'No archived sessions — nothing has aged out of the browser.' : 'No sessions match.';
   if(stats) renderStats(); else { loadMeta(); applyFilters(); }
 }
 $('#tabSessions').onclick = ()=>showTab('sessions');
@@ -550,11 +598,11 @@ document.addEventListener('keydown',e=>{
     STATE.kbIndex = Math.max(0, Math.min(cards.length-1, STATE.kbIndex+(e.key==='j'?1:-1)));
     cards.forEach(c=>c.classList.remove('kb-active'));
     const c=cards[STATE.kbIndex]; if(c){ c.classList.add('kb-active'); c.scrollIntoView({block:'center',behavior:'smooth'}); }
-  } else if(e.key==='r' && STATE.kbIndex>=0){ resume(STATE.sessions[STATE.kbIndex].session_id); }
+  } else if(e.key==='r' && STATE.kbIndex>=0){ const c=cards[STATE.kbIndex]; if(c && c.dataset.sid) resume(c.dataset.sid); }
   else if(e.key==='Escape'){ closeModal(); }
 });
 
-loadMeta().then(applyFilters);
+loadMeta().then(applyFilters).catch(e => toast(`Could not start: ${e.message}`));
 </script>
 </body>
 </html>

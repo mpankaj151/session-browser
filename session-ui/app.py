@@ -50,11 +50,6 @@ def _check_host():
 
 
 # --- helpers ------------------------------------------------------------------
-def _restore_supported() -> set[str]:
-    """Sources whose adapter can put a raw copy back (restore_path)."""
-    return {name for name, a in SOURCES.items() if callable(getattr(a, "restore_path", None))}
-
-
 def _row_to_dict(row, raw_index: dict | None = None) -> dict:
     """raw_index: reasoning.archived_raw_index(), computed once per request by
     the callers that list archived rows — it labels which of them still have
@@ -75,10 +70,15 @@ def _row_to_dict(row, raw_index: dict | None = None) -> dict:
     d["is_active"] = _is_active(d.get("last_activity"))
     d["has_reasoning"] = bool(d.get("reasoning_path"))
     has_raw = raw_index is not None and d["session_id"] in raw_index
-    supported = d.get("cli_source") in _restore_supported()
+    # Per ROW (restore.supported_for): an adapter refuses rows whose recorded
+    # path is outside its tree, so a per-source answer advertised Restores the
+    # server then refused. Only archived listings pay for the per-row check.
+    supported = bool(d.get("archived")) and restore.supported_for(d, SOURCES)
     d["restorable"] = bool(d.get("archived")) and has_raw and supported
+    # Name the fact that is actually missing: with no raw copy there is nothing
+    # to place back, whatever the adapter could do.
     d["restore_blocker"] = (None if not d.get("archived") or d["restorable"]
-                            else "unsupported" if not supported else "no-raw-copy")
+                            else "no-raw-copy" if not has_raw else "unsupported")
     d["cost"] = {
         "usd": d.get("cost_usd"),
         "input": d.get("input_tokens"), "output": d.get("output_tokens"),
@@ -113,6 +113,9 @@ def static_files(filename: str):
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+PAGE = 500   # rows per listing; a truncated page is flagged in the response headers
 
 
 @app.get("/api/sessions")
@@ -185,10 +188,19 @@ def api_sessions():
         params += [like, like, like, like]
 
     order = "last_activity DESC"
-    sql = "SELECT * FROM sessions WHERE " + " AND ".join(where) + f" ORDER BY {order} LIMIT 500"
+    clause = "SELECT * FROM sessions WHERE " + " AND ".join(where)
+    # One row past the page: a hard cap with no marker made the header count
+    # 602 sessions while the list showed 500 and the oldest 102 — the very rows
+    # the archive protects — were unreachable from any UI path.
+    sql = clause + f" ORDER BY {order} LIMIT {PAGE + 1}"
     conn = indexer.connect()
     try:
         rows = conn.execute(sql, params).fetchall()
+        total = len(rows)
+        if len(rows) > PAGE:
+            rows = rows[:PAGE]
+            total = conn.execute("SELECT COUNT(*) FROM sessions WHERE " + " AND ".join(where),
+                                 params).fetchone()[0]
     finally:
         conn.close()
     raw_index = reasoning.archived_raw_index() if state == "archived" else None
@@ -197,7 +209,11 @@ def api_sessions():
     if sem_ids is not None:
         rank = {sid: i for i, sid in enumerate(sem_ids)}
         results.sort(key=lambda d: rank.get(d["session_id"], 1e9))
-    return jsonify(results)
+    resp = jsonify(results)
+    if total > len(results):
+        resp.headers["X-Result-Truncated"] = "1"
+        resp.headers["X-Result-Total"] = str(total)
+    return resp
 
 
 @app.get("/api/sessions/folders")
@@ -255,6 +271,11 @@ def api_resume(sid: str):
         # only report "not found" after a round trip to the terminal.
         return jsonify({"error": f"no adapter for source '{row['cli_source']}' — enable "
                                  f"[sources.{row['cli_source']}] in config.toml"}), 409
+    if not _installed(row["cli_source"]):
+        # Same rule as bridge: never hand back a command that dies with
+        # "command not found" after the user has switched terminals.
+        return jsonify({"error": f"{row['cli_source']} is not installed on this machine "
+                                 f"(binary not on PATH) — resume it where it is"}), 409
     raw = src.resume_command(sid)
     cwd = row["cwd"] or ""
     # Primary: the `cr` shell shortcut (installed via bin/install-cr.sh). Paste it in
@@ -264,7 +285,8 @@ def api_resume(sid: str):
     command = f"cr {shlex.quote(sid)}"
     command_full = f'{shlex.quote(str(wrapper))} {shlex.quote(sid)} {shlex.quote(row["cli_source"])}'
     return jsonify({"command": command, "command_full": command_full,
-                    "raw_command": raw, "origin_cwd": cwd, "cli_source": row["cli_source"]})
+                    "raw_command": raw, "origin_cwd": cwd, "cli_source": row["cli_source"],
+                    "origin_cwd_exists": bool(cwd) and Path(cwd).is_dir()})
 
 
 @app.post("/api/sessions/<sid>/restore")
@@ -427,6 +449,7 @@ def _build_bridge(conn, sid: str, target: str) -> dict | None:
     ).fetchone()
     source = row["cli_source"]
     cwd = row["cwd"] or ""
+    cwd_exists = bool(cwd) and Path(cwd).is_dir()
 
     header = (
         f"# Handoff: continue this {source} session in {target}\n\n"
@@ -434,8 +457,12 @@ def _build_bridge(conn, sid: str, target: str) -> dict | None:
         f"**{source}** CLI. No transcript is being resumed — the full context is below. "
         f"Read it, then continue the work from where it left off. For deeper detail you "
         f"may open the referenced transcript and decision-trail files directly.\n\n"
-        f"---\n\n"
     )
+    if cwd and not cwd_exists:
+        # `cd <cwd> && …` would die at the cd — after the user pasted it.
+        header += (f"Note: the original project directory `{cwd}` does not exist on this "
+                   f"machine; the command below starts in the current directory.\n\n")
+    header += "---\n\n"
     primer = header + context_md
 
     bridges = Path.home() / ".session-browser" / "bridges"
@@ -444,10 +471,12 @@ def _build_bridge(conn, sid: str, target: str) -> dict | None:
     fpath.write_text(primer, encoding="utf-8")
 
     tmpl = _BRIDGE_CMD.get(target)
-    command = (tmpl.format(cwd=shlex.quote(cwd or "."), file=shlex.quote(str(fpath)))
+    if tmpl and not cwd_exists:
+        tmpl = tmpl.replace("cd {cwd} && ", "")
+    command = (tmpl.format(cwd=shlex.quote(cwd), file=shlex.quote(str(fpath)))
                if tmpl else f"# unsupported target {target}")
     return {"command": command, "primer": primer, "path": str(fpath),
-            "target": target, "source": source}
+            "target": target, "source": source, "origin_cwd_exists": cwd_exists}
 
 
 @app.post("/api/sessions/<sid>/bridge")

@@ -113,14 +113,16 @@ def main() -> None:
             files = list(adp.discover())
             total += len(files)
             print(f"[{name}] {len(files)} files")
-            for i, path in enumerate(files, 1):
+            for path in files:
                 try:
                     if process_one(adp, path, args.archive, conn=conn):
                         done += 1
                 except Exception as e:  # noqa: BLE001
                     print(f"  ! {path.name}: {e}", file=sys.stderr)
-                if i % 20 == 0:
-                    conn.commit()
+                # Commit per file: each iteration parses a whole transcript and
+                # copies it into the vault, so batching 20 held the write lock
+                # for tens of seconds and blocked the Stop hook's own upsert.
+                conn.commit()
             conn.commit()
         conn.close()
         print(f"Reasoning backfill complete: {done}/{total} sessions had reasoning.")

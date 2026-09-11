@@ -31,12 +31,9 @@ def run(label: str, args: list[str]) -> tuple[str, int]:
         return label, -1
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--enrich", action="store_true", help="also run LLM enrichment (uses quota)")
-    args = ap.parse_args()
-
-    steps = [
+def steps(enrich: bool) -> list[tuple[str, list[str]]]:
+    """The nightly pipeline, in dependency order."""
+    out = [
         ("migrate schema", [str(SCRIPTS / "migrate-db.py")]),
         ("backfill sessions", [str(SCRIPTS / "backfill.py")]),
         ("classify topics", [str(SCRIPTS / "classify-topics.py")]),
@@ -45,15 +42,24 @@ def main() -> None:
         # weekly whole-DB copy of OpenCode's store; exits 0 when disabled / not due
         ("opencode db snapshot", [str(SCRIPTS / "backup-opencode.py"), "--if-due", "7"]),
         ("full-text index", [str(SCRIPTS / "build-fts.py")]),
-        ("embeddings", [str(SCRIPTS / "embed-sessions.py")]),
     ]
-    if args.enrich:
-        steps.append(("enrichment", [str(SCRIPTS / "enrich-sessions.py")]))
+    if enrich:
+        out.append(("enrichment", [str(SCRIPTS / "enrich-sessions.py")]))
+    # After enrichment: embeddings are built from title/summary/first_message,
+    # so running them earlier left semantic search one night behind.
+    out.append(("embeddings", [str(SCRIPTS / "embed-sessions.py")]))
     # Last so it sees tonight's enrichment; no LLM cost, so never gated on --enrich.
-    steps.append(("daily digest", [str(SCRIPTS / "daily-digest.py")]))
+    out.append(("daily digest", [str(SCRIPTS / "daily-digest.py")]))
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--enrich", action="store_true", help="also run LLM enrichment (uses quota)")
+    args = ap.parse_args()
 
     failed: list[tuple[str, int]] = []
-    for label, a in steps:
+    for label, a in steps(args.enrich):
         label, rc = run(label, a)
         if rc != 0:
             failed.append((label, rc))

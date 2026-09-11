@@ -14,7 +14,10 @@
        would respawn it every ~10s forever. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>__PATH__</string></dict>
+  <dict>
+  <key>PATH</key><string>__PATH__</string>
+__JOB_ENV__
+  </dict>
   <key>StandardOutPath</key><string>__LOG_DIR__/watcher.out.log</string>
   <key>StandardErrorPath</key><string>__LOG_DIR__/watcher.err.log</string>
 </dict>

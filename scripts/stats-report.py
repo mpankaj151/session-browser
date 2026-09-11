@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import indexer  # noqa: E402
 import sbconfig  # noqa: E402
 
-_TOK = "input_tokens+output_tokens+cache_read_tokens+cache_write_tokens"
+_TOK = ("COALESCE(input_tokens,0)+COALESCE(output_tokens,0)"
+        "+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)")
 PFX = "≈" if sbconfig.COST_IS_NOTIONAL else ""
 
 
@@ -32,6 +33,15 @@ def _h(n: int) -> str:
 
 def _bold(s):  # noqa: ANN001
     return f"\033[1m{s}\033[0m"
+
+
+def since_sql(days: int) -> str:
+    """`last_activity` cutoff for a rolling window, spelled like the column
+    ('YYYY-MM-DDTHH:MM:SS.mmmZ'). datetime('now', '-N days') would yield
+    'YYYY-MM-DD HH:MM:SS' — and 'T' sorts above ' ', so every row of the cutoff
+    day compared >= the cutoff and the window leaked up to 24 h."""
+    return (f"last_activity >= strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now', "
+            f"'-{int(days)} days')")
 
 
 def _window(conn, label: str, sql_filter: str):
@@ -65,10 +75,10 @@ def main() -> None:
 
     print(f"\n{_bold('By window')}")
     print(_window(conn, "today", "AND last_activity >= date('now')"))
-    print(_window(conn, "7 days", "AND last_activity >= datetime('now','-7 days')"))
-    print(_window(conn, "30 days", "AND last_activity >= datetime('now','-30 days')"))
+    print(_window(conn, "7 days", "AND " + since_sql(7)))
+    print(_window(conn, "30 days", "AND " + since_sql(30)))
     if args.days:
-        print(_window(conn, f"{args.days}d", f"AND last_activity >= datetime('now','-{args.days} days')"))
+        print(_window(conn, f"{args.days}d", "AND " + since_sql(args.days)))
     print(_window(conn, "all", ""))
 
     _table(conn, "By model", "model", "COALESCE(model_used,'unknown')", 10)

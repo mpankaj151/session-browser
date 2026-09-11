@@ -27,6 +27,9 @@ _CMD_LINE = re.compile(r"^\s*<(command-name|command-message|command-args|local-c
 _USER_MARKER = '"type":"user"'
 # Subdir a session's multi-agent sidechain transcripts live under; never a session.
 _SUBAGENT_DIR = "subagents"
+# Claude encodes a cwd as one project dir name ("/" -> "-"); enrichment runs
+# from <data>/enrichment-cwd, so its transcripts always sit in a dir with this tail.
+_ENRICH_CWD_SUFFIX = "-enrichment-cwd"
 
 
 class ClaudeSource:
@@ -43,8 +46,9 @@ class ClaudeSource:
         # conduits, but the canonical transcript is the real file at its origin.
         # Indexing only real files keeps one row per session, at its true home.
         for p in self.projects_dir.glob("*/*.jsonl"):
-            if not p.is_symlink():
-                yield p
+            if p.is_symlink() or p.parent.name.endswith(_ENRICH_CWD_SUFFIX):
+                continue        # resume conduits; our own headless enrichment runs
+            yield p
 
     # -- cheap header ----------------------------------------------------------
     def parse_header(self, path: Path) -> Optional[SessionHeader]:
@@ -178,6 +182,16 @@ class ClaudeSource:
         # workflow journal has stem "journal", so they'd all collide onto a single
         # bogus session row.
         if path.suffix != ".jsonl" or _SUBAGENT_DIR in path.parts:
+            return None
+        if path.parent.name.endswith(_ENRICH_CWD_SUFFIX):
+            return None          # our own headless enrichment runs live here
+        # Exactly <projects>/<project>/<sid>.jsonl — the depth discover() globs.
+        # Deeper files (a future <sid>/workflows/x/journal.jsonl) would index as
+        # a session named after the file and then be archived by prune.
+        try:
+            if path.parent.parent.resolve() != self.projects_dir.resolve():
+                return None
+        except OSError:
             return None
         return path.stem
 

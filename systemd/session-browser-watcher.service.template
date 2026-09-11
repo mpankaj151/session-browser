@@ -9,6 +9,7 @@ After=default.target
 Type=simple
 ExecStart="__VENV_PY__" "__REPO__/watcher.py"
 Environment="PATH=__PATH__"
+__JOB_ENV__
 # The watcher exits 0 on purpose when another instance holds its lock or no
 # source is enabled — restart only on failure.
 Restart=on-failure

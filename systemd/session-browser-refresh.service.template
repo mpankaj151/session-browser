@@ -7,5 +7,6 @@ Description=Session Browser nightly refresh (costs, reasoning trails, full-text,
 Type=oneshot
 ExecStart="__VENV_PY__" "__REPO__/scripts/refresh-all.py" --enrich
 Environment="PATH=__PATH__"
+__JOB_ENV__
 StandardOutput=append:__LOG_DIR__/refresh.out.log
 StandardError=append:__LOG_DIR__/refresh.err.log

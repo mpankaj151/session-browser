@@ -25,6 +25,11 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     # Stripe uses underscores (sk_live_...), so the hyphenated sk- patterns miss it.
     ("stripe-key", re.compile(r"\b[rps]k_(?:live|test)_[A-Za-z0-9]{10,}")),
     ("stripe-webhook-secret", re.compile(r"\bwhsec_[A-Za-z0-9]{10,}")),
+    # Unnamed credentials that show up in tool output (curl lines, git URLs, env dumps).
+    ("slack-webhook", re.compile(r"hooks\.slack\.com/services/[A-Za-z0-9/_\-]{20,}")),
+    ("huggingface-token", re.compile(r"\bhf_[A-Za-z0-9]{30,}")),
+    ("gitlab-pat", re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}")),
+    ("pypi-token", re.compile(r"\bpypi-[A-Za-z0-9_\-]{32,}")),
     # Authorization header with any (or no) scheme — raw opaque tokens included.
     ("assigned-auth-header", re.compile(
         r"(?i)(\bauthorization\b['\"]?\s*[:=]\s*['\"]?(?:(?:basic|bearer|token)\s+)?)"

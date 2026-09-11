@@ -44,8 +44,10 @@ class CopilotSource:
         if not self.state_dir.exists():
             return
         for d in self.state_dir.iterdir():
+            if d.is_symlink():   # a symlinked session dir would index a second row of the same turns
+                continue
             ev = d / "events.jsonl"
-            if ev.exists():
+            if ev.exists() and not ev.is_symlink():
                 yield ev
 
     def parse_header(self, path: Path) -> Optional[SessionHeader]:

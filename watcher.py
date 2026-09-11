@@ -70,12 +70,17 @@ def _build_watch_pairs() -> list[tuple[Path, object]]:
     for name, adapter in build_source_registry().items():
         roots = getattr(adapter, "watch_roots", None)
         if callable(roots):
-            pairs.extend((Path(d).expanduser(), adapter) for d in roots())
+            for r in roots():
+                d, rec = (r[0], bool(r[1])) if isinstance(r, tuple) else (r, True)
+                pairs.append((Path(d).expanduser(), adapter, rec))
             continue
-        cfg = sbconfig.source_config(name)
-        d = cfg.get("projects_dir") or cfg.get("state_dir") or cfg.get("sessions_dir")
+        # The adapter — not the raw config key — is the source of truth: it has
+        # already applied CLAUDE_CONFIG_DIR / CODEX_HOME / XDG_DATA_HOME via
+        # registry._cli_home(), which a config re-read here silently bypassed.
+        d = (getattr(adapter, "projects_dir", None) or getattr(adapter, "state_dir", None)
+             or getattr(adapter, "sessions_dir", None))
         if d:
-            pairs.append((Path(d).expanduser(), adapter))
+            pairs.append((Path(d).expanduser(), adapter, True))
     return pairs
 
 
@@ -102,7 +107,10 @@ class _RootScheduler:
 
     def __init__(self, observer, pairs, log=None):
         self.observer = observer
-        self.pending = list(pairs)
+        # (dir, adapter[, recursive]); recursive defaults to True. Kept as pairs
+        # for callers; the flag lives alongside.
+        self.pending = [(p[0], p[1]) for p in pairs]
+        self.recursive = {(p[0], p[1]): (bool(p[2]) if len(p) > 2 else True) for p in pairs}
         self.scheduled: list[tuple[Path, object]] = []
         self._log = log or _log
 
@@ -113,7 +121,8 @@ class _RootScheduler:
             if not directory.is_dir():
                 continue
             try:
-                self.observer.schedule(_Handler(adapter), str(directory), recursive=True)
+                self.observer.schedule(_Handler(adapter), str(directory),
+                                       recursive=self.recursive.get((directory, adapter), True))
             except OSError as e:
                 # Linux: one inotify watch per directory; past
                 # fs.inotify.max_user_watches watchdog raises ENOSPC. Keep the
@@ -127,6 +136,23 @@ class _RootScheduler:
             newly.append(directory)
             self._log(f"watching [{adapter.name}] {directory}")
         return newly
+
+
+def start_watching(observer, pairs, log=None) -> "_RootScheduler":
+    """Start the observer FIRST, then subscribe roots. watchdog defers each
+    emitter's start until Observer.start(); a root scheduled before that
+    raised its inotify ENOSPC out of start() — outside the scheduler's guard —
+    and the daemon died (systemd respawned it straight into the same crash).
+    Started first, every failure lands in poll(), is logged with the sysctl
+    hint, and is retried."""
+    log = log or _log
+    observer.start()
+    roots = _RootScheduler(observer, pairs, log=log)
+    roots.poll()
+    if not roots.scheduled:
+        log(f"no source directory exists yet ({len(roots.pending)} pending) — "
+            f"waiting for the first one to appear, re-checking every {ROOT_POLL_S}s")
+    return roots
 
 
 class _Handler(FileSystemEventHandler):
@@ -287,12 +313,7 @@ def main() -> None:
         _log("no sources enabled in config; exiting")
         return
     observer = Observer()
-    roots = _RootScheduler(observer, pairs)
-    roots.poll()
-    if not roots.scheduled:
-        _log(f"no source directory exists yet ({len(roots.pending)} pending) — "
-             f"waiting for the first one to appear, re-checking every {ROOT_POLL_S}s")
-    observer.start()
+    roots = start_watching(observer, pairs)
     try:
         tick = 0
         while True:

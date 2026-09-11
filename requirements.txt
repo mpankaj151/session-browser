@@ -3,7 +3,7 @@ flask>=3.0
 watchdog>=4.0
 pyyaml>=6.0
 numpy>=1.26
-mcp>=1.0
+mcp>=1.0,<2   # 2.x renamed FastMCP -> MCPServer and changed the tool API
 # Codex zstd-compresses rollouts older than 7 days in place; without this
 # every Codex session silently drops out of the browser after a week.
 zstandard>=0.22

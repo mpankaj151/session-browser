@@ -42,9 +42,18 @@ def mark(session_id: str, path: Path | None = None) -> None:
             continue
     state[session_id] = now.isoformat()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(state), encoding="utf-8")
-    os.replace(tmp, path)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(state))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def recently(session_id: str, within_s: float = RACE_GUARD_S, path: Path | None = None) -> bool:

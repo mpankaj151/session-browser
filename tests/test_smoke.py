@@ -282,13 +282,14 @@ def test_to_iso_utc_hardening():
 # --- costs ----------------------------------------------------------------------
 def test_cost_mapping():
     pricing = costs.load_pricing()
-    assert costs.tier_for_model("claude-opus-4-8", pricing) == "opus"
-    assert costs.tier_for_model("claude-sonnet-4-6", pricing) == "sonnet"
+    assert costs.tier_for_model("claude-opus-4-8", pricing) == "opus-4.5"
+    assert costs.tier_for_model("claude-opus-4-1", pricing) == "opus-4"      # retired rate kept
+    assert costs.tier_for_model("claude-sonnet-4-6", pricing) == "sonnet-4"
     assert costs.tier_for_model("gpt-5-mini", pricing) == "gpt-5-mini"  # longest-alias-first
     assert costs.tier_for_model("some-future-model-9", pricing) is None  # unknown -> None, not a guess
     c = costs.cost_usd("claude-opus-4-8", {"input": 1_000_000, "output": 0,
                                            "cache_read": 0, "cache_write": 0}, pricing)
-    assert abs(c - 15.0) < 1e-6
+    assert abs(c - 5.0) < 1e-6
     assert costs.coerce_cache_write({"ephemeral_5m_input_tokens": 10,
                                      "ephemeral_1h_input_tokens": 5}) == 15
     print("  ok  cost mapping (tiers, unknown->None, cache dict coercion)")
@@ -336,7 +337,7 @@ def test_adapters():
     assert "claude" in reg and "copilot" in reg and "opencode" in reg, list(reg)
     assert isinstance(reg["opencode"], OpenCodeSource)
     assert reg["opencode"].session_id_for_path(Path(f"/m/{_OC_ROOT}.jsonl")) == _OC_ROOT
-    assert ClaudeSource().session_id_for_path(Path("/p/abc-1.jsonl")) == "abc-1"
+    assert ClaudeSource("/p").session_id_for_path(Path("/p/-proj/abc-1.jsonl")) == "abc-1"
     assert CopilotSource().session_id_for_path(Path("/s/sid9/events.jsonl")) == "sid9"
     assert CopilotSource().session_id_for_path(Path("/s/sid9/other.jsonl")) is None
     print(f"  ok  adapters registered + path->id mapping: {list(reg)}")
@@ -351,7 +352,7 @@ def test_claude_ignores_subagent_transcripts():
     discover()'s glob — is what has to reject them.
     """
     from sources.claude import ClaudeSource
-    src = ClaudeSource()
+    src = ClaudeSource("/p")
     root = "/p/-Users-me-proj/6550180f-14ff-4b91-a93d-d951ed98c2f7"
     # real transcript still maps to its id (the discover() `*/*.jsonl` shape)
     assert src.session_id_for_path(Path("/p/-Users-me-proj/abc-1.jsonl")) == "abc-1"
@@ -1062,7 +1063,7 @@ def test_api_archived_state_and_visible_stats():
     sb = _load_app()
     conn = _temp_db()
     db_path = conn.execute("PRAGMA database_list").fetchone()[2]
-    orig_connect, old_archive = indexer.connect, reasoning.ARCHIVE
+    orig_connect, old_archive, old_sources = indexer.connect, reasoning.ARCHIVE, sb.SOURCES
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1070,10 +1071,15 @@ def test_api_archived_state_and_visible_stats():
             raw = root / "raw" / "2026" / "05"
             raw.mkdir(parents=True)
             (raw / "aged-has-copy.jsonl").write_text(_cl_transcript("x"))
-            indexer.upsert(_header("live"), conn=conn)
+            # restorable is decided per ROW: the recorded project_path must be
+            # inside the adapter's tree, as it is for a session indexed here.
+            from sources.claude import ClaudeSource
+            proj = root / "claude" / "-Users-x-proj"
+            sb.SOURCES = {"claude": ClaudeSource(root / "claude")}
+            indexer.upsert(_header("live", project_path=str(proj)), conn=conn)
             conn.execute("UPDATE sessions SET cost_usd=1.0 WHERE session_id='live'")
             for sid in ("aged-has-copy", "aged-no-copy"):
-                indexer.upsert(_header(sid), conn=conn)
+                indexer.upsert(_header(sid, project_path=str(proj)), conn=conn)
                 indexer.archive(sid, indexer.TRANSCRIPT_MISSING, conn=conn)
                 conn.execute("UPDATE sessions SET cost_usd=2.0 WHERE session_id=?", (sid,))
             indexer.upsert(_header("agent-noise", turn_count=0, first_message=""), conn=conn)
@@ -1102,7 +1108,7 @@ def test_api_archived_state_and_visible_stats():
             totals = c.get("/api/stats/timeseries").get_json()["totals"]
             assert totals["sessions"] == 3 and abs(totals["cost"] - 5.0) < 1e-9, totals
     finally:
-        indexer.connect, reasoning.ARCHIVE = orig_connect, old_archive
+        indexer.connect, reasoning.ARCHIVE, sb.SOURCES = orig_connect, old_archive, old_sources
         conn.close()
     print("  ok  /api/sessions?state=archived + stats count aged-out, never noise")
 
@@ -1115,7 +1121,9 @@ def test_api_restore_endpoint_and_resume_refusal():
     sb = _load_app()
     conn = _temp_db()
     db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    import os
     orig_connect, old_archive, old_sources = indexer.connect, reasoning.ARCHIVE, sb.SOURCES
+    old_path = os.environ.get("PATH", "")
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1130,6 +1138,8 @@ def test_api_restore_endpoint_and_resume_refusal():
             conn.commit()
             indexer.connect = lambda *a, **k: orig_connect(db_path)
             sb.SOURCES = {"claude": ClaudeSource(projects)}
+            # resume also requires the CLI on PATH now: stub it (CI has no claude)
+            os.environ["PATH"] = str(_stub_bin(projects.parent / "bins", "claude").parent) + os.pathsep + old_path
             c = sb.app.test_client()
 
             r = c.get("/api/sessions/aged/resume")
@@ -1149,6 +1159,7 @@ def test_api_restore_endpoint_and_resume_refusal():
             assert r.status_code == 409 and r.get_json()["status"] == "no-raw-copy", r.data
     finally:
         indexer.connect, reasoning.ARCHIVE, sb.SOURCES = orig_connect, old_archive, old_sources
+        os.environ["PATH"] = old_path
         conn.close()
     print("  ok  resume refused (409) while aged out; POST restore -> live -> resume ok")
 
@@ -1900,7 +1911,7 @@ def test_watcher_sync_trigger_resyncs_mirror():
     try:
         with tempfile.TemporaryDirectory() as td:
             src = _oc_source(Path(td))
-            assert src.watch_roots() == [src.mirror_dir, src.data_dir]
+            assert [r[0] for r in src.watch_roots()] == [src.mirror_dir, src.data_dir]
             for yes in ("opencode.db", "opencode.db-wal", "opencode-beta.db-wal"):
                 assert src.sync_trigger(src.data_dir / yes) is True, yes
             for no in ("opencode.db-shm", "log/2026.log", "tool-output/tool_x", "auth.json"):
@@ -2375,7 +2386,7 @@ def test_opencode_watch_roots_creates_mirror_dir():
     with tempfile.TemporaryDirectory() as td:
         mirror = Path(td) / "mirror"
         roots = OpenCodeSource(data_dir=Path(td) / "data", mirror_dir=mirror).watch_roots()
-        assert mirror.is_dir() and mirror in roots, (mirror.exists(), roots)
+        assert mirror.is_dir() and mirror in [r[0] for r in roots], (mirror.exists(), roots)
     print("  ok  opencode watch_roots() materialises the mirror dir")
 
 
@@ -2925,8 +2936,8 @@ def test_archive_reason_uses_content_signals_and_watcher_agrees():
     import watcher
     conn = _temp_db()
     db_path = conn.execute("PRAGMA database_list").fetchone()[2]
-    indexer.upsert(_header("cmd-only", turn_count=0, first_message="", project_path="/p"), conn=conn)
-    indexer.upsert(_header("empty", turn_count=0, first_message="", project_path="/p"), conn=conn)
+    indexer.upsert(_header("cmd-only", turn_count=0, first_message="", project_path="/p/-proj"), conn=conn)
+    indexer.upsert(_header("empty", turn_count=0, first_message="", project_path="/p/-proj"), conn=conn)
     conn.execute("UPDATE sessions SET output_tokens=3000, model_used='claude-opus-4-5' WHERE session_id='cmd-only'")
     conn.commit()
     rows = {r["session_id"]: r for r in conn.execute("SELECT * FROM sessions")}
@@ -2944,8 +2955,8 @@ def test_archive_reason_uses_content_signals_and_watcher_agrees():
 
             def __init__(self, p):
                 self.src_path = p
-        h.on_deleted(Ev("/p/cmd-only.jsonl"))
-        h.on_deleted(Ev("/p/empty.jsonl"))
+        h.on_deleted(Ev("/p/-proj/cmd-only.jsonl"))     # <projects>/<project>/<sid>.jsonl
+        h.on_deleted(Ev("/p/-proj/empty.jsonl"))
         got = {r[0]: r[1] for r in conn.execute("SELECT session_id, archived_reason FROM sessions")}
         assert got == {"cmd-only": indexer.TRANSCRIPT_MISSING, "empty": indexer.NOT_A_SESSION}, got
     finally:
@@ -3026,6 +3037,1285 @@ def test_opencode_reimport_empty_directory_falls_back_to_home():
         assert ok is True and seen["cwd"] == Path.home(), (seen, detail)
         assert "directory" in detail and str(Path.home()) in detail, detail
     print("  ok  opencode re-import: empty directory -> $HOME, and the note says so")
+
+
+# --- stats-report windows: cutoff day is not leaked --------------------------
+def test_stats_report_windows_do_not_leak_the_cutoff_day():
+    """`sb stats` 7-day / 30-day windows must agree with the UI's days filter:
+    a row at 00:00 on the cutoff day is OUTSIDE a window that starts later
+    that day. datetime('now', '-N days') spells the cutoff with a space, which
+    sorts below the stored 'T' and pulled the whole day in."""
+    mod = _load_script("stats-report")
+    conn = _temp_db()
+    try:
+        row = conn.execute(
+            "SELECT strftime('%Y-%m-%dT00:00:00.000Z','now','-7 days') AS edge, "
+            "strftime('%Y-%m-%dT%H:%M:%S.000Z','now','-6 days') AS inside").fetchone()
+        indexer.upsert(_header(sid="edge", last_activity=row["edge"]), conn=conn)
+        indexer.upsert(_header(sid="inside", last_activity=row["inside"]), conn=conn)
+        line = mod._window(conn, "7 days", "AND " + mod.since_sql(7))
+        assert "   1 sessions" in line, line
+        assert mod.since_sql(7).count("'T'") == 0 and "T%H" in mod.since_sql(7), mod.since_sql(7)
+    finally:
+        conn.close()
+    print("  ok  stats-report windows use the transcript timestamp spelling")
+
+
+# --- pricing.json tracks the published Claude list prices --------------------
+def test_pricing_matches_published_claude_list_prices():
+    """Per-million list prices as published on platform.claude.com/docs/en/about-claude/pricing
+    (checked 2026-09-11). The old table priced every Opus at the retired Opus 4.1
+    rate ($15/$75), tripling the Usage tab for Opus 4.5+ / Opus 5, priced Sonnet 5
+    at the Sonnet 4.x rate, Haiku 4.5 at the Haiku 3.5 rate, and had no Fable /
+    Mythos tier at all (cost counted as $0 with a nightly warning)."""
+    pricing = costs.load_pricing()
+    M = 1_000_000
+
+    def usd(model, **tok):
+        return round(costs.cost_usd(model, dict(tok), pricing), 4)
+
+    # Opus 4.5 .. Opus 5 (both '4-7' and '4.7' spellings occur in transcripts)
+    for m in ("claude-opus-5", "claude-opus-4-8", "claude-opus-4.7", "claude-opus-4-6", "claude-opus-4-5"):
+        assert usd(m, input=M) == 5.0, (m, usd(m, input=M))
+        assert usd(m, output=M) == 25.0, m
+        assert usd(m, cache_read=M) == 0.5 and usd(m, cache_write=M) == 6.25, m
+    # retired Opus 4 / 4.1 keep the old rate
+    for m in ("claude-opus-4-1", "claude-opus-4"):
+        assert usd(m, input=M) == 15.0 and usd(m, output=M) == 75.0, m
+    # Sonnet 5 vs Sonnet 4.x
+    assert usd("claude-sonnet-5", input=M) == 2.0 and usd("claude-sonnet-5", output=M) == 10.0
+    assert usd("claude-sonnet-5", cache_read=M) == 0.2 and usd("claude-sonnet-5", cache_write=M) == 2.5
+    for m in ("claude-sonnet-4.6", "claude-sonnet-4-5", "claude-sonnet-4"):
+        assert usd(m, input=M) == 3.0 and usd(m, output=M) == 15.0, m
+    # Haiku 4.5 vs Haiku 3.5
+    assert usd("claude-haiku-4.5", input=M) == 1.0 and usd("claude-haiku-4.5", output=M) == 5.0
+    assert usd("claude-haiku-4-5", cache_read=M) == 0.1 and usd("claude-haiku-4-5", cache_write=M) == 1.25
+    assert usd("claude-3-5-haiku", input=M) == 0.8 and usd("claude-3-5-haiku", output=M) == 4.0
+    # Fable / Mythos 5.1: cache hits are 0.025x; Fable / Mythos 5: 0.1x
+    for m in ("claude-fable-5-1", "claude-mythos-5-1", "claude-fable-5.1"):
+        assert usd(m, input=M) == 10.0 and usd(m, output=M) == 50.0, m
+        assert usd(m, cache_read=M) == 0.25 and usd(m, cache_write=M) == 12.5, m
+    for m in ("claude-fable-5", "claude-mythos-5"):
+        assert usd(m, input=M) == 10.0 and usd(m, output=M) == 50.0, m
+        assert usd(m, cache_read=M) == 1.0 and usd(m, cache_write=M) == 12.5, m
+    # OpenAI (developers.openai.com/api/docs/pricing, 2026-09-11): each 5.x
+    # generation is priced on its own, not at the launch gpt-5 rate
+    for m, inp, out in (("gpt-5", 1.25, 10.0), ("gpt-5.1", 1.25, 10.0), ("gpt-5.2", 1.75, 14.0),
+                        ("gpt-5.3-codex", 1.75, 14.0), ("gpt-5.4", 2.5, 15.0), ("gpt-5.5", 5.0, 30.0),
+                        ("gpt-5-mini", 0.25, 2.0), ("gpt-5.4-mini", 0.75, 4.5),
+                        ("gpt-5-nano", 0.05, 0.4), ("gpt-5.4-nano", 0.2, 1.25)):
+        assert usd(m, input=M) == inp, (m, usd(m, input=M))
+        assert usd(m, output=M) == out, (m, usd(m, output=M))
+        assert usd(m, cache_read=M) == round(inp / 10, 4), m   # cached input = 0.1x
+    # unknown stays unknown (loud $0), never a guess
+    assert costs.tier_for_model("claude-nova-9", pricing) is None
+    print("  ok  pricing.json matches the published Claude + OpenAI list prices")
+
+
+# --- Codex cost extractor reads the model from a top-level turn_context ------
+def test_codex_cost_extractor_reads_model_from_top_level_turn_context():
+    """Real rollouts write turn_context as the RECORD type ({"type":
+    "turn_context", "payload": {"model": "gpt-5.5", ...}}); the adapter reads it
+    there, so rows say gpt-5.5, but the cost extractor only looked for
+    payload.type == "turn_context", never saw a model, and silently billed every
+    Codex session at its "gpt-5" fallback tier. Both spellings must resolve."""
+    cc = _load_script("compute-costs")
+    usage = {"type": "token_count", "info": {"total_token_usage": {
+        "input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 250,
+        "reasoning_output_tokens": 0}}}
+    meta = {"timestamp": "2026-08-01T10:00:00Z", "type": "session_meta",
+            "payload": {"id": _CX_ID, "timestamp": "2026-08-01T10:00:00Z", "cwd": "/x",
+                        "cli_version": "0.150.1", "model_provider": "openai"}}
+    top_level = [meta,
+                 {"timestamp": "2026-08-01T10:00:01Z", "type": "turn_context",
+                  "payload": {"cwd": "/x", "model": "gpt-5.5", "approval_policy": "never"}},
+                 _cx_line(3, usage)]
+    in_payload = [meta, _cx_line(2, {"type": "turn_context", "model": "gpt-5.5"}), _cx_line(3, usage)]
+    with tempfile.TemporaryDirectory() as td:
+        for label, recs in (("top-level", top_level), ("payload.type", in_payload)):
+            p = Path(td) / f"{label}.jsonl"
+            p.write_text("".join(json.dumps(r) + "\n" for r in recs))
+            totals, per_model = cc._usage_codex(p)
+            assert totals["input"] == 600 and totals["cache_read"] == 400, totals
+            assert list(per_model) == ["gpt-5.5"], (label, dict(per_model))
+    print("  ok  codex cost extractor attributes tokens to the rollout's real model (both dialects)")
+
+
+# ===== final review: OpenCode mirror safety ==================================
+def test_opencode_deleted_session_kept_when_reasoning_archive_is_disabled():
+    """With [reasoning] enabled = false the default archiver was a silent no-op
+    and _remove_deleted still unlinked: the LAST copy of a deleted OpenCode
+    session was destroyed. The file is kept and the report says why."""
+    import sbconfig
+    old = sbconfig.REASONING_ENABLED
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        path = next(iter(src.discover()))
+        _oc_wipe(src.db_path)
+        sbconfig.REASONING_ENABLED = False
+        try:
+            r = src.sync()
+        finally:
+            sbconfig.REASONING_ENABLED = old
+        assert r.removed == [] and path.exists(), r
+        assert any("reasoning" in w and "keeping" in w for w in r.warnings), r.warnings
+    print("  ok  opencode: reasoning archive off -> a deleted session's mirror file is kept")
+
+
+def test_opencode_sync_never_removes_mirror_files_projected_from_another_db():
+    """A daemon that resolves a DIFFERENT OpenCode DB (XDG_DATA_HOME/OPENCODE_DB
+    set in the shell, not in the launchd/systemd job) must not archive and
+    unlink every mirror file the hook wrote from the real DB. Line 1 records
+    the source DB; a mismatch is skipped, never deleted."""
+    from sources.opencode import OpenCodeSource
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        real = _oc_source(root)
+        path = next(iter(real.discover()))
+        other_dir = root / "other"
+        other_dir.mkdir()
+        c = sqlite3.connect(str(other_dir / "opencode.db"))
+        _oc_schema(c)
+        c.close()                                            # valid, empty
+        other = OpenCodeSource(data_dir=other_dir, mirror_dir=real.mirror_dir)
+        r = other.sync()
+        assert path.exists() and r.removed == [], r
+        assert r.skipped >= 1 and any("another OpenCode DB" in w for w in r.warnings), r
+    print("  ok  opencode: a mirror file projected from another DB is never archived or unlinked")
+
+
+def test_opencode_atomic_writes_use_unique_temp_names_and_sync_is_serialised():
+    """The hook (idle + 1.5 s) and the watcher (WAL + 2.5 s) both project the
+    same root; a fixed <file>.tmp name let two writers interleave and one crash
+    on os.replace. Temp names are unique per writer and sync() holds
+    <mirror>/.sync.lock so concurrent syncs serialise."""
+    import fcntl
+    import os as _os
+    import threading
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        seen = []
+        real_replace = _os.replace
+
+        def spy(a, b):
+            seen.append(str(a))
+            real_replace(a, b)
+        _os.replace = spy
+        try:
+            src.sync(force=True)
+            src.sync(force=True)
+        finally:
+            _os.replace = real_replace
+        tmps = [s for s in seen if ".tmp" in s]
+        assert len(tmps) >= 4 and len(set(tmps)) == len(tmps), tmps
+        assert not list(src.mirror_dir.glob("*.tmp")), "temp litter"
+        lock = src.mirror_dir / ".sync.lock"
+        fh = open(lock, "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (src.sync(force=True), done.set()), daemon=True)
+        t.start()
+        assert not done.wait(0.5), "sync() ran while another writer held the mirror lock"
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        assert done.wait(10), "sync() never completed after the lock was released"
+    print("  ok  opencode: unique temp names, concurrent sync() serialised on the mirror lock")
+
+
+def test_opencode_discover_survives_an_unwritable_mirror_dir():
+    """sync() raised OSError out of discover() (manifest write on a read-only
+    mirror dir) and every batch script calls discover() outside its per-file
+    try — one bad directory took the whole nightly down for EVERY source. A
+    failed sync degrades to 'serve what is already mirrored' plus a warning."""
+    import os as _os
+    if _os.geteuid() == 0:
+        print("  --  skipped: root ignores directory permissions")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        path = next(iter(src.discover()))
+        src.mirror_dir.chmod(0o555)
+        try:
+            r = src.sync(force=True)
+            assert any("mirror" in w for w in r.warnings), r
+            src._last_sync = 0.0
+            assert list(src.discover()) == [path]
+        finally:
+            src.mirror_dir.chmod(0o755)
+    print("  ok  opencode: an unwritable mirror dir warns instead of crashing every source's batch")
+
+
+def test_opencode_reprojection_keeps_inlined_tool_output_after_the_blob_is_purged():
+    """OpenCode purges spilled tool outputs after 7 days; the mirror inlined the
+    blob while it existed, but every re-projection rebuilt parts from the DB
+    and dropped the copy again — and the smaller file became a new raw archive
+    version, so Restore would have brought back the lossy one."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = _oc_source(root, seed=False)
+        conn = sqlite3.connect(str(src.db_path))
+        _oc_seed(conn)
+        spill_dir = src.data_dir / "tool-output"
+        spill_dir.mkdir()
+        blob = spill_dir / "tool_keepme"
+        blob.write_text("line\n" * 3000)
+        conn.execute("INSERT INTO part VALUES (?, 'msg_a1', ?, ?, ?, ?)",
+                     ("prt_keep", _OC_ROOT, _OC_T0 + 2100, _OC_T0 + 2100, json.dumps({
+                         "type": "tool", "tool": "bash", "callID": "prt_keep",
+                         "state": {"status": "completed", "input": {"command": "cat big"},
+                                   "output": "(truncated preview)", "title": "cat big",
+                                   "metadata": {"truncated": True, "outputPath": str(blob)}}})))
+        conn.commit()
+        src.sync()
+        blob.unlink()                                        # the 7-day purge
+        conn.execute("INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+                     ("msg_later", _OC_ROOT, _OC_T0 + 90_000, _OC_T0 + 90_000,
+                      json.dumps({"role": "user"})))
+        conn.commit()
+        conn.close()
+        r = src.sync()
+        assert r.written == [_OC_ROOT], r
+        path = src.mirror_dir / f"{_OC_ROOT}.jsonl"
+        a1 = next(json.loads(l) for l in path.read_text().splitlines()[1:]
+                  if json.loads(l)["info"]["id"] == "msg_a1")
+        part = next(pd for pd in a1["parts"] if pd["id"] == "prt_keep")
+        assert part["state"]["output"] == "line\n" * 3000, part["state"]["output"][:40]
+        assert part["state"]["metadata"]["inlined"] is True
+    print("  ok  opencode: re-projection carries an inlined tool output forward after the blob is purged")
+
+
+def test_opencode_unattributed_assistant_spend_is_bucketed_not_dropped():
+    """An assistant message without providerID/modelID contributed nothing to
+    the roll-up while the cost extractor still reported the total as
+    authoritative — a renamed field upstream would silently zero every OpenCode
+    session. Unknown spend lands in an 'unknown/unknown' bucket and sync warns."""
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        conn = sqlite3.connect(str(src.db_path))
+        conn.execute("INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+                     ("msg_nomodel", _OC_ROOT, _OC_T0 + 9000, _OC_T0 + 9000, json.dumps({
+                         "role": "assistant", "cost": 9.99,
+                         "tokens": {"input": 50000, "output": 9000, "reasoning": 0,
+                                    "cache": {"read": 0, "write": 0}}})))
+        conn.commit()
+        conn.close()
+        r = src.sync()
+        head = json.loads(next(iter(src.discover())).read_text().splitlines()[0])
+        bucket = head["stats"]["models"].get("unknown/unknown")
+        assert bucket and bucket["input"] == 50000 and bucket["cost"] == 9.99, head["stats"]["models"]
+        assert head["stats"]["cost_usd"] >= 9.99, head["stats"]
+        assert any("unknown" in w.lower() and "model" in w.lower() for w in r.warnings), r.warnings
+    print("  ok  opencode: spend without a model name is bucketed and warned, never dropped")
+
+
+def test_opencode_hook_does_not_archive_a_raw_copy_per_turn():
+    """session.idle fires per turn; the hook spawned extract-reasoning --archive
+    every time and archive_raw writes a new @vN copy whenever the size changed,
+    so a 60-turn session left ~60 full copies. The per-turn spawn refreshes the
+    trail only; the nightly run and archive-then-unlink on deletion own the vault."""
+    import subprocess
+    import sbconfig
+    hook = _load_script("opencode-hook")
+    captured = []
+    real = subprocess.Popen
+    subprocess.Popen = lambda argv, **kw: captured.append(list(argv)) or type("P", (), {"pid": 1})()
+    old_log = sbconfig.LOG_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            sbconfig.LOG_DIR = Path(td) / "logs"
+            sbconfig.LOG_DIR.mkdir()
+            src = _oc_source(Path(td))
+            conn = _temp_db()
+            try:
+                hook.run(_OC_ROOT, adapter=src, conn=conn, spawn=True)
+            finally:
+                conn.close()
+    finally:
+        subprocess.Popen = real
+        sbconfig.LOG_DIR = old_log
+    assert captured and "--archive" not in captured[0], captured
+    assert "--source" in captured[0] and "opencode" in captured[0], captured
+    print("  ok  opencode hook: per-turn spawn refreshes the trail without a new raw copy")
+
+
+def test_opencode_plugin_runs_under_node_and_spawns_on_the_leading_edge():
+    """Bun.spawn inside a bare try/catch meant an OpenCode build that loads
+    plugins under Node silently never indexed anything; and a trailing-edge
+    debounce dropped the LAST turn when `opencode run` exited inside the
+    window. Under node: the first idle event spawns immediately, a burst
+    coalesces into one trailing spawn, and failures are logged, not swallowed."""
+    import shutil
+    import subprocess
+    inst = _load_script("install-opencode-plugin")
+    js = inst.render(repo=_REPO, python=Path("/bin/sh"))
+    assert "typeof Bun" in js and "child_process" in js, "no Node fallback"
+    assert "catch (_) {}" not in js, "failures are still swallowed silently"
+    if not shutil.which("node"):
+        print("  --  node not installed: plugin runtime check skipped")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        log = root / "spawns.log"
+        hook = root / "hook.sh"
+        hook.write_text(f"#!/bin/sh\necho \"$@\" >> '{log}'\n")
+        hook.chmod(0o755)
+        plugin = root / "plugin.mjs"
+        plugin.write_text(js.replace(str(_REPO / "scripts" / "opencode-hook.py"), str(hook)))
+        driver = root / "drive.mjs"
+        driver.write_text(f"""
+import {{ SessionBrowser }} from '{plugin}';
+const h = await SessionBrowser({{}});
+const idle = (id) => h.event({{ event: {{ type: 'session.idle', properties: {{ sessionID: id }} }} }});
+await idle('ses_a'); await idle('ses_a'); await idle('ses_a');
+await new Promise(r => setTimeout(r, 300));
+const fs = await import('node:fs');
+const early = fs.existsSync('{log}') ? fs.readFileSync('{log}', 'utf8').trim().split('\\n').filter(Boolean).length : 0;
+await new Promise(r => setTimeout(r, 2200));
+const late = fs.readFileSync('{log}', 'utf8').trim().split('\\n').filter(Boolean).length;
+console.log(JSON.stringify({{ early, late }}));
+""")
+        p = subprocess.run(["node", str(driver)], capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, p.stderr[-800:]
+        got = json.loads(p.stdout.strip().splitlines()[-1])
+        assert got["early"] == 1, ("first event must spawn immediately", got, p.stderr[-300:])
+        assert got["late"] == 2, ("a burst must coalesce into one trailing spawn", got)
+    print("  ok  opencode plugin: runs under node, leading-edge spawn, burst coalesced")
+
+
+def test_opencode_data_dir_is_watched_non_recursively():
+    """watch_roots() returned the whole OpenCode data dir and the watcher
+    subscribed recursively — log/, tool-output/, snapshot/, project/ are hundreds
+    of directories that never trigger a sync but each cost an inotify watch
+    (ENOSPC on Linux, timer churn on macOS). A root may declare (path, recursive)."""
+    import watcher
+    with tempfile.TemporaryDirectory() as td:
+        src = _oc_source(Path(td))
+        roots = src.watch_roots()
+        as_pairs = [(Path(r[0]), r[1]) if isinstance(r, tuple) else (Path(r), True) for r in roots]
+        assert (src.mirror_dir, True) in as_pairs and (src.data_dir, False) in as_pairs, roots
+        calls = []
+
+        class Obs:
+            def is_alive(self):
+                return True
+
+            def schedule(self, handler, path, recursive=True):
+                calls.append((Path(path), recursive))
+        pairs = watcher._build_watch_pairs()
+        oc = [p for p in pairs if p[1].name == "opencode"]
+        assert oc and all(len(p) == 3 for p in oc), oc
+        sched = watcher._RootScheduler(Obs(), [(src.mirror_dir, src, True), (src.data_dir, src, False)],
+                                       log=lambda m: None)
+        sched.poll()
+        assert (src.data_dir, False) in calls and (src.mirror_dir, True) in calls, calls
+    print("  ok  opencode: the data dir is watched non-recursively (only the DB/WAL matter)")
+
+
+def test_backup_opencode_leaves_no_stub_when_the_snapshot_fails():
+    """A locked DB (OpenCode running) made VACUUM INTO raise; the fallback
+    created the destination file before failing on the same lock, and the
+    0-byte stub then satisfied is_due() for another 7 days."""
+    bk = _load_script("backup-opencode")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        db = root / "opencode.db"
+        c = sqlite3.connect(str(db))
+        _oc_schema(c)
+        c.close()
+        out = root / "snaps"
+        real_connect = sqlite3.connect
+
+        def locked(*a, **kw):
+            conn = real_connect(*a, **kw)
+            if kw.get("uri") and "mode=ro" in str(a[0]):
+                class C:
+                    def execute(self, *x, **y):
+                        raise sqlite3.OperationalError("database is locked")
+
+                    def backup(self, *x, **y):
+                        raise sqlite3.OperationalError("database is locked")
+
+                    def close(self):
+                        conn.close()
+                return C()
+            return conn
+        bk.sqlite3.connect = locked
+        try:
+            try:
+                bk.snapshot(db, out, keep=3)
+                raised = False
+            except sqlite3.OperationalError:
+                raised = True
+        finally:
+            bk.sqlite3.connect = real_connect
+        assert raised, "a locked DB must be reported, not swallowed"
+        assert bk.snapshots(out) == [] and not list(out.glob("*.db")), list(out.iterdir())
+        assert bk.is_due(out, 7) is True
+    print("  ok  backup-opencode: a failed snapshot leaves no stub that would silence is_due()")
+
+
+def test_restore_protects_the_mirror_file_before_copying_and_retries_reimport_when_live():
+    """(a) restore copied the mirror file back BEFORE the .restored marker was
+    written; a watcher sync in that window saw a file with no DB row and no
+    marker and archived + unlinked it — un-restoring the session. The marker
+    goes first now. (b) 'already-live' returned before reimport, so a restore
+    whose import failed could never be retried from the UI."""
+    import restore
+    import shutil
+    old_archive = reasoning.ARCHIVE
+    conn = _temp_db()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reasoning.ARCHIVE = root / "archive"
+            src = _oc_source(root)
+            live = next(iter(src.discover()))
+            indexer.upsert(src.parse_header(live), conn=conn)
+            raw = root / "archive" / "raw" / "2026" / "08"
+            raw.mkdir(parents=True)
+            (raw / f"{_OC_ROOT}.jsonl").write_bytes(live.read_bytes())
+            _oc_wipe(src.db_path)
+            live.unlink()
+            indexer.archive(_OC_ROOT, indexer.TRANSCRIPT_MISSING, conn=conn)
+            marker = live.with_name(live.name + ".restored")
+            seen = []
+            real_copy = shutil.copyfile
+            restore.shutil.copyfile = lambda s, d: seen.append(marker.exists()) or real_copy(s, d)
+            try:
+                src._run_import = lambda file, cwd: (False, "import failed")
+                res = restore.restore_session(_OC_ROOT, conn=conn, registry={"opencode": src})
+            finally:
+                restore.shutil.copyfile = real_copy
+            assert res.status == "restored" and res.reimported is False, res
+            assert seen == [True], "marker must exist before the copy lands"
+            assert marker.exists(), "marker stays until the session is back in the DB"
+            # (b) retry from the UI: file is live, DB still lacks the session
+            calls = []
+            src._run_import = lambda file, cwd: calls.append(file) or (True, "")
+            res = restore.restore_session(_OC_ROOT, conn=conn, registry={"opencode": src})
+            assert res.status == "already-live" and res.reimported is True, res
+            assert calls, "already-live must still offer the re-import"
+    finally:
+        reasoning.ARCHIVE = old_archive
+        conn.close()
+    print("  ok  restore: sidecar before copy; already-live still re-imports")
+
+
+# ===== final review: indexing core ==========================================
+def test_migrate_backfills_archive_reason_from_the_whole_row():
+    """Legacy archived rows (schema v1) were classified from a 3-column
+    projection, so a slash-command-only session with tokens/cost/model was
+    labelled not-a-session — hidden from the Archived tab, never offered for
+    restore — and the idempotency guard made it permanent."""
+    mig = _load_script("migrate-db")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="init-only", turn_count=0, first_message=""), conn=conn)
+        conn.execute("UPDATE sessions SET archived=1, archived_reason=NULL, output_tokens=1200, "
+                     "cost_usd=0.42, model_used='claude-opus-4-8' WHERE session_id='init-only'")
+        indexer.upsert(_header(sid="noise", turn_count=0, first_message=""), conn=conn)
+        conn.execute("UPDATE sessions SET archived=1, archived_reason=NULL WHERE session_id='noise'")
+        conn.commit()
+        mig._backfill_archive_reason(conn)
+        got = dict(conn.execute("SELECT session_id, archived_reason FROM sessions").fetchall())
+        assert got == {"init-only": indexer.TRANSCRIPT_MISSING, "noise": indexer.NOT_A_SESSION}, got
+    finally:
+        conn.close()
+    print("  ok  migrate: legacy archived rows are classified from the whole row")
+
+
+def test_watcher_starts_the_observer_before_subscribing_roots():
+    """watchdog defers emitter start until Observer.start(); roots scheduled
+    BEFORE start raised their inotify ENOSPC out of start() — outside the
+    scheduler's guard — and the daemon died (systemd respawned it into the same
+    crash). The observer is started first so every failure lands in poll()."""
+    import errno
+    import watcher
+
+    class Obs:
+        def __init__(self):
+            self.started = False
+            self.deferred = []
+
+        def is_alive(self):
+            return self.started
+
+        def schedule(self, handler, path, recursive=True):
+            if not self.started:
+                self.deferred.append(path)
+                return
+            raise OSError(errno.ENOSPC, "inotify watch limit reached")
+
+        def start(self):
+            self.started = True
+            if self.deferred:
+                raise OSError(errno.ENOSPC, "inotify watch limit reached")
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "projects"
+        d.mkdir()
+        obs = Obs()
+        logs = []
+        adapter = type("A", (), {"name": "claude"})()
+        roots = watcher.start_watching(obs, [(d, adapter)], log=logs.append)
+        assert obs.started and roots.pending and not roots.scheduled, (roots.pending, roots.scheduled)
+        assert any("cannot watch" in m for m in logs), logs
+    print("  ok  watcher: observer started before roots are subscribed (ENOSPC lands in poll())")
+
+
+def test_watcher_pairs_follow_relocated_cli_homes():
+    """_build_watch_pairs re-derived Claude/Copilot roots from raw config keys,
+    bypassing registry._cli_home(): with CLAUDE_CONFIG_DIR set the watcher
+    subscribed ~/.claude/projects and never indexed a live session. Roots come
+    from the adapters — the single source of truth."""
+    import os as _os
+    import watcher
+    with tempfile.TemporaryDirectory() as td:
+        alt = Path(td) / "alt-claude"
+        (alt / "projects").mkdir(parents=True)
+        old = _os.environ.get("CLAUDE_CONFIG_DIR")
+        _os.environ["CLAUDE_CONFIG_DIR"] = str(alt)
+        try:
+            pairs = watcher._build_watch_pairs()
+        finally:
+            if old is None:
+                _os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                _os.environ["CLAUDE_CONFIG_DIR"] = old
+        claude_roots = [p[0] for p in pairs if p[1].name == "claude"]
+        assert claude_roots == [alt / "projects"], pairs
+    print("  ok  watcher: roots follow CLAUDE_CONFIG_DIR / CODEX_HOME / XDG_DATA_HOME like the registry")
+
+
+def test_backfill_holds_the_write_lock_only_for_the_burst():
+    """parse_header ran inside the open write transaction (commit every 200
+    rows), so a nightly backfill of multi-MB transcripts held the lock for
+    5+ s and the Stop hook's extract-reasoning died with 'database is locked'
+    (busy_timeout 5 s). Headers are parsed outside the transaction and written
+    in one short burst."""
+    import threading
+    import time as _time
+    bf = _load_script("backfill")
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db = f.name
+    indexer.connect(db).close()                         # migrate the schema
+
+    class Slow:
+        name = "claude"
+
+        def discover(self):
+            return [Path(f"/x/s{i}.jsonl") for i in range(5)]
+
+        def parse_header(self, p):
+            _time.sleep(0.12)
+            return _header(sid=p.stem)
+    errors = []
+
+    def run():
+        conn = indexer.connect(db)                      # sqlite connections are per thread
+        try:
+            bf.index_source(conn, "claude", Slow(), commit_every=200)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+        finally:
+            conn.close()
+    t = threading.Thread(target=run)
+    t.start()
+    _time.sleep(0.25)                                   # mid-backfill
+    other = sqlite3.connect(db, timeout=0.25)
+    try:
+        other.execute("PRAGMA busy_timeout=250")
+        other.execute("INSERT INTO session_artifacts (session_id, type, content) VALUES ('h', 'journal', 'x')")
+        other.commit()
+    finally:
+        other.close()
+        t.join()
+    assert not errors, errors
+    c = sqlite3.connect(db)
+    assert c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 5
+    c.close()
+    print("  ok  backfill: parse outside the write transaction; a concurrent writer gets through")
+
+
+def test_codex_corrupt_zst_rollout_is_not_a_session():
+    """zstandard.ZstdError is not a ValueError: a .jsonl.zst whose bytes are not
+    a zstd frame raised straight out of parse_header/parse_full (and the
+    reasoning and cost readers) instead of returning None — a restore that had
+    already copied the file then 500'd in the UI."""
+    cc = _load_script("compute-costs")
+    with tempfile.TemporaryDirectory() as td:
+        cx = _cx_source(Path(td))
+        day = Path(td) / "sessions" / "2026" / "08" / "01"
+        day.mkdir(parents=True)
+        bad = day / (_CX_NAME + ".zst")
+        bad.write_bytes(b"this is not a zstd frame at all")
+        assert cx.parse_header(bad) is None and cx.parse_full(bad) is None
+        assert reasoning.extract_codex(bad) == []
+        totals, per_model = cc._usage_codex(bad)
+        assert not totals and not per_model
+    print("  ok  codex: a corrupt .zst rollout is 'not a session' in every reader, never a traceback")
+
+
+def test_claude_session_id_gate_matches_discover_depth():
+    """discover() globs exactly <projects>/*/*.jsonl, but session_id_for_path
+    accepted a .jsonl at ANY depth: a future <project>/<sid>/workflows/x/
+    journal.jsonl would be indexed as session 'journal' (every one colliding on
+    one row) and then archived by prune because discover() never yields it."""
+    from sources.claude import ClaudeSource
+    with tempfile.TemporaryDirectory() as td:
+        projects = Path(td) / "projects"
+        proj = projects / "-Users-x-proj"
+        proj.mkdir(parents=True)
+        cl = ClaudeSource(projects_dir=projects)
+        sid = "0f0f0f0f-0000-4000-8000-000000000001"
+        assert cl.session_id_for_path(proj / f"{sid}.jsonl") == sid
+        assert cl.session_id_for_path(proj / sid / "workflows" / "wf-1" / "journal.jsonl") is None
+        assert cl.session_id_for_path(projects / "stray.jsonl") is None
+        assert cl.session_id_for_path(proj / "subagents" / "agent-1.jsonl") is None
+    print("  ok  claude: session_id_for_path rejects what discover() would never yield")
+
+
+def test_copilot_factory_default_and_symlink_guard():
+    """(a) an explicit state_dir = "" fell through cfg.get()'s default and made
+    CopilotSource('.') 'available' (a recursive watch on the daemon's cwd);
+    (b) copilot discover() did not skip symlinked session dirs, so a symlink
+    indexed a second row carrying another session's turns."""
+    import sbconfig
+    from sources import registry as reg
+    from sources.copilot import CopilotSource
+    real = sbconfig.source_config
+    sbconfig.source_config = lambda name: {"state_dir": ""} if name == "copilot" else real(name)
+    try:
+        assert reg._make_copilot().state_dir == Path("~/.copilot/session-state").expanduser()
+    finally:
+        sbconfig.source_config = real
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "session-state"
+        real_dir = state / "11111111-1111-4111-8111-111111111111"
+        real_dir.mkdir(parents=True)
+        (real_dir / "workspace.yaml").write_text("cwd: /x\n")
+        (real_dir / "events.jsonl").write_text("")
+        (state / "22222222-2222-4222-8222-222222222222").symlink_to(real_dir)
+        assert [p.parent.name for p in CopilotSource(state).discover()] == [real_dir.name]
+    print("  ok  copilot: empty state_dir means the default; symlinked session dirs are skipped")
+
+
+# ===== final review: archive / restore / costs ===============================
+def test_raw_copy_version_breaks_an_mtime_tie():
+    """Newest-by-mtime tie-broke on the full path string, so @v9 beat @v10 on a
+    1-second-granularity volume or when copy2 preserved an unchanged source
+    mtime — and Restore put back the OLDER, shorter transcript."""
+    import os as _os
+    old_archive = reasoning.ARCHIVE
+    with tempfile.TemporaryDirectory() as td:
+        reasoning.ARCHIVE = Path(td)
+        try:
+            d = Path(td) / "raw" / "2026" / "08"
+            d.mkdir(parents=True)
+            for v in (9, 10):
+                p = d / f"sid-a@v{v}.jsonl"
+                p.write_text("x" * v)
+                _os.utime(p, (1_700_000_000, 1_700_000_000))
+            assert reasoning.find_archived_raw("sid-a").name == "sid-a@v10.jsonl"
+            assert reasoning.archived_raw_index()["sid-a"].name == "sid-a@v10.jsonl"
+        finally:
+            reasoning.ARCHIVE = old_archive
+    print("  ok  raw copies: an mtime tie is broken by the @vN version, not the path string")
+
+
+def test_readable_trail_is_written_atomically_before_the_old_one_is_retired():
+    """write_readable unlinked every older <sid>-*.md FIRST and then wrote the
+    new file non-atomically: a kill or ENOSPC between the two left no trail at
+    all while sessions.reasoning_path still pointed at the deleted file."""
+    import os as _os
+    old_archive = reasoning.ARCHIVE
+    with tempfile.TemporaryDirectory() as td:
+        reasoning.ARCHIVE = Path(td)
+        try:
+            hdr = {"session_id": "sid-trail", "last_activity": "2026-08-01T00:00:00.000Z",
+                   "cli_source": "claude", "cwd": "/x", "folder_name": "x", "title": "Old"}
+            step = reasoning.ReasoningStep(turn_index=0, thinking="why", decision="do", actions=[])
+            first = reasoning.write_readable([step], hdr)
+            assert first.exists()
+            real_replace = _os.replace
+            _os.replace = lambda a, b: (_ for _ in ()).throw(OSError("ENOSPC"))
+            try:
+                try:
+                    reasoning.write_readable([step], {**hdr, "title": "New"})
+                except OSError:
+                    pass
+            finally:
+                _os.replace = real_replace
+            assert first.exists(), "the previous trail must survive a failed rewrite"
+            assert not list(first.parent.glob("*.tmp")), "no temp litter"
+            second = reasoning.write_readable([step], {**hdr, "title": "New"})
+            assert second.exists() and (second == first or not first.exists())
+        finally:
+            reasoning.ARCHIVE = old_archive
+    print("  ok  readable trail: atomic write, previous trail retired only after the new one landed")
+
+
+def test_archive_paths_never_leave_the_vault():
+    """session_id and last_activity are file content (a Codex rollout's payload.id,
+    a mirror header) yet were used as path components: '../x' escaped the
+    archive, and a malformed last_activity produced a one-level directory the
+    raw-copy glob could never see — archived, but permanently unrestorable."""
+    old_archive = reasoning.ARCHIVE
+    with tempfile.TemporaryDirectory() as td:
+        reasoning.ARCHIVE = Path(td) / "archive"
+        try:
+            src = Path(td) / "t.jsonl"
+            src.write_text('{"x":1}\n')
+            for bad in ("../../pwn", "a/b", "a\\b", ".."):
+                try:
+                    reasoning.archive_raw(src, {"session_id": bad, "last_activity": "2026-08-01T00:00:00.000Z"})
+                    raise AssertionError(f"archive_raw accepted {bad!r}")
+                except ValueError:
+                    pass
+                try:
+                    reasoning.write_readable([], {"session_id": bad, "last_activity": "2026-08-01T00:00:00.000Z",
+                                                  "cli_source": "claude", "cwd": "/x", "folder_name": "x"})
+                    raise AssertionError(f"write_readable accepted {bad!r}")
+                except ValueError:
+                    pass
+            dest = reasoning.archive_raw(src, {"session_id": "sid-odd", "last_activity": "2026"})
+            assert dest.parent.relative_to(reasoning.ARCHIVE / "raw").parts == ("0000", "00"), dest
+            assert reasoning.find_archived_raw("sid-odd") == dest
+        finally:
+            reasoning.ARCHIVE = old_archive
+    print("  ok  archive: session ids are validated and odd timestamps still land where the glob looks")
+
+
+def test_compute_costs_never_overwrites_a_price_with_zero_for_unpriced_models():
+    """cost_usd was written unconditionally, so a Copilot session on a model
+    with no pricing alias — or a run with an unreadable pricing.json — zeroed
+    a previously correct cost. When nothing in the session is priced, the
+    stored cost is left alone (and the unknown-model line still warns)."""
+    cc = _load_script("compute-costs")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="cp1", cli_source="copilot"), conn=conn)
+        conn.execute("UPDATE sessions SET cost_usd=1.5 WHERE session_id='cp1'")
+        conn.commit()
+
+        class Ad:
+            name = "copilot"
+
+            def parse_header(self, p):
+                return _header(sid="cp1", cli_source="copilot")
+        cc._EXTRACTORS["copilot"] = lambda p: ({"input": 1000, "output": 10, "cache_read": 0, "cache_write": 0},
+                                              {"gemini-9-ultra": {"input": 1000, "output": 10,
+                                                                  "cache_read": 0, "cache_write": 0}})
+        try:
+            r = cc.process(Path("/x/cp1"), Ad(), conn)
+        finally:
+            cc._EXTRACTORS["copilot"] = cc._usage_copilot
+        assert r is not None and r["cost"] is None, r
+        assert conn.execute("SELECT cost_usd FROM sessions WHERE session_id='cp1'").fetchone()[0] == 1.5
+    finally:
+        conn.close()
+    print("  ok  compute-costs: an unpriced session keeps its stored cost instead of being zeroed")
+
+
+def test_restore_session_batch_survives_one_failure_and_exits_nonzero():
+    """restore-session.py --all --apply had no per-row guard: one locked DB or
+    corrupt rollout aborted the batch mid-way, and main() returned 0 even when
+    every restore failed — on the one command a user runs after losing data."""
+    import restore
+    rs = _load_script("restore-session")
+    rows = [{"session_id": s, "restorable": True, "supported": True, "cli_source": "claude",
+             "folder_name": "x", "last_activity": "2026-08-01T00:00:00.000Z", "title": s,
+             "archived_at": None, "raw_path": None} for s in ("ok1", "boom", "ok2")]
+    calls = []
+
+    def fake(sid):
+        calls.append(sid)
+        if sid == "boom":
+            raise sqlite3.OperationalError("database is locked")
+        return restore.RestoreResult(sid, "restored")
+    real_plan, real_restore = rs.restore.plan, rs.restore.restore_session
+    rs.restore.plan, rs.restore.restore_session = (lambda: rows), fake
+    old_argv = sys.argv
+    sys.argv = ["restore-session.py", "--all", "--apply"]
+    try:
+        try:
+            rs.main()
+            code = 0
+        except SystemExit as e:
+            code = e.code
+    finally:
+        sys.argv = old_argv
+        rs.restore.plan, rs.restore.restore_session = real_plan, real_restore
+    assert calls == ["ok1", "boom", "ok2"], calls
+    assert code not in (0, None), "a failed restore must make the batch exit non-zero"
+    print("  ok  restore-session --all: one failure is reported, the rest proceed, exit is non-zero")
+
+
+def test_redaction_masks_bare_platform_tokens():
+    """Unnamed credentials in tool output — a Slack webhook URL, HF / GitLab /
+    PyPI tokens — reached the readable trail and the MCP egress verbatim."""
+    import redact
+    # Built at runtime: a token-shaped literal in the source trips GitHub's
+    # push protection even though every one of these is fake.
+    slack = "https://hooks." + "slack.com/services/" + "T0" + "A" * 7 + "/B0" + "B" * 7 + "/" + "X" * 24
+    samples = {
+        "slack-webhook": "curl -X POST " + slack,
+        "hf": "export HF_TOKEN=" + "hf_" + "Q" * 34,
+        "gitlab": "git clone https://oauth2:" + "glpat-" + "y" * 20 + "@gitlab.com/x/y.git",
+        "pypi": "twine upload -p " + "pypi-" + "AgEIcHlwaS5vcmc" + "C" * 50,
+    }
+    for name, text in samples.items():
+        out = redact.redact(text)
+        assert out != text and "REDACTED" in out.upper(), (name, out)
+    print("  ok  redaction: Slack webhook, HF, GitLab and PyPI tokens are masked")
+
+
+def test_build_fts_rebuild_with_source_only_clears_that_source():
+    """--rebuild --source claude ran DELETE FROM sessions_fts before narrowing
+    the registry, silently destroying full-text for every OTHER source."""
+    import os as _os
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "r.db"
+        conn = indexer.connect(db)
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(session_id UNINDEXED, body)")
+        for sid, src in (("c1", "claude"), ("x1", "codex")):
+            indexer.upsert(_header(sid=sid, cli_source=src), conn=conn)
+            conn.execute("INSERT INTO sessions_fts (session_id, body) VALUES (?, ?)", (sid, f"body of {sid}"))
+        conn.commit()
+        conn.close()
+        env = {**_os.environ, "SB_DB": str(db), "HOME": td}
+        p = subprocess.run([sys.executable, str(_REPO / "scripts" / "build-fts.py"), "--rebuild", "--source", "claude"],
+                           capture_output=True, text=True, env=env, timeout=120)
+        assert p.returncode == 0, p.stderr[-500:]
+        conn = sqlite3.connect(str(db))
+        left = sorted(r[0] for r in conn.execute("SELECT session_id FROM sessions_fts"))
+        conn.close()
+        assert left == ["x1"], left
+    print("  ok  build-fts: --rebuild --source clears only that source's full-text rows")
+
+
+def test_fts_archived_index_ignores_source_availability():
+    """index_archived received the availability-narrowed registry: once the
+    CLI's transcript tree was gone (the exact end state the archive exists
+    for) the adapter was dropped and every archived row lost full-text — while
+    Restore, using the full registry, still worked."""
+    import os as _os
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        db = home / "r.db"
+        raw = home / "claude-reasoning-archive" / "raw" / "2026" / "08"
+        raw.mkdir(parents=True)
+        sid = "aaaaaaaa-0000-4000-8000-000000000001"
+        (raw / f"{sid}.jsonl").write_text(_cl_transcript("find me in fts", cwd="/Users/x/proj"))
+        conn = indexer.connect(db)
+        indexer.upsert(_header(sid=sid, cli_source="claude", project_path=str(home / "gone")), conn=conn)
+        indexer.archive(sid, indexer.TRANSCRIPT_MISSING, conn=conn)
+        conn.commit()
+        conn.close()
+        env = {**_os.environ, "SB_DB": str(db), "HOME": str(home)}
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        p = subprocess.run([sys.executable, str(_REPO / "scripts" / "build-fts.py")],
+                           capture_output=True, text=True, env=env, timeout=120)
+        assert p.returncode == 0, p.stderr[-500:]
+        assert "+1 archived" in p.stdout, p.stdout
+        conn = sqlite3.connect(str(db))
+        n = conn.execute("SELECT COUNT(*) FROM sessions_fts WHERE sessions_fts MATCH 'fts'").fetchone()[0]
+        conn.close()
+        assert n == 1, n
+    print("  ok  build-fts: archived rows are indexed from the vault even when the CLI's tree is gone")
+
+
+def test_restore_rechecks_the_zst_destination_before_writing():
+    """dest was re-pointed to .zst AFTER the already-live check, so a live cold
+    rollout could be overwritten if an adapter ever returned the plain name."""
+    import restore
+    old_archive = reasoning.ARCHIVE
+    conn = _temp_db()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            reasoning.ARCHIVE = Path(td) / "archive"
+            raw = reasoning.ARCHIVE / "raw" / "2026" / "08"
+            raw.mkdir(parents=True)
+            (raw / "z1.jsonl.zst").write_bytes(b"archived-bytes")
+            live = Path(td) / "live.jsonl.zst"
+            live.write_bytes(b"LIVE")
+            indexer.upsert(_header(sid="z1", cli_source="codex"), conn=conn)
+            indexer.archive("z1", indexer.TRANSCRIPT_MISSING, conn=conn)
+
+            class Ad:
+                name = "codex"
+
+                def restore_path(self, row):
+                    return Path(td) / "live.jsonl"          # plain name; the .zst twin is live
+
+                def parse_header(self, p):
+                    return _header(sid="z1", cli_source="codex")
+            res = restore.restore_session("z1", conn=conn, registry={"codex": Ad()})
+            assert res.status == "already-live", res
+            assert live.read_bytes() == b"LIVE", "a live transcript must never be overwritten"
+    finally:
+        reasoning.ARCHIVE = old_archive
+        conn.close()
+    print("  ok  restore: the .zst twin of the destination counts as live")
+
+
+# ===== final review: UI / API / MCP honesty ==================================
+def _js_function_source(name: str) -> str:
+    """Source text of one top-level `function name(...){ ... }` in the SPA."""
+    html = (_REPO / "session-ui" / "static" / "index.html").read_text()
+    start = html.index(f"function {name}(")
+    if html[max(0, start - 6):start] == "async ":
+        start -= 6
+    depth = 0
+    for i in range(start, len(html)):
+        if html[i] == "{":
+            depth += 1
+        elif html[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return html[start:i + 1]
+    raise AssertionError(f"unterminated function {name}")
+
+
+def test_api_resume_refuses_a_cli_that_is_not_installed():
+    """Resume answered 200 with `cr <id>` for a source whose binary is absent on
+    this machine (rows synced from the other laptop); the user switched
+    terminals and got 'claude is not on PATH'. Bridge already refused — resume
+    now does too, and the SPA can disable the button from /api/sources."""
+    import os
+    from sources.claude import ClaudeSource
+    sb, conn, root, restore = _app_harness()
+    try:
+        indexer.upsert(_header("s1", project_path=str(root / "claude" / "-p")), conn=conn)
+        conn.commit()
+        sb.SOURCES = {"claude": ClaudeSource(root / "claude")}
+        os.environ["PATH"] = str(root / "nobins")
+        c = sb.app.test_client()
+        r = c.get("/api/sessions/s1/resume")
+        assert r.status_code == 409 and "not installed" in r.get_json()["error"], r.data
+        assert c.get("/api/sources").get_json()["claude"]["installed"] is False
+    finally:
+        restore()
+    print("  ok  resume: 409 when the row's CLI is not installed here")
+
+
+def test_api_restorable_is_decided_per_row_not_per_source():
+    """_restore_supported() asked 'does the adapter have restore_path'; the
+    adapter refuses rows whose recorded path is outside its tree (a registry
+    carried from another machine), so Restore was advertised and then 409'd.
+    The API now asks restore.supported_for(row)."""
+    from sources.claude import ClaudeSource
+    sb, conn, root, restore = _app_harness()
+    try:
+        raw = root / "archive" / "raw" / "2026" / "08"
+        raw.mkdir(parents=True)
+        inside, outside = root / "claude" / "-p", Path("/Users/other-laptop/.claude/projects/-p")
+        for sid, pp in (("row-inside", inside), ("row-outside", outside)):
+            (raw / f"{sid}.jsonl").write_text(_cl_transcript("hi", cwd="/x"))
+            indexer.upsert(_header(sid, project_path=str(pp)), conn=conn)
+            indexer.archive(sid, indexer.TRANSCRIPT_MISSING, conn=conn)
+        conn.commit()
+        sb.SOURCES = {"claude": ClaudeSource(root / "claude")}
+        c = sb.app.test_client()
+        rows = {s["session_id"]: s for s in c.get("/api/sessions?state=archived").get_json()}
+        assert rows["row-inside"]["restorable"] is True and rows["row-inside"]["restore_blocker"] is None
+        assert rows["row-outside"]["restorable"] is False and rows["row-outside"]["restore_blocker"] == "unsupported", rows["row-outside"]
+        H = {"X-Requested-With": "session-browser"}
+        assert c.post("/api/sessions/row-outside/restore", headers=H).status_code == 409
+        assert c.post("/api/sessions/row-inside/restore", headers=H).status_code == 200
+    finally:
+        restore()
+    print("  ok  restorable agrees with restore_session() per row")
+
+
+def test_restore_blocker_prefers_no_raw_copy_over_unsupported():
+    """An archived row with no raw copy AND no adapter support was labelled
+    'unsupported', whose tooltip claims 'a raw copy exists' — it does not."""
+    sb, conn, root, restore = _app_harness()
+    try:
+        indexer.upsert(_header("gm-gone", cli_source="gemini"), conn=conn)
+        indexer.archive("gm-gone", indexer.TRANSCRIPT_MISSING, conn=conn)
+        conn.commit()
+        sb.SOURCES = {}
+        row = sb.app.test_client().get("/api/sessions?state=archived").get_json()[0]
+        assert row["restorable"] is False and row["restore_blocker"] == "no-raw-copy", row
+    finally:
+        restore()
+    print("  ok  restore_blocker names the fact that is actually missing")
+
+
+def test_bridge_and_resume_say_when_the_recorded_cwd_is_gone():
+    """`cd <cwd> && <cli> …` died at the cd for a directory from another
+    machine, after the user had already pasted the command. With no such
+    directory the command drops the cd and the primer says so; resume reports
+    origin_cwd_exists."""
+    import os
+    from sources.claude import ClaudeSource
+    sb, conn, root, restore = _app_harness()
+    try:
+        gone = "/Users/other-laptop/code/my proj"
+        indexer.upsert(_header("s1", cwd=gone, project_path=str(root / "claude" / "-p")), conn=conn)
+        conn.commit()
+        sb.SOURCES = {"claude": ClaudeSource(root / "claude")}
+        bins = root / "bins"
+        bins.mkdir()
+        for b in ("claude", "codex"):
+            (bins / b).write_text("#!/bin/sh\nexit 0\n")
+            (bins / b).chmod(0o755)
+        os.environ["PATH"] = str(bins)
+        c = sb.app.test_client()
+        r = c.post("/api/sessions/s1/bridge?target=codex", headers={"X-Requested-With": "x"})
+        assert r.status_code == 200, r.data
+        j = r.get_json()
+        assert not j["command"].startswith("cd "), j["command"]
+        assert "does not exist on this machine" in j["primer"], j["primer"][:400]
+        assert j["origin_cwd_exists"] is False
+        r = c.get("/api/sessions/s1/resume")
+        assert r.status_code == 200 and r.get_json()["origin_cwd_exists"] is False, r.data
+    finally:
+        restore()
+    print("  ok  bridge/resume: a missing origin cwd is reported, never `cd`-ed into")
+
+
+def test_api_sessions_marks_a_truncated_listing():
+    """A hard LIMIT 500 with no marker: the header counted 602 sessions, the
+    list showed 500, and the oldest 102 — the very rows the archive protects —
+    were unreachable from any UI path without a word about it."""
+    sb, conn, root, restore = _app_harness()
+    try:
+        for i in range(503):
+            indexer.upsert(_header(f"s{i:04d}", last_activity=f"2026-01-{1 + i % 28:02d}T00:00:00.000Z"), conn=conn)
+        conn.commit()
+        sb.SOURCES = {}
+        c = sb.app.test_client()
+        r = c.get("/api/sessions")
+        assert len(r.get_json()) == 500
+        assert r.headers.get("X-Result-Truncated") == "1" and r.headers.get("X-Result-Total") == "503", dict(r.headers)
+        r = c.get("/api/sessions?days=0&search=s0002")
+        assert r.headers.get("X-Result-Truncated") in (None, "0")
+    finally:
+        restore()
+    print("  ok  /api/sessions flags a truncated listing with the true total")
+
+
+def test_spa_markdown_blockquote_and_fetch_errors():
+    """(a) mdToHtml sliced the ESCAPED line by the RAW marker length, so every
+    '> ' reasoning line rendered as 't; …'. (b) fetchJson threw Error(status),
+    discarding the server's honest error body."""
+    import shutil
+    import subprocess
+    if not shutil.which("node"):
+        print("  --  node not installed: SPA function check skipped")
+        return
+    src = "\n".join(_js_function_source(n) for n in ("esc", "mdToHtml", "fetchJson"))
+    driver = src + r"""
+const q = mdToHtml("> I need to check the auth flow.\n>\n- item **bold**");
+if (!q.includes("<blockquote") || !q.includes(">I need to check the auth flow.</blockquote>")) { console.error("BAD:" + q); process.exit(2); }
+if (q.includes("t; ")) { console.error("BAD:" + q); process.exit(3); }
+globalThis.fetch = async () => ({ ok: false, status: 409, json: async () => ({ error: "codex is not installed on this machine" }) });
+fetchJson("/x").then(() => process.exit(4)).catch(e => { if (!String(e.message).includes("codex is not installed")) { console.error("BAD:" + e.message); process.exit(5); } console.log("ok"); });
+"""
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "t.js"
+        f.write_text(driver)
+        p = subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, (p.returncode, p.stderr[-400:])
+    print("  ok  SPA: blockquotes render, fetch errors carry the server's message")
+
+
+def test_shell_helpers_read_the_ui_port_from_config():
+    """[ui].port is honoured by app.py, but `sb ui|stop|open` and doctor
+    hard-coded 7655: after the documented remedy for a busy port, sb printed
+    the wrong URL, could not see the running UI, and `sb stop` killed whatever
+    unrelated process held 7655."""
+    import os
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        env = {**os.environ, "HOME": td, "SHELL": "/bin/zsh"}
+        p = subprocess.run(["bash", str(_REPO / "bin" / "install-cr.sh")], env=env, capture_output=True, text=True, timeout=60)
+        assert p.returncode == 0, p.stderr
+        rc = (Path(td) / ".zshrc").read_text()
+        block = rc[rc.index("# >>> session-browser sb >>>"):rc.index("# <<< session-browser sb <<<")]
+        for literal in ("tcp:7655", "127.0.0.1:7655", "7655/tcp"):
+            assert literal not in block, (literal, block)
+        assert "sbconfig" in block, block          # resolved from config; 7655 survives only as the fallback
+    doctor = (_REPO / "bin" / "doctor.sh").read_text()
+    for literal in ("tcp:7655", "localhost:7655", ":7655 "):
+        assert literal not in doctor, ("doctor still hard-codes the port", literal)
+    print("  ok  sb / doctor resolve the UI port from config")
+
+
+def test_stats_report_token_sums_tolerate_null_columns():
+    """_TOK summed the four token columns without per-column COALESCE, so one
+    NULL zeroed a row's whole token count (the dashboard COALESCEs each)."""
+    mod = _load_script("stats-report")
+    conn = _temp_db()
+    try:
+        indexer.upsert(_header(sid="a"), conn=conn)
+        indexer.upsert(_header(sid="b"), conn=conn)
+        conn.execute("UPDATE sessions SET input_tokens=100, output_tokens=50, cache_read_tokens=NULL, cache_write_tokens=NULL WHERE session_id='a'")
+        conn.execute("UPDATE sessions SET input_tokens=10, output_tokens=10, cache_read_tokens=10, cache_write_tokens=10 WHERE session_id='b'")
+        line = mod._window(conn, "all", "")
+        assert "190 tok" in line, line
+    finally:
+        conn.close()
+    print("  ok  stats-report token sums COALESCE per column")
+
+
+def test_mcp_descriptors_flag_archived_rows_and_tolerate_odd_bytes():
+    """search/list returned aged-out sessions with no `archived` field, so the
+    consuming agent suggested `cr <id>` for a transcript that no longer exists;
+    get_reasoning read the trail strictly and one bad byte became a tool error."""
+    import os
+    tmp = tempfile.mkdtemp(prefix="sb-mcp2-")
+    db = str(Path(tmp) / "r.db")
+    os.environ["SESSION_MEMORY_DB"] = db
+    try:
+        conn = indexer.connect(db)
+        try:
+            for sid in ("live", "aged"):
+                indexer.upsert(_header(sid=sid, last_activity="2026-09-01T00:00:00.000Z", title="find me"), conn=conn)
+            indexer.archive("aged", indexer.TRANSCRIPT_MISSING, conn=conn)
+            trail = Path(tmp) / "trail.md"
+            trail.write_bytes(b"# Decision trail\n\xff\xfe odd bytes\n")
+            conn.execute("UPDATE sessions SET reasoning_path=? WHERE session_id='live'", (str(trail),))
+            conn.commit()
+        finally:
+            conn.close()
+        srv_dir = _REPO / "mcp" / "session-memory"
+        sys.path.insert(0, str(srv_dir))
+        spec = _ilu.spec_from_file_location("sb_mcp_server2", srv_dir / "server.py")
+        srv = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(srv)
+        srv.common.DB_PATH = db
+        recent = {r["session_id"]: r for r in srv.list_recent(days=36500)}
+        assert recent["aged"]["archived"] is True and recent["live"]["archived"] is False, recent
+        found = {r["session_id"]: r for r in srv.search_sessions("find me", limit=5)}
+        assert "archived" in found.get("aged", {}), found
+        got = srv.get_reasoning("live")
+        assert "markdown" in got and "odd bytes" in got["markdown"], got
+        assert "Claude" not in (srv.get_reasoning.__doc__ or "") or "CLI" in (srv.get_reasoning.__doc__ or "")
+    finally:
+        os.environ.pop("SESSION_MEMORY_DB", None)
+    print("  ok  MCP: archived flag on descriptors, lenient trail decoding")
+
+
+# ===== final review: installer, jobs, CI, docs ===============================
+def test_render_job_passes_cli_home_env_through_to_the_jobs():
+    """The launchd/systemd jobs propagated only PATH, so CLAUDE_CONFIG_DIR /
+    CODEX_HOME / XDG_DATA_HOME / OPENCODE_DB set in the shell were unknown to
+    the watcher and the nightly refresh — which then indexed the default trees
+    (usually empty) or, worse, a different OpenCode DB."""
+    rj = _load_script("render-job")
+    env = {"SB_VENV_PY": "/v/bin/python", "SB_REPO": "/r", "SB_LOG_DIR": "/l", "SB_HOME_DIR": "/h",
+           "SB_JOB_PATH": "/usr/bin", "SB_JOB_ENV": "CLAUDE_CONFIG_DIR=/alt/claude\nCODEX_HOME=/x y/codex"}
+    plist = rj.render(_REPO / "launchd" / "watcher.plist.template", env, "plist")
+    assert "<key>CLAUDE_CONFIG_DIR</key><string>/alt/claude</string>" in plist, plist
+    assert "<key>CODEX_HOME</key><string>/x y/codex</string>" in plist, plist
+    unit = rj.render(_REPO / "systemd" / "session-browser-watcher.service.template", env, "systemd")
+    assert 'Environment="CLAUDE_CONFIG_DIR=/alt/claude"' in unit and 'Environment="CODEX_HOME=/x y/codex"' in unit, unit
+    # no extra env: the markers render to nothing, never a dangling key
+    plain = rj.render(_REPO / "launchd" / "refresh.plist.template", {k: v for k, v in env.items() if k != "SB_JOB_ENV"}, "plist")
+    assert "__JOB_ENV__" not in plain and "<key></key>" not in plain, plain
+    print("  ok  render-job passes the CLI-home env vars through to the background jobs")
+
+
+def test_installer_survives_a_failing_pipeline_step_and_uninstall_purge_exits_zero():
+    """install.sh ran refresh-all unguarded under set -e: one failing pipeline
+    step (FTS5 missing, a pinned provider absent) aborted BEFORE the hooks and
+    scheduler were installed, leaving a database nothing keeps fresh. And
+    uninstall.sh --purge always exited 1 (its last command was a false test)."""
+    import os
+    import shutil
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        clone = root / "repo"
+        clone.mkdir()
+        files = subprocess.run(["git", "ls-files"], cwd=_REPO, capture_output=True, text=True).stdout.split()
+        for f in files:
+            src = _REPO / f
+            if src.is_file():
+                dst = clone / f
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        # A "venv" whose python is THIS interpreter (the venv locally; the
+        # CI runner's python with requirements installed): the installer then
+        # skips venv creation and pip is already satisfied — no network, no
+        # dependence on a .venv existing in the checkout.
+        (clone / ".venv" / "bin").mkdir(parents=True)
+        os.symlink(sys.executable, clone / ".venv" / "bin" / "python")
+        stub = clone / "scripts" / "refresh-all.py"
+        stub.write_text("#!/usr/bin/env python3\nimport sys\nprint('boom: simulated pipeline failure')\nsys.exit(1)\n")
+        home = root / "home"
+        home.mkdir()
+        env = {**os.environ, "HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "SHELL": "/bin/zsh"}
+        for k in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "OPENCODE_DB"):
+            env.pop(k, None)
+        p = subprocess.run(["bash", "install.sh", "--lite", "--no-scheduler"], cwd=clone, env=env,
+                           capture_output=True, text=True, timeout=600)
+        assert p.returncode == 0, (p.returncode, p.stdout[-1500:], p.stderr[-800:])
+        assert "Session Browser installed" in p.stdout, p.stdout[-800:]
+        assert "pipeline step" in p.stdout or "re-run" in p.stdout, p.stdout[-800:]
+        assert (clone / "config.toml").exists()
+        q = subprocess.run(["bash", "uninstall.sh", "--purge"], cwd=clone, env=env,
+                           capture_output=True, text=True, timeout=120)
+        assert q.returncode == 0, (q.returncode, q.stdout[-600:], q.stderr[-400:])
+        assert not (home / ".session-browser").exists()
+    print("  ok  install.sh continues past a failing pipeline step; uninstall --purge exits 0")
+
+
+def test_ci_runs_every_suite_the_docs_promise():
+    """tests/test_work_journal.py — the enrichment/journal suite — ran in
+    neither CI nor the CONTRIBUTING checklist, so a change to the journal path
+    could pass CI green."""
+    ci = (_REPO / ".github" / "workflows" / "ci.yml").read_text()
+    contributing = (_REPO / "CONTRIBUTING.md").read_text()
+    for suite in ("tests/test_smoke.py", "tests/test_work_journal.py", "tests/test_portability.py"):
+        assert suite in ci, f"{suite} missing from CI"
+        assert suite in contributing, f"{suite} missing from CONTRIBUTING"
+    print("  ok  CI and CONTRIBUTING run all three suites")
+
+
+def test_docs_reference_only_files_flags_and_keys_that_exist():
+    """Documentation drift, checked mechanically: every scripts/*.py and
+    bin/*.sh a doc or skill names must exist; every [ui] key documented in
+    config.toml.example must be read by app.py; the ADDING-A-CLI sample must
+    not gate availability on the binary; setup/README invoke repo scripts via
+    the venv; the Linux prerequisite names a 3.11+ Python; log names are the
+    real ones."""
+    import re
+    import tomllib
+    docs = [_REPO / "README.md", _REPO / "CONTRIBUTING.md", *(_REPO / "docs").glob("*.md"),
+            *(_REPO / "skills").glob("*/SKILL.md")]
+    for doc in docs:
+        text = doc.read_text()
+        for ref in set(re.findall(r"\b(?:scripts|bin)/[A-Za-z0-9_\-]+\.(?:py|sh)\b", text)):
+            assert (_REPO / ref).exists(), f"{doc.name} names {ref}, which does not exist"
+    example = tomllib.loads((_REPO / "config.toml.example").read_text())
+    app_src = (_REPO / "session-ui" / "app.py").read_text()
+    for key in example.get("ui", {}):
+        assert f'"{key}"' in app_src, f"[ui].{key} is documented but nothing reads it"
+    adding = (_REPO / "docs" / "ADDING-A-CLI.md").read_text()
+    sample = adding[adding.index("def is_available"):adding.index("def is_available") + 200]
+    assert "shutil.which" not in sample, "ADDING-A-CLI's is_available() sample gates on the binary"
+    assert "config.toml.example" in adding, "step 3 must point at the committed defaults"
+    setup = (_REPO / "docs" / "SETUP.md").read_text()
+    assert "python3.12" in setup and "sudo apt install python3 python3-venv" not in setup
+    assert "refresh.out.log" in setup and "`refresh.log`" not in setup
+    assert "claude mcp add" in setup.split("**Claude Code**")[1].split("**Codex")[0].split("\n")[0]
+    for doc in (setup, (_REPO / "README.md").read_text()):
+        assert not re.search(r"^\s*scripts/[a-z\-]+\.py", doc, re.M), "bare script invocation runs the system python3"
+    readme_head = (_REPO / "README.md").read_text()[:600]
+    assert "OpenCode" in readme_head, "README's pitch omits OpenCode"
+    for skill in ("checkpoint", "snapshot"):
+        head = (_REPO / "skills" / skill / "SKILL.md").read_text()[:400]
+        assert "scaffold" in head.lower() and "not implemented" in head.lower(), skill
+    for src in ("sources/base.py", "sources/registry.py"):
+        head = (_REPO / src).read_text()[:700]
+        assert "app.py and watcher.py" not in head and "config.toml.example" in head, src
+    print("  ok  docs, config example, skills and docstrings match the code")
 
 
 if __name__ == "__main__":

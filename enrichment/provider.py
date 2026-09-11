@@ -44,18 +44,31 @@ def _finalize_summary(text: str) -> str:
     return text + "…"
 
 
+SESSION_TYPES = {"debugging", "feature", "refactor", "review", "research", "planning", "ops", "other"}
+OUTCOMES = {"completed", "partial", "abandoned", "unknown"}
+
+
 def parse_facet_json(raw: str, provider_name: str, model: str | None = None) -> dict:
     """Strip code fences / preamble, json.loads, validate, coerce, inject _meta."""
     s = raw.strip()
     s = re.sub(r"^```(?:json)?", "", s).strip()
-    s = re.sub(r"```$", "", s).strip()
-    brace = s.find("{")
-    if brace > 0:
-        s = s[brace:]
-    try:
-        data = json.loads(s)
-    except json.JSONDecodeError as e:
-        raise FacetValidationError(f"not valid JSON: {e}") from e
+    # raw_decode from each "{" in turn: the object may sit after a preamble
+    # that itself contains braces ("here is the {summary}…") and may be
+    # followed by a closing fence, a sentence of prose, or both — the most
+    # common LLM shapes. The first brace that decodes into an object wins.
+    data, last_err = None, "no object found"
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", s):
+        try:
+            cand, _end = dec.raw_decode(s[m.start():])
+        except json.JSONDecodeError as e:
+            last_err = str(e)
+            continue
+        if isinstance(cand, dict):
+            data = cand
+            break
+    if data is None:
+        raise FacetValidationError(f"not valid JSON: {last_err}")
     missing = REQUIRED_KEYS - set(data)
     if missing:
         raise FacetValidationError(f"missing keys: {missing}")
@@ -70,6 +83,12 @@ def parse_facet_json(raw: str, provider_name: str, model: str | None = None) -> 
     # them) — coerce to their shape so downstream code never branches on absence.
     for key in ("accomplishments", "explorations", "open_threads"):
         data[key] = [str(x) for x in (data.get(key) or [])]
+    # Closed vocabularies from the prompt; anything else fragments every
+    # by-type / by-outcome histogram.
+    if data.get("session_type") not in SESSION_TYPES:
+        data["session_type"] = "other"
+    if data.get("outcome") not in OUTCOMES:
+        data["outcome"] = "unknown"
     data["goal"] = str(data.get("goal") or "").strip()
     data["reusability"] = str(data.get("reusability") or "").strip()
     data["brief_summary"] = _finalize_summary(data.get("brief_summary", ""))
@@ -119,13 +138,15 @@ def render_prior_context(prior: dict) -> str:
 def render_prompt(turns: list, cli_source: str, model: str, cwd: str,
                   template_path: Path, prior: dict | None = None) -> str:
     lines = []
-    for t in turns[:60]:
+    for i, t in enumerate(turns[:60], 1):
         role = getattr(t, "role", "?").upper()
         # Redact BEFORE the LLM sees the transcript: a summary can't echo a
         # credential it never received, and summarization doesn't need the value.
-        content = _redact.redact((getattr(t, "content", "") or "")[:1500])
+        # Redact first, truncate second — a credential straddling the cut
+        # otherwise leaves a non-matching prefix that reaches the model.
+        content = _redact.redact(getattr(t, "content", "") or "")[:1500]
         if content:
-            lines.append(f"**{role}:** {content}")
+            lines.append(f"[turn {i} · {role}] {content}")
     transcript = "\n\n".join(lines)
     template = Path(template_path).read_text(encoding="utf-8")
     return (template.replace("{cli_source}", cli_source)

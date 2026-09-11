@@ -76,14 +76,14 @@ def main() -> None:
     import hookstate
     import indexer
     import sbconfig
-    from sources.claude import ClaudeSource
+    from sources.registry import _make_claude
 
     sbconfig.ensure_dirs()
 
     # --- inline tier: cheap upsert ---
     header = None
     try:
-        header = ClaudeSource().parse_header(path)
+        header = _make_claude().parse_header(path)
         if header is not None:
             indexer.upsert(header)
             hookstate.mark(header.session_id)

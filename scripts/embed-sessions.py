@@ -19,6 +19,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # install — fetching a missing model here is expected. Interactive queries
 # (UI / MCP) stay strictly offline.
 os.environ.setdefault("SB_ALLOW_MODEL_DOWNLOAD", "1")
+# Loading a cached model printed a tqdm "Loading weights" bar and a
+# FutureWarning to stderr on EVERY nightly run, so refresh.err.log was never
+# empty and stopped being a health signal.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+import warnings  # noqa: E402
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import indexer  # noqa: E402
 import semsearch  # noqa: E402

@@ -19,7 +19,7 @@ enrichment); this skill is the read layer.
 The skill directory may be a symlink into `~/.claude/skills`. Resolve the repo:
 
 ```bash
-REPO="$(cd "$(dirname "$(readlink -f "<this skill dir>/SKILL.md")")/../.." && pwd)"
+REPO="$(cd "$(dirname "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "<this skill dir>/SKILL.md")")/../.." && pwd)"   # readlink -f is missing on macOS < 12.3
 PY="$REPO/.venv/bin/python"
 ```
 
@@ -87,5 +87,4 @@ open the files.
 
 ## Mode: checkpoint (optional, mid/end-session)
 
-Delegate to the repo's `snapshot` / `checkpoint` skills — not required for the
 journal to function; enrichment covers every session automatically.

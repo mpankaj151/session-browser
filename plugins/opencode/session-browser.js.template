@@ -7,26 +7,59 @@
 // OpenCode void-s the event hook (never awaited) and does not catch its
 // rejections, so everything here is try/catch-ed and nothing is awaited. The
 // hook process is detached (unref) and always exits 0. session.idle fires per
-// turn and per child session, so spawns are debounced per session id.
+// turn and per child session: the FIRST event spawns immediately (a one-shot
+// `opencode run` may exit before any timer fires) and a burst coalesces into
+// one trailing spawn. Runs under Bun or Node; failures are logged, not swallowed.
+import { createRequire } from "node:module";
+const _require = createRequire(import.meta.url);   // ES module: no bare `require` under Node
 const PY = "__VENV_PY__";
 const HOOK = "__HOOK__";
-const pending = new Map();
+const LOG = "__LOG_DIR__/opencode-plugin.log";
+const pending = new Map();   // session id -> { timer, again }
+
+function note(msg) {
+  try {
+    _require("node:fs").appendFileSync(LOG, new Date().toISOString() + "  " + msg + "\n");
+  } catch (_) { /* logging must never throw into OpenCode */ }
+}
 
 function spawn(args) {
   try {
-    const proc = Bun.spawn([PY, HOOK, ...args], {
-      stdin: "ignore", stdout: "ignore", stderr: "ignore",
-      env: { ...process.env, OPENCODE_DISABLE_AUTOUPDATE: "1" },
-    });
+    const env = { ...process.env, OPENCODE_DISABLE_AUTOUPDATE: "1" };
+    if (typeof Bun !== "undefined" && Bun.spawn) {
+      const proc = Bun.spawn([PY, HOOK, ...args], { stdin: "ignore", stdout: "ignore", stderr: "ignore", env });
+      proc.unref();
+      return;
+    }
+    const cp = _require("node:child_process");
+    const proc = cp.spawn(PY, [HOOK, ...args], { detached: true, stdio: "ignore", env });
+    proc.on("error", (e) => note("spawn error: " + (e && e.message ? e.message : e)));
     proc.unref();
-  } catch (_) {}
+  } catch (e) {
+    note("spawn failed: " + (e && e.message ? e.message : e));
+  }
 }
 
+// Leading + trailing edge: spawn now if nothing is pending for this id; while
+// the timer runs, remember that more events arrived and spawn once more when it
+// fires — so the last turn of a burst is indexed too.
 function schedule(id, args, delayMs) {
   try {
-    clearTimeout(pending.get(id));
-    pending.set(id, setTimeout(() => { pending.delete(id); spawn(args); }, delayMs));
-  } catch (_) {}
+    const entry = pending.get(id);
+    if (entry) { entry.again = true; entry.args = args; return; }
+    spawn(args);
+    const timer = setTimeout(() => {
+      try {
+        const e = pending.get(id);
+        pending.delete(id);
+        if (e && e.again) spawn(e.args);
+      } catch (err) { note("timer error: " + err); }
+    }, delayMs);
+    if (timer && typeof timer.unref === "function") timer.unref();
+    pending.set(id, { timer, again: false, args });
+  } catch (e) {
+    note("schedule failed: " + (e && e.message ? e.message : e));
+  }
 }
 
 export const SessionBrowser = async () => ({
@@ -38,6 +71,8 @@ export const SessionBrowser = async () => ({
       } else if (event.type === "session.deleted" && p.info && p.info.id) {
         schedule(p.info.id, [p.info.id, "--deleted"], 200);
       }
-    } catch (_) {}
+    } catch (e) {
+      note("event handler failed: " + (e && e.message ? e.message : e));
+    }
   },
 });

@@ -42,20 +42,28 @@ from sources.registry import build_source_registry  # noqa: E402
 # spelling so the lexicographic comparison is valid for both. (Migrating legacy
 # one-line summaries to journal grade is a one-time `--force` run, not this
 # predicate's job.)
-STALE_PREDICATE = ("(summary IS NULL "
+STALE_PREDICATE = ("(TRIM(COALESCE(summary, '')) = '' "
                    "OR last_activity > COALESCE(replace(enriched_at, ' ', 'T'), ''))")
+
+# "Nothing to summarise" in the indexer's own vocabulary (infer_archive_reason):
+# typed turns, a first message, or output tokens. turn_count alone counts only
+# TYPED user turns — a /init-only session has none yet did real work.
+HAS_CONTENT = ("(turn_count > 0 OR TRIM(COALESCE(first_message, '')) <> '' "
+               "OR COALESCE(output_tokens, 0) > 0)")
 
 
 def _select_sessions(conn, session_id: str | None, force: bool) -> list:
     """Which sessions this run enriches. --session is the hook fast path and
     still honors staleness (a SessionEnd with no new activity must cost $0);
     --force bypasses it either way."""
+    # turn_count > 0: a session opened and closed at once has nothing to
+    # summarise; selecting it every night and skipping it in the loop made the
+    # log read "N sessions to enrich ... Enriched 0/N" with no reason, forever.
+    base = f"SELECT * FROM sessions WHERE {indexer.LIVE} AND {HAS_CONTENT}"
     if session_id:
         pred = "" if force else f" AND {STALE_PREDICATE}"
-        return conn.execute(
-            f"SELECT * FROM sessions WHERE {indexer.LIVE} AND session_id = ?" + pred,
-            (session_id,)).fetchall()
-    sel = f"SELECT * FROM sessions WHERE {indexer.LIVE}"
+        return conn.execute(base + " AND session_id = ?" + pred, (session_id,)).fetchall()
+    sel = base
     if not force:
         sel += f" AND {STALE_PREDICATE}"
     sel += " ORDER BY last_activity DESC"
@@ -102,13 +110,35 @@ def _slice_turns(turns: list, prior: dict | None, prior_seen: int) -> tuple[list
     tail carries the outcome); re-enrich gets only the turns added since."""
     if prior is not None:
         if prior_seen < len(turns):
-            return turns[prior_seen:], prior
+            new = turns[prior_seen:]
+            # Bounded like the full slice: render_prompt caps at 60, and an
+            # unbounded tail let it drop the OUTCOME of a long resumed session
+            # while turns_seen then marked every dropped turn as seen.
+            return (new[:20] + new[-40:] if len(new) > 60 else new), prior
         # Activity advanced but no new substantive turns parsed (tool-only noise,
         # replayed history) — give the model the tail to verify/adjust cheaply.
         return turns[-30:], prior
     if len(turns) > 60:
         return turns[:20] + turns[-40:], None
     return turns, None
+
+
+def _write_facet(path: Path, facet: dict) -> None:
+    """Atomic: a nightly killed mid-write left truncated JSON that _load_prior
+    swallowed, silently re-paying for a full enrichment."""
+    import os
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(facet, indent=2))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _persist(conn, session_id: str, facet: dict, now_iso: str) -> None:
@@ -191,16 +221,19 @@ def main() -> None:
         sessions = sessions[:args.limit]
     print(f"{len(sessions)} sessions to enrich")
 
-    done = 0
+    done = failed = skipped = 0
     consecutive_failures = 0
     for s in sessions:
         adapter, path = _find_transcript(adapters, s)
         if path is None:
             print(f"  skip {s['session_id'][:8]} (transcript not found)")
+            skipped += 1
             continue
         try:
             parsed = adapter.parse_full(path)
             if parsed is None or not parsed.turns:
+                print(f"  skip {s['session_id'][:8]} (no turns in transcript)")
+                skipped += 1
                 continue
             prior, prior_seen = _load_prior(s, args.force)
             turns_for_llm, prior = _slice_turns(parsed.turns, prior, prior_seen)
@@ -213,8 +246,7 @@ def main() -> None:
             facet = _redact.redact_obj(facet)
             # turns_seen drives the next incremental slice for this session
             facet.setdefault("_meta", {})["turns_seen"] = len(parsed.turns)
-            (sbconfig.FACETS_DIR / f"{s['session_id']}.json").write_text(
-                json.dumps(facet, indent=2))
+            _write_facet(sbconfig.FACETS_DIR / f"{s['session_id']}.json", facet)
             now_iso = to_iso_utc(datetime.now(timezone.utc))
             _persist(conn, s["session_id"], facet, now_iso)
             conn.commit()
@@ -224,7 +256,8 @@ def main() -> None:
             print(f"  ✓ {s['session_id'][:8]} [{s['cli_source']}/{mode}] "
                   f"{facet['brief_summary'][:70]}")
         except Exception as e:  # noqa: BLE001
-            print(f"  ! {s['session_id'][:8]}: {e}", file=sys.stderr)
+            print(f"  ! {s['session_id'][:8]}: {str(e)[:300]}", file=sys.stderr)
+            failed += 1
             consecutive_failures += 1
             if consecutive_failures >= 5:
                 # circuit breaker: exhausted quota / broken provider would
@@ -235,7 +268,11 @@ def main() -> None:
         time.sleep(args.rate_limit)
 
     conn.close()
-    print(f"Enriched {done}/{len(sessions)} sessions.")
+    print(f"Enriched {done}/{len(sessions)} sessions ({skipped} skipped, {failed} failed).")
+    if failed:
+        # A broken provider (expired credential, exhausted quota) used to end a
+        # green night with zero summaries; refresh-all must see it.
+        sys.exit(1)
 
 
 if __name__ == "__main__":

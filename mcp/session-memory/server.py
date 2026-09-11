@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """session-memory MCP server.
 
-Exposes the Session Browser registry to Claude as tools so it can recall and
+Exposes the Session Browser registry to the coding CLI as tools so it can recall and
 reason over past sessions across CLIs. Five core tools plus get_reasoning — a
 deliberate extension surfacing the project's headline decision-trail feature.
 
@@ -12,7 +12,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError as e:  # mcp 2.x renamed FastMCP to MCPServer and changed the tool API
+    raise SystemExit("session-memory needs the mcp 1.x SDK: pip install 'mcp>=1.0,<2' "
+                     f"(installed SDK lacks mcp.server.fastmcp: {e})") from e
 
 import common  # noqa: E402  (same dir — also puts the repo root on sys.path)
 import indexer  # noqa: E402
@@ -31,7 +35,7 @@ def search_sessions(query: str, limit: int = 5) -> list[dict]:
     try:
         ph = ",".join("?" * len(ids))
         rows = conn.execute(
-            f"SELECT session_id, summary, title, topics, last_activity, folder_name, cli_source "
+            f"SELECT session_id, summary, title, topics, last_activity, folder_name, cli_source, archived "
             f"FROM sessions WHERE session_id IN ({ph})", ids
         ).fetchall()
     finally:
@@ -49,6 +53,9 @@ def search_sessions(query: str, limit: int = 5) -> list[dict]:
             "last_activity": r["last_activity"],
             "folder_name": r["folder_name"],
             "cli_source": r["cli_source"],
+            # An aged-out session has no transcript to resume: say so, or the
+            # consuming agent suggests `cr <id>` for a file that no longer exists.
+            "archived": bool(r["archived"]),
         }
         if sid in scores:
             d["_score"] = scores[sid]
@@ -114,8 +121,11 @@ def list_recent(folder: str = "", days: int = 7) -> list[dict]:
     """List sessions active within the last N days, optionally filtered by folder."""
     conn = common.connect()
     try:
-        sql = ("SELECT session_id, title, summary, folder_name, last_activity, cli_source "
-               f"FROM sessions WHERE {indexer.VISIBLE} AND last_activity >= datetime('now', ?)")
+        sql = ("SELECT session_id, title, summary, folder_name, last_activity, cli_source, archived "
+               # strftime with the column's own 'T' spelling: datetime('now', ...) yields
+               # 'YYYY-MM-DD HH:MM:SS', which sorts below every row of the cutoff day.
+               f"FROM sessions WHERE {indexer.VISIBLE} AND "
+               "last_activity >= strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now', ?)")
         params = [f"-{int(days)} days"]
         if folder:
             sql += " AND folder_name = ?"
@@ -127,7 +137,7 @@ def list_recent(folder: str = "", days: int = 7) -> list[dict]:
     return common.clamp([
         {"session_id": r["session_id"], "title": r["title"] or (r["summary"] or "")[:80],
          "folder_name": r["folder_name"], "last_activity": r["last_activity"],
-         "cli_source": r["cli_source"]}
+         "cli_source": r["cli_source"], "archived": bool(r["archived"])}
         for r in rows
     ])
 
@@ -153,11 +163,11 @@ def get_decisions(topic: str, limit: int = 10) -> list[dict]:
 
 @mcp.tool()
 def get_reasoning(session_id: str, query: str = "") -> dict:
-    """The decision/reasoning trail for a session — how Claude reached its
-    decisions. Returns the rendered Markdown trail (or, with a query, the matching
-    reasoning steps). Note: Claude Code stores hidden extended-thinking text empty;
-    this surfaces the visible reasoning + action sequence (Copilot includes its
-    reasoning text)."""
+    """The decision/reasoning trail for a session — how the coding CLI reached
+    its decisions. Returns the rendered Markdown trail (or, with a query, the
+    matching reasoning steps). Note: Claude Code stores hidden extended-thinking
+    text empty; this surfaces the visible reasoning + action sequence (Copilot
+    and OpenCode include their reasoning text)."""
     conn = common.connect()
     try:
         r = conn.execute(
@@ -178,7 +188,7 @@ def get_reasoning(session_id: str, query: str = "") -> dict:
         conn.close()
     if not r or not r["reasoning_path"] or not Path(r["reasoning_path"]).exists():
         return {"error": "no reasoning trail; run extract-reasoning.py for this session"}
-    md = Path(r["reasoning_path"]).read_text(encoding="utf-8")
+    md = Path(r["reasoning_path"]).read_text(encoding="utf-8", errors="replace")
     return common.sanitize({"session_id": session_id, "markdown": md[:6000],
                             "truncated": len(md) > 6000, "path": r["reasoning_path"]})
 

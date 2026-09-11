@@ -96,7 +96,7 @@ def _usage_codex(path: Path) -> tuple[dict, dict]:
     INCLUDES cached; split it so cache_read isn't double-counted. reasoning billed as
     output. Keep the LAST token_count seen (it's the running total). No per-model
     breakdown in the event, so attribute to the session's model."""
-    from sources.codex import open_rollout   # plain or zstd — never a bare open()
+    from sources.codex import ROLLOUT_ERRORS, open_rollout   # plain or zstd — never a bare open()
     totals = defaultdict(int)
     per_model = defaultdict(lambda: defaultdict(int))
     last = None
@@ -106,10 +106,14 @@ def _usage_codex(path: Path) -> tuple[dict, dict]:
             for line in fh:
                 if '"model"' in line and not model:
                     try:
-                        p = json.loads(line).get("payload", {})
-                        if isinstance(p, dict) and p.get("type") == "turn_context":
+                        rec = json.loads(line)
+                        p = rec.get("payload", {}) if isinstance(rec, dict) else {}
+                        # Current rollouts write turn_context as the RECORD type
+                        # (payload = {model, cwd, ...}); older ones nest it as
+                        # payload.type. The adapter accepts both — so must this.
+                        if isinstance(p, dict) and "turn_context" in (rec.get("type"), p.get("type")):
                             model = p.get("model", "") or ""
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, AttributeError):
                         pass
                 if "token_count" not in line:
                     continue
@@ -120,7 +124,7 @@ def _usage_codex(path: Path) -> tuple[dict, dict]:
                 info = p.get("info") if isinstance(p, dict) else None
                 if isinstance(info, dict) and isinstance(info.get("total_token_usage"), dict):
                     last = info["total_token_usage"]
-    except OSError:
+    except ROLLOUT_ERRORS:            # I/O, or a corrupt/truncated zstd frame
         return totals, per_model
     if not last:
         return totals, per_model
@@ -133,7 +137,9 @@ def _usage_codex(path: Path) -> tuple[dict, dict]:
     }
     for k, v in mapped.items():
         totals[k] += v
-        per_model[model or "gpt-5"][k] += v
+        # No turn_context at all: leave the key empty so process() prices it via
+        # the adapter's model_used or reports it unknown — never a silent guess.
+        per_model[model][k] += v
     return totals, per_model
 
 
@@ -183,6 +189,9 @@ def process(path: Path, adapter, conn) -> dict | None:
     res = extractor(path)
     totals, per_model = res[0], res[1]
     authoritative = res[2] if len(res) > 2 else None
+    # An extractor that found tokens but no model name leaves the key empty;
+    # the adapter's model_used is the authority (never a silent tier guess).
+    per_model = {(m or header.model_used or ""): t for m, t in per_model.items()}
     if not per_model:
         return None
     if authoritative is not None:
@@ -190,22 +199,31 @@ def process(path: Path, adapter, conn) -> dict | None:
     else:
         pricing = costs.load_pricing()
         total_cost = 0.0
+        priced_any = False
         for model, toks in per_model.items():
-            if costs.tier_for_model(model, pricing) is None and any(toks.values()):
-                print(f"  ? unknown model '{model}' ({header.session_id[:8]}) — cost counted as $0; "
-                      f"add an alias for it in pricing.json", file=sys.stderr)
+            if costs.tier_for_model(model, pricing) is None:
+                if any(toks.values()):
+                    print(f"  ? unknown model '{model}' ({header.session_id[:8]}) — cost counted as $0; "
+                          f"add an alias for it in pricing.json", file=sys.stderr)
+                continue
+            priced_any = True
             total_cost += costs.cost_usd(model, toks, pricing)
+        if not priced_any:
+            # Nothing in this session is priced (unknown model, or an unreadable
+            # pricing.json): leave the stored cost alone rather than zero it.
+            total_cost = None
     # dominant model = most output tokens
     dominant = max(per_model, key=lambda m: per_model[m]["output"], default=header.model_used)
     models_used = json.dumps(sorted(per_model.keys()))
     conn.execute(
         "UPDATE sessions SET input_tokens=?, output_tokens=?, cache_read_tokens=?, "
-        "cache_write_tokens=?, model_used=COALESCE(model_used, ?), models_used=?, cost_usd=? "
-        "WHERE session_id=?",
+        "cache_write_tokens=?, model_used=COALESCE(model_used, ?), models_used=?, "
+        "cost_usd=COALESCE(?, cost_usd) WHERE session_id=?",
         (totals["input"], totals["output"], totals["cache_read"], totals["cache_write"],
-         dominant, models_used, round(total_cost, 6), header.session_id),
+         dominant, models_used, None if total_cost is None else round(total_cost, 6),
+         header.session_id),
     )
-    return {"session": header.session_id, "cost": round(total_cost, 4), **totals}
+    return {"session": header.session_id, "cost": None if total_cost is None else round(total_cost, 4), **totals}
 
 
 def main() -> None:
@@ -227,7 +245,8 @@ def main() -> None:
                 r = process(path, adapter, conn)
                 if r:
                     n += 1
-                    print(f"  ${r['cost']:.4f}  in={r['input']} out={r['output']} "
+                    shown = "unpriced" if r["cost"] is None else f"${r['cost']:.4f}"
+                    print(f"  {shown}  in={r['input']} out={r['output']} "
                           f"cr={r['cache_read']} cw={r['cache_write']}  {r['session'][:8]}")
             except Exception as e:  # noqa: BLE001
                 print(f"  ! {path.name}: {e}", file=sys.stderr)

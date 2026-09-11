@@ -140,17 +140,19 @@ elif command -v systemctl >/dev/null 2>&1; then
 else
   printf "  \033[33m∼\033[0m no launchd/systemd here — run watcher.py and scripts/refresh-all.py yourself (docs/SETUP.md §5)\n"
 fi
+# The UI port comes from [ui].port (config.toml) — the same value app.py binds.
+UI_PORT="$("$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import sbconfig; print(int(sbconfig.CONFIG.get("ui", {}).get("port", 7655)))' "$REPO" 2>/dev/null || echo 7655)"
 # Is something listening on the UI port? lsof is not a given on Linux.
 port_held() {
-  if command -v lsof >/dev/null 2>&1; then lsof -ti tcp:7655 >/dev/null 2>&1
-  elif command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | grep -q ':7655 '
+  if command -v lsof >/dev/null 2>&1; then lsof -ti tcp:"$UI_PORT" >/dev/null 2>&1
+  elif command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | grep -q ":$UI_PORT "
   else return 1; fi
 }
 # --max-time: a wedged/suspended process holding the port accepts the TCP
 # connect but never answers — without a deadline this health check hangs forever.
-if curl -s --max-time 3 localhost:7655/health >/dev/null 2>&1; then ok "UI responding on :7655"; else
+if curl -s --max-time 3 "localhost:$UI_PORT/health" >/dev/null 2>&1; then ok "UI responding on :$UI_PORT"; else
   if port_held; then
-    printf "  \033[31m✗\033[0m :7655 is held by a process that isn't answering — try: sb stop, then sb ui\n"
+    printf "  \033[31m✗\033[0m :%s is held by a process that isn't answering — try: sb stop, then sb ui\n" "$UI_PORT"
   else
     printf "  \033[33m∼\033[0m UI not running (start with: sb ui)\n"
   fi
