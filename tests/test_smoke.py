@@ -1121,7 +1121,9 @@ def test_api_restore_endpoint_and_resume_refusal():
     sb = _load_app()
     conn = _temp_db()
     db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+    import os
     orig_connect, old_archive, old_sources = indexer.connect, reasoning.ARCHIVE, sb.SOURCES
+    old_path = os.environ.get("PATH", "")
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1136,6 +1138,8 @@ def test_api_restore_endpoint_and_resume_refusal():
             conn.commit()
             indexer.connect = lambda *a, **k: orig_connect(db_path)
             sb.SOURCES = {"claude": ClaudeSource(projects)}
+            # resume also requires the CLI on PATH now: stub it (CI has no claude)
+            os.environ["PATH"] = str(_stub_bin(projects.parent / "bins", "claude").parent) + os.pathsep + old_path
             c = sb.app.test_client()
 
             r = c.get("/api/sessions/aged/resume")
@@ -1155,6 +1159,7 @@ def test_api_restore_endpoint_and_resume_refusal():
             assert r.status_code == 409 and r.get_json()["status"] == "no-raw-copy", r.data
     finally:
         indexer.connect, reasoning.ARCHIVE, sb.SOURCES = orig_connect, old_archive, old_sources
+        os.environ["PATH"] = old_path
         conn.close()
     print("  ok  resume refused (409) while aged out; POST restore -> live -> resume ok")
 
@@ -4235,7 +4240,12 @@ def test_installer_survives_a_failing_pipeline_step_and_uninstall_purge_exits_ze
                 dst = clone / f
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
-        os.symlink(_REPO / ".venv", clone / ".venv")            # no pip run: already satisfied
+        # A "venv" whose python is THIS interpreter (the venv locally; the
+        # CI runner's python with requirements installed): the installer then
+        # skips venv creation and pip is already satisfied — no network, no
+        # dependence on a .venv existing in the checkout.
+        (clone / ".venv" / "bin").mkdir(parents=True)
+        os.symlink(sys.executable, clone / ".venv" / "bin" / "python")
         stub = clone / "scripts" / "refresh-all.py"
         stub.write_text("#!/usr/bin/env python3\nimport sys\nprint('boom: simulated pipeline failure')\nsys.exit(1)\n")
         home = root / "home"

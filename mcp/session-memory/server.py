@@ -12,7 +12,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError as e:  # mcp 2.x renamed FastMCP to MCPServer and changed the tool API
+    raise SystemExit("session-memory needs the mcp 1.x SDK: pip install 'mcp>=1.0,<2' "
+                     f"(installed SDK lacks mcp.server.fastmcp: {e})") from e
 
 import common  # noqa: E402  (same dir — also puts the repo root on sys.path)
 import indexer  # noqa: E402
