@@ -4318,6 +4318,32 @@ def test_docs_reference_only_files_flags_and_keys_that_exist():
     print("  ok  docs, config example, skills and docstrings match the code")
 
 
+def test_spa_heatmap_cells_are_theme_aware():
+    """The heatmap painted every empty cell with an inline dark-navy fill, so
+    in light mode the activity chart was a black block (and a theme toggle
+    never re-renders it). Cells carry hm0..hm4 classes styled per theme."""
+    import shutil
+    import subprocess
+    html = (_REPO / "session-ui" / "static" / "index.html").read_text()
+    assert ".hm0{fill:#e5e7eb}" in html and ".dark .hm0{fill:#1e293b}" in html, "missing theme rules"
+    if not shutil.which("node"):
+        print("  --  node not installed: heatmap check skipped")
+        return
+    src = _js_function_source("heatmap")
+    driver = src + r"""
+const svg = heatmap([{day: new Date().toISOString().slice(0,10), sessions: 3}]);
+if (/fill="#1e293b"/.test(svg)) { console.error("inline dark fill"); process.exit(2); }
+if (!/class="hm hm0"/.test(svg) || !/class="hm hm4"/.test(svg)) { console.error("classes missing: " + svg.slice(0, 200)); process.exit(3); }
+console.log("ok");
+"""
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "t.js"
+        f.write_text(driver)
+        p = subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, p.stderr[-300:]
+    print("  ok  SPA heatmap: theme-aware cell classes, no inline dark fill")
+
+
 if __name__ == "__main__":
     print("Session Browser smoke + regression tests")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

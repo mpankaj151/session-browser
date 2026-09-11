@@ -63,7 +63,7 @@ sb() {
     stop)    PIDS="\$(lsof -ti tcp:"\$P" 2>/dev/null || fuser "\$P"/tcp 2>/dev/null)"; if [ -n "\$PIDS" ]; then kill \$PIDS 2>/dev/null && echo "UI stopped"; else echo "UI not running"; fi ;;
     open)    open "http://127.0.0.1:\$P" 2>/dev/null || xdg-open "http://127.0.0.1:\$P" ;;
     stats)   "\$REPO/.venv/bin/python" "\$REPO/scripts/stats-report.py" "\${@:2}" ;;
-    demo)    "\$REPO/.venv/bin/python" "\$REPO/scripts/demo.py" ;;
+    demo)    "\$REPO/.venv/bin/python" "\$REPO/scripts/demo.py" "\${@:2}" ;;
     doctor)  "\$REPO/bin/doctor.sh" ;;
     refresh) "\$REPO/.venv/bin/python" "\$REPO/scripts/refresh-all.py" "\${@:2}" ;;
     *)       echo "usage: sb {ui|stop|open|stats|demo|doctor|refresh [--enrich]}" ;;

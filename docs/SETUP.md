@@ -53,13 +53,17 @@ source ~/.zshrc
 5. **If Claude Code is present** (`claude` on PATH or `~/.claude` exists):
    registers the Claude Stop + SessionEnd hooks in `settings.json` (backup
    kept; `$CLAUDE_CONFIG_DIR` honoured) — Stop indexes instantly; SessionEnd
-   journals the ended session — and links the shipped skills (work-journal,
-   snapshot, checkpoint) into the same directory's `skills/`. On a laptop
+   journals the ended session — and links the work-journal skill into the same
+   directory's `skills/` (the `checkpoint` / `snapshot` scaffolds are not
+   linked until they are implemented). On a laptop
    without Claude Code this step is skipped with one line; the watcher still
    indexes everything. (OpenCode's equivalent is `--opencode-plugin`.)
 6. Installs the background jobs: launchd agents on macOS, systemd --user units on
-   Linux (live watcher + nightly 01:00 refresh). Without either, it prints the
-   two commands to schedule yourself.
+   Linux (live watcher + nightly 01:00 refresh). `CLAUDE_CONFIG_DIR`,
+   `CODEX_HOME`, `XDG_DATA_HOME` and `OPENCODE_DB` set in the shell that runs
+   the installer are baked into the jobs, so a relocated CLI home is indexed by
+   the daemon too (re-run `./install.sh` after changing them). Without either
+   scheduler, it prints the two commands to schedule yourself.
 
 Install flags:
 

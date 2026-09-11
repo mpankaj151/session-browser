@@ -15,21 +15,26 @@ No cloud services, no telemetry, no external requests — the UI even works offl
 
 ![Session Browser demo — search, cross-CLI bridge, usage dashboard, light/dark](docs/demo.gif)
 
-*30-second tour on synthetic `sb demo` data — sessions list, search, cross-CLI
-bridge, the usage dashboard, and light mode.*
+*30-second tour on synthetic `sb demo` data — the sessions list, search, the
+Archived tab with one-click Restore, the usage dashboard, and light mode.*
 
 ## Why
 
 If you run several AI CLIs and long, multi-day sessions, your work scatters
-across `~/.claude`, `~/.copilot`, and `~/.codex` in formats you can't search,
-resume from elsewhere, or carry between tools. Session Browser unifies them into
-one searchable index and adds the things the CLIs don't give you:
+across `~/.claude`, `~/.copilot`, `~/.codex`, and OpenCode's SQLite database in
+formats you can't search, resume from elsewhere, or carry between tools.
+Session Browser unifies them into one searchable index and adds the things the
+CLIs don't give you:
 
 - **"What would this have cost on the API?"** — real token volume + public
   list-price equivalent, so a flat-rate Max/Pro plan finally has a usage signal.
 - **Resume from anywhere** — not just the original project directory.
-- **Port a session to another CLI** — Claude → Copilot → Codex handoff.
+- **Port a session to another CLI** — Claude ↔ Copilot ↔ Codex ↔ OpenCode handoff.
+- **Nothing ages out** — a session whose transcript the CLI deleted stays in
+  the **Archived** tab, and most come back with one click.
 - **A reasoning trail** — how each session actually reached its decisions.
+- **Any laptop, any subset of CLIs** — one of them or all four, macOS or Linux;
+  the UI only ever offers actions the machine in front of you can perform.
 
 ## Quick start
 
@@ -67,7 +72,7 @@ git clone https://github.com/mpankaj151/session-browser.git && cd session-browse
 cr <session_id>       # resume ANY session in the CURRENT directory
 sb ui                 # start the web UI
 sb stats              # ccusage-style usage report in the terminal
-sb demo               # launch a synthetic-data demo
+sb demo [--port N]    # launch a synthetic-data demo (your data untouched)
 sb doctor             # health check
 sb refresh [--enrich] # run the indexing pipeline now
 ```
@@ -83,6 +88,11 @@ flat plan.
 
 ![Usage dashboard](docs/screenshot-usage.png)
 
+Prices come from `pricing.json`, one tier per model generation (Claude 5 family
+incl. Fable/Mythos, Opus/Sonnet/Haiku 4.x, GPT-5.x; list prices as of
+2026-09). An unknown model is reported, never guessed. OpenCode sessions carry
+their own per-message USD for every provider, so those figures are exact.
+
 Also available in the terminal: `sb stats` (today / 7d / 30d / all).
 
 ### Search everything, three ways
@@ -90,6 +100,8 @@ Also available in the terminal: `sb stats` (today / 7d / 30d / all).
 **Keyword** (title/summary/topics), **Semantic** (vector similarity), and
 **Full-text** (FTS5 over the actual conversation — find sessions by what was
 *discussed*). Filter by folder, source, topic, or time.
+
+![Sessions list](docs/screenshot-sessions.png)
 
 ### AI summaries & topics (uses your own quota)
 
@@ -131,6 +143,13 @@ with one click (**♻ Restore**), after which `cr <id>` and `--resume` work agai
 .venv/bin/python scripts/restore-session.py --all --apply  # restore every one that can
 ```
 
+![Archived tab](docs/screenshot-archived.png)
+
+Restore is offered only when it will succeed: a raw copy exists *and* the
+session's adapter can put it back on this machine (an aged-out row that never
+got a copy says so instead). OpenCode restores also re-import the session into
+OpenCode itself, so `opencode --session <id>` works again.
+
 Raise `cleanupPeriodDays` in `~/.claude/settings.json` to stop the deletions at
 the source; Archived is the safety net for the ones that already happened.
 
@@ -149,7 +168,9 @@ readable archives under `~/claude-reasoning-archive/`.
 
 No CLI can natively resume another's session, so **🌉 Bridge** writes a
 target-specific handoff primer and a command that starts a fresh session in the
-other CLI, in the same project dir, seeded with the full context.
+other CLI, in the same project dir, seeded with the full context. The menu
+lists only the CLIs installed on this machine, and a command never `cd`s into
+a directory that doesn't exist here (sessions synced from another laptop).
 
 ### Carry context between sessions
 
@@ -162,14 +183,17 @@ command, and pointers to the transcript + trail.
 Every primer that leaves the tool (Copy, Export, Bridge), the full-text index,
 the reasoning archive, LLM enrichment (both the prompt and what gets stored),
 and every MCP tool result pass through `redact.py`, which masks API keys and
-tokens (`sk-`, `sk_live_`, `github_pat_`, `npm_`, `xox*`, AWS, Google, JWT,
-`Authorization:` headers), `*_SECRET`/`*_KEY` assignments (including JSON
-form), `user:password@` URL credentials, and private-key blocks.
+tokens (`sk-`, `sk_live_`, `github_pat_`, `npm_`, `xox*`, `hf_`, `glpat-`,
+`pypi-`, Slack webhook URLs, AWS, Google, JWT, `Authorization:` headers),
+`*_SECRET`/`*_KEY` assignments (including JSON form), `user:password@` URL
+credentials, and private-key blocks.
 
-### MCP server — let Claude recall past work
+### MCP server — let your CLI recall past work
 
 Six stdio tools (`search_sessions`, `get_session_summary`, `get_session_snippet`,
-`list_recent`, `get_decisions`, `get_reasoning`). Registration in
+`list_recent`, `get_decisions`, `get_reasoning`), nothing Claude-specific in
+them; descriptors flag aged-out sessions so an agent never suggests resuming a
+transcript that is gone. Registration for all four CLIs in
 [docs/SETUP.md](docs/SETUP.md).
 
 ### Work journal — your performance review, already written
@@ -199,17 +223,27 @@ generated from the journal, never by re-reading months of transcripts.
 - **Nightly refresh** (01:00) runs the full pipeline: costs, reasoning, full-text,
   embeddings, LLM journals for anything the hooks missed, daily digests.
 
-macOS wires these via launchd, Linux via systemd --user units — both installed by `install.sh` (details in
+macOS wires these via launchd, Linux via systemd --user units — both installed
+by `install.sh`, and both inherit `CLAUDE_CONFIG_DIR` / `CODEX_HOME` /
+`XDG_DATA_HOME` / `OPENCODE_DB` from the shell that ran the installer (details in
 [docs/SETUP.md](docs/SETUP.md)).
 
 ## Supported CLIs
 
-| CLI | Index | Cost | Reasoning | Resume | Bridge |
-|-----|:--:|:--:|:--:|:--:|:--:|
-| Claude Code | ✅ | ✅ | ✅ visible + flagged | ✅ | ✅ |
-| GitHub Copilot CLI | ✅ | ✅ | ✅ real reasoning text | ✅ | ✅ |
-| Codex CLI | ✅ | ✅ | ✅ visible + flagged | ✅ | ✅ |
-| OpenCode | ✅ | ✅ real per-message USD, any provider | ✅ real reasoning text | ✅ | ✅ |
+| CLI | Index | Cost | Reasoning | Resume | Bridge | Archive → Restore |
+|-----|:--:|:--:|:--:|:--:|:--:|:--:|
+| Claude Code | ✅ | ✅ | ✅ visible + flagged | ✅ | ✅ | ✅ |
+| GitHub Copilot CLI | ✅ | ✅ | ✅ real reasoning text | ✅ | ✅ | ✅ |
+| Codex CLI | ✅ | ✅ | ✅ visible + flagged | ✅ | ✅ | ✅ (plain or zstd rollouts) |
+| OpenCode | ✅ | ✅ real per-message USD, any provider | ✅ real reasoning text | ✅ | ✅ | ✅ + re-import into OpenCode |
+
+Any subset works. A CLI counts as present when its **transcripts** are on disk —
+indexing, search, costs, the archive and Restore never need the binary; only
+Resume and Bridge do, and the UI checks that per machine. Relocated homes
+(`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, `OPENCODE_DB`) are honoured
+everywhere, `config.toml` is a per-machine override layered over
+`config.toml.example`, and `[enrichment].provider = "auto"` summarises through
+whichever of `claude` / `opencode` / `copilot` is installed (or skips cleanly).
 
 OpenCode keeps its sessions in one SQLite database; the adapter projects each
 root session (sub-agents embedded) to a JSONL file under
