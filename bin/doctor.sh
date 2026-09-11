@@ -1,8 +1,31 @@
 #!/usr/bin/env bash
 # Health check for the Session Browser install.
+#
+#   ./bin/doctor.sh        (usually run as `sb doctor`)
+#
+# Takes no arguments and changes nothing: every section only reads. It is the first thing
+# to run when something looks wrong, and the thing to paste into a bug report.
+#
+# HOW TO READ THE OUTPUT — three marks, and the middle one matters most:
+#   green ✓   fine.
+#   amber ∼   an OPTIONAL piece is absent, or a normal state that is worth knowing (no
+#             transcripts for a CLI you don't use, the ~2 GB search stack skipped by a
+#             --lite install, Claude Code not installed here). Not a problem to fix.
+#   red   ✗   actually broken: fix this.
+#
+# SECTIONS, in order: the venv and its libraries; the registry database; "resume sync"
+# (duplicate Claude transcripts); which CLIs have transcripts on disk; the enrichment
+# summariser; the Claude hook and the OpenCode plugin; the background jobs and the web UI.
+#
+# `set -uo pipefail` deliberately WITHOUT -e: a health check must report every section
+# even when an early one fails. Each Python section is its own short program, so a
+# traceback in one cannot take the rest of the report down with it.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$REPO/.venv/bin/python"
+# Two tiny printers so the green/amber/red vocabulary is spelled once. The \033[..m
+# sequences are terminal colour codes; amber lines are written with printf inline because
+# they carry a remedy after the mark.
 ok(){ printf "  \033[32m✓\033[0m %s\n" "$1"; }
 bad(){ printf "  \033[31m✗\033[0m %s\n" "$1"; }
 
@@ -12,6 +35,10 @@ echo "repo: $REPO"
 echo "[python & deps]"
 if [ -x "$PY" ]; then ok "venv python present"; else bad "venv python missing — run install.sh"; fi
 "$PY" - <<'PYEOF'
+# Import each requirement by name instead of shelling out to `pip list`: this proves the
+# library actually loads on THIS interpreter, which is what the tool needs.
+#   flask = the web UI, numpy = semantic search, watchdog = the file watcher,
+#   yaml = Copilot's workspace files.
 import importlib, sys
 for m in ["flask","numpy","watchdog","yaml"]:
     try: importlib.import_module(m); print(f"  \033[32m✓\033[0m import {m}")
@@ -20,6 +47,10 @@ for m in ["flask","numpy","watchdog","yaml"]:
 try: importlib.import_module("sentence_transformers"); print("  \033[32m✓\033[0m import sentence_transformers")
 except Exception: print("  \033[33m∼\033[0m sentence_transformers absent (--lite: semantic search falls back to keyword/full-text)")
 # sqlite extension capability (optional fast path)
+# Some Python builds (pyenv's, notably) compile sqlite3 without the ability to load
+# extensions, which rules out sqlite-vec. That is why vectors are stored as plain bytes
+# and compared with numpy instead — see docs/ARCHITECTURE.md. Reported for information:
+# the numpy path is fast enough for thousands of sessions, so absence is amber, not red.
 import sqlite3
 c=sqlite3.connect(":memory:")
 # no backslashes inside f-string {} — that's a SyntaxError before Python 3.12 (PEP 701)
@@ -30,9 +61,14 @@ print(f"  {mark} sqlite loadable-extensions {state}")
 PYEOF
 
 echo "[database]"
+# Three numbers that together say whether the pipeline has actually run: how many sessions
+# are indexed, how many have an embedding (semantic search), how many have a reasoning
+# trail extracted. A healthy install has the last two close behind the first.
 "$PY" - "$REPO" <<'PYEOF'
 import sys; sys.path.insert(0, sys.argv[1])   # repo path, NOT cwd — doctor may run from anywhere
 import indexer, sbconfig
+# Any failure here (a missing or unreadable database, an un-migrated schema) is reported
+# as one red line rather than a traceback — doctor exists to be readable when broken.
 try:
     c=indexer.connect()
     n=c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
@@ -45,6 +81,11 @@ except Exception as ex:
 PYEOF
 
 echo "[resume sync]"
+# Checks the side effects of `cr` (bin/resume-here.sh). A symlinked transcript is healthy:
+# every directory reads the one canonical file. A session with REAL copies in more than
+# one project directory has forked — the two histories drift apart from the moment both
+# are used — which happens on filesystems without symlinks, or after copying a tree
+# around. scripts/reconcile-sessions.py repairs that while preserving genuine forks.
 "$PY" - "$REPO" <<'PYEOF'
 import collections, sys; sys.path.insert(0, sys.argv[1])
 from pathlib import Path
@@ -58,6 +99,8 @@ if proj.exists():
         for f in d.glob("*.jsonl"):
             if f.is_symlink(): links += 1
             else: real[f.stem].append(d.name)
+# More than one REAL file for the same id = diverged copies. Symlinks are counted, not
+# collected, precisely because they are never a divergence.
 dupes = {k: v for k, v in real.items() if len(v) > 1}
 print(f"  \033[32m✓\033[0m {links} resume symlink(s) (always in sync with origin)")
 if dupes:
@@ -70,6 +113,12 @@ else:
 PYEOF
 
 echo "[sources]"
+# One line per supported CLI. Two INDEPENDENT facts, deliberately kept apart:
+#   is_available()  — are there transcripts on disk for this CLI? That is all indexing,
+#                     search, stats and the Archived/Restore flow ever need.
+#   has_binary()    — is the CLI itself installed in this shell? Only resume and bridge
+#                     need that, so its absence is a note, not a failure.
+# A laptop that no longer has Claude Code installed still browses its whole Claude history.
 "$PY" - "$REPO" <<'PYEOF'
 import sys; sys.path.insert(0, sys.argv[1])
 from sources.registry import build_source_registry
@@ -82,13 +131,23 @@ for name,a in build_source_registry().items():
 PYEOF
 
 echo "[enrichment]"
+# "Enrichment" is the one place this tool asks a language model for anything: it runs an
+# installed coding CLI non-interactively to summarise a session (title, topics, decisions,
+# open threads). This section answers the three questions behind every "my summaries never
+# appear" report: which provider is configured, which one that resolved to, and is its
+# binary actually on PATH. The default `auto` picks the first of claude / opencode /
+# copilot it finds, so the answer differs per machine.
 "$PY" - "$REPO" <<'PYEOF'
 import shutil, sys; sys.path.insert(0, sys.argv[1])
 import sbconfig
 from enrichment.provider import _PROVIDERS, get_provider, resolve_provider_name
+# `configured` is what config.toml says; `name` is what it resolved to. The label shows
+# both when they differ ("auto -> claude-headless"), which is the interesting case.
 configured = sbconfig.CONFIG.get("enrichment", {}).get("provider", "auto")
 name = resolve_provider_name(sbconfig.CONFIG)
 label = f"{configured} -> {name}" if configured == "auto" and name else str(configured)
+# Four outcomes, and only the typo is red: no CLI found at all and an explicit "none" are
+# both legitimate configurations in which enrichment simply skips.
 if name is None:
     print("  \033[33m∼\033[0m provider: auto found no summariser CLI on PATH (claude / opencode / copilot) — "
           "enrichment is skipped; install one or set [enrichment].provider")
@@ -107,6 +166,10 @@ else:
 PYEOF
 
 echo "[hook]"
+# The two instant-indexing integrations: Claude Code's Stop/SessionEnd hook and the
+# OpenCode plugin. Both are optional accelerators — the watcher indexes everything anyway
+# — so a missing one is amber. A plain grep for the script name is enough here; install.sh
+# owns the actual JSON editing. Same $CLAUDE_CONFIG_DIR default as the installer.
 SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 if grep -q "session-hook.py" "$SETTINGS" 2>/dev/null; then ok "Claude Stop hook registered"; else
   if command -v claude >/dev/null 2>&1; then
@@ -115,6 +178,9 @@ if grep -q "session-hook.py" "$SETTINGS" 2>/dev/null; then ok "Claude Stop hook 
     printf "  \033[33m∼\033[0m Claude Code not installed here — no Stop hook needed\n"
   fi
 fi
+# The plugin script reports its own state: "installed", "stale..." (a file from an older
+# repo path or version — red, because it is loaded and wrong), or anything else meaning
+# not installed. `|| echo unknown` keeps a missing/failing script from aborting the line.
 OCP_STATUS="$("$PY" "$REPO/scripts/install-opencode-plugin.py" --status 2>/dev/null || echo "unknown")"
 case "$OCP_STATUS" in
   installed) ok "OpenCode plugin installed";;
@@ -124,6 +190,10 @@ esac
 
 echo "[watcher / ui]"
 # One line per background job, phrased for the scheduler this OS actually has.
+# The two jobs install.sh sets up: the always-on watcher (indexes transcripts as the CLIs
+# write them) and the nightly refresh (costs, reasoning trails, search indexes, LLM
+# summaries). Without them nothing keeps the registry current, so this is the section to
+# check when the UI stops showing today's work.
 if [ "$(uname)" = "Darwin" ]; then
   # Capture once; grep against a here-string so `grep -q` closing early can't
   # SIGPIPE launchctl and trip pipefail (which would falsely report "not loaded").
@@ -141,7 +211,15 @@ else
   printf "  \033[33m∼\033[0m no launchd/systemd here — run watcher.py and scripts/refresh-all.py yourself (docs/SETUP.md §5)\n"
 fi
 # The UI port comes from [ui].port (config.toml) — the same value app.py binds.
+# Asking sbconfig rather than hard-coding a number is what makes doctor still correct
+# after the documented remedy for a busy port (change [ui].port and restart). The literal
+# in the line below is only the fallback for when config cannot be read at all, and a test
+# in tests/test_smoke.py greps this file to keep it that way.
 UI_PORT="$("$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import sbconfig; print(int(sbconfig.CONFIG.get("ui", {}).get("port", 7655)))' "$REPO" 2>/dev/null || echo 7655)"
+# port_held — is ANY process listening on the UI port? No arguments; status only.
+# Returns 0 (held) / 1 (free, or undecidable). lsof is standard on macOS but not installed
+# on every Linux, so `ss` is tried next; with neither, report "free" rather than guess —
+# the worst outcome is the friendlier "UI not running" message.
 # Is something listening on the UI port? lsof is not a given on Linux.
 port_held() {
   if command -v lsof >/dev/null 2>&1; then lsof -ti tcp:"$UI_PORT" >/dev/null 2>&1
@@ -150,6 +228,9 @@ port_held() {
 }
 # --max-time: a wedged/suspended process holding the port accepts the TCP
 # connect but never answers — without a deadline this health check hangs forever.
+# Three distinct outcomes, which is why the port test and the HTTP test are separate:
+# answering (green), held but not answering — a wedged or suspended process (red, with the
+# fix), or nothing there at all, which just means the UI is not started (amber).
 if curl -s --max-time 3 "localhost:$UI_PORT/health" >/dev/null 2>&1; then ok "UI responding on :$UI_PORT"; else
   if port_held; then
     printf "  \033[31m✗\033[0m :%s is held by a process that isn't answering — try: sb stop, then sb ui\n" "$UI_PORT"
