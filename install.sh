@@ -194,8 +194,12 @@ if [ "$NO_HOOK" -eq 0 ] && [ "$HAVE_CLAUDE" -eq 1 ]; then
     name="$(basename "$d")"
     # Scaffold skills document a future feature; linking them made the agent run
     # scripts that do not exist yet.
-    if grep -qi "^description:.*scaffold" "$d/SKILL.md" 2>/dev/null; then continue; fi
     target="$CLAUDE_DIR/skills/$name"
+    if grep -qi "^description:.*scaffold" "$d/SKILL.md" 2>/dev/null; then
+      # an earlier install linked it: retire our own link, never a user's file
+      if [ -L "$target" ] && [ "$(readlink "$target")" = "${d%/}" ]; then rm -f "$target"; echo "   unlinked scaffold skill $name"; fi
+      continue
+    fi
     if [ -L "$target" ]; then
       # repoint after a repo move; no-op when already correct
       [ "$(readlink "$target")" = "${d%/}" ] || { ln -sfn "${d%/}" "$target"; echo "   repointed $name"; }
