@@ -10,6 +10,12 @@
      fully offline and never phone home. -->
 <link rel="stylesheet" href="/static/tailwind.css">
 <style>
+    .hm0{fill:#e5e7eb} .dark .hm0{fill:#1e293b}
+    .hm1{fill:#bbf7d0} .dark .hm1{fill:#14532d}
+    .hm2{fill:#86efac} .dark .hm2{fill:#166534}
+    .hm3{fill:#4ade80} .dark .hm3{fill:#15803d}
+    .hm4{fill:#22c55e} .dark .hm4{fill:#22c55e}
+
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, system-ui, sans-serif; }
   .clamp2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
   .kb-active { outline: 2px solid #6366f1; outline-offset: 2px; }
@@ -486,8 +492,9 @@ function heatmap(perDay){
       const key = new Date(t).toISOString().slice(0,10);
       const n = byDay[key] || 0;
       const lvl = n===0?0 : Math.ceil((n/max)*4);
-      const c = ['#1e293b','#14532d','#166534','#15803d','#22c55e'][lvl] || '#1e293b';
-      cells.push(`<rect x="${w*13}" y="${d*13}" width="11" height="11" rx="2" fill="${c}"><title>${key}: ${n} session${n===1?'':'s'}</title></rect>`);
+      // Theme-aware via CSS classes (hm0..hm4): an inline dark fill left the
+      // empty cells navy-black in light mode, and a theme toggle never re-renders.
+      cells.push(`<rect x="${w*13}" y="${d*13}" width="11" height="11" rx="2" class="hm hm${lvl}"><title>${key}: ${n} session${n===1?'':'s'}</title></rect>`);
     }
   }
   return `<svg viewBox="0 0 690 95" class="w-full" style="max-width:690px">${cells.join('')}</svg>`;
@@ -577,7 +584,9 @@ function showTab(which){
   $('#tabSessions').className = which==='sessions' ? on : off;
   $('#tabArchived').className = which==='archived' ? on : off;
   $('#tabStats').className    = stats ? on : off;
-  if(stats) renderStats(); else { loadMeta(); applyFilters(); }
+  // loadMeta on the Usage tab too: the header line and source pills otherwise
+  // keep showing the previous tab's (e.g. Archived) scope next to live totals.
+  if(stats){ loadMeta(); renderStats(); } else { loadMeta(); applyFilters(); }
 }
 $('#tabSessions').onclick = ()=>showTab('sessions');
 $('#tabArchived').onclick = ()=>showTab('archived');
